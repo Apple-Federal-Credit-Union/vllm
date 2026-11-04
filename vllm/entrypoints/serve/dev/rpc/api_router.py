@@ -5,15 +5,16 @@ import json
 from http import HTTPStatus
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.middleware.authenticate import require_api_key
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 def engine_client(request: Request) -> EngineClient:

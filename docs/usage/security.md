@@ -149,7 +149,7 @@ firewall configuration instructions.
 
 ### Overview
 
-The `--api-key` flag (or `VLLM_API_KEY` environment variable) provides authentication for vLLM's HTTP server, but **only for endpoints under the `/v1`, `/v2`, `/inference`, and `/cohere` path prefixes**. Many other sensitive endpoints are exposed on the same HTTP server without any authentication enforcement.
+The `--api-key` flag (or `VLLM_API_KEY` environment variable) provides authentication for vLLM's HTTP server, but **only for endpoints under the `/v1`, `/v2`, `/inference`, and `/cohere` path prefixes, and for the development and RL endpoints enabled by `VLLM_SERVER_DEV_MODE=1`**. Many other sensitive endpoints are exposed on the same HTTP server without any authentication enforcement.
 
 **Important:** Do not rely exclusively on `--api-key` for securing access to vLLM. Additional security measures are required for production deployments.
 
@@ -186,6 +186,31 @@ When `--api-key` is configured, the following endpoints require Bearer token aut
 - `/v2/embed` - Cohere Embed API
 - `/v2/rerank` - Cohere Rerank API
 
+**Development and RL endpoints (only when `VLLM_SERVER_DEV_MODE=1`):**
+
+These endpoints are **only available when the environment variable `VLLM_SERVER_DEV_MODE` is set to `1`**. They are intended for development, debugging, and RL training workflows and should never be enabled in production. When `--api-key` is configured they require the same Bearer token as the endpoints above. Without `--api-key` they are open to any client that can reach the server:
+
+- `/server_info` - Get detailed server configuration
+- `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
+- `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
+- `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
+- `/sleep` - Put engine to sleep (causes denial of service)
+- `/release_kv_cache_memory` - Discard KV cache memory after a completed pause
+- `/wake_up` - Wake engine from sleep
+- `/is_sleeping` - Check if engine is sleeping
+- `/collective_rpc` - Execute arbitrary RPC methods on the engine (extremely dangerous)
+- `/pause` - Pause generation (causes denial of service)
+- `/resume` - Resume generation
+- `/is_paused` - Check if generation is paused
+- `/abort_requests` - Abort in-flight requests (causes loss of in-flight work)
+- `/init_weight_transfer_engine`, `/shutdown_weight_transfer_engine` - Manage the weight transfer engine for RLHF
+- `/start_weight_update`, `/start_draft_weight_update`, `/update_weights`, `/finish_weight_update` - Update model weights (can alter model behavior)
+- `/update_weight_version`, `/weight_info` - Set or read the weight version
+- `/weight_checker` - Checksum, compare, or reset model weights (`reset` zeroes the weights)
+- `/get_world_size` - Get distributed world size
+
+Every holder of a configured API key can call these endpoints, including `/collective_rpc`. There is no separate administrator credential, so do not share the API key with untrusted clients while `VLLM_SERVER_DEV_MODE=1` is set.
+
 ### Unprotected Endpoints (No API Key Required)
 
 The following endpoints **do not require authentication** even when `--api-key` is configured:
@@ -201,16 +226,9 @@ The following endpoints **do not require authentication** even when `--api-key` 
 
 **Operational control endpoints (only when `"generate"` task is supported):**
 
-- `/pause` - Pause generation (causes denial of service)
-- `/resume` - Resume generation
-- `/is_paused` - Check if generation is paused
-- `/abort_requests` - Abort in-flight requests (causes loss of in-flight work)
 - `/scale_elastic_ep` - Trigger scaling operations
 - `/is_scaling_elastic_ep` - Check if scaling is in progress
-- `/init_weight_transfer_engine` - Initialize weight transfer engine for RLHF
-- `/update_weights` - Update model weights (can alter model behavior)
-- `/get_world_size` - Get distributed world size
-- `/abort_requests` - Abort in-flight requests (available with `--tokens-only`. Use the authenticated `/inference/v1/abort_requests` otherwise)
+- `/abort_requests` - Abort in-flight requests (available with `--tokens-only` when `VLLM_SERVER_DEV_MODE` is not set. Use the authenticated `/inference/v1/abort_requests` otherwise)
 - `/fault_tolerance/apply` - Trigger fault-recovery operations across ranks (available when fault tolerance is enabled)
 - `/fault_tolerance/status` - Query fault-recovery status (available when fault tolerance is enabled)
 
@@ -231,19 +249,6 @@ This endpoint is **only available when the `--enable-tokenizer-info-endpoint` fl
 
 - `/tokenizer_info` - Get comprehensive tokenizer information including chat templates and configuration
 
-**Development endpoints (only when `VLLM_SERVER_DEV_MODE=1`):**
-
-These endpoints are **only available when the environment variable `VLLM_SERVER_DEV_MODE` is set to `1`**. They are intended for development and debugging purposes and should never be enabled in production:
-
-- `/server_info` - Get detailed server configuration
-- `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
-- `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
-- `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
-- `/sleep` - Put engine to sleep (causes denial of service)
-- `/wake_up` - Wake engine from sleep
-- `/is_sleeping` - Check if engine is sleeping
-- `/collective_rpc` - Execute arbitrary RPC methods on the engine (extremely dangerous)
-
 **Profiler endpoints (only when profiling is enabled via `--profiler-config`):**
 
 These endpoints are only available when profiling is enabled and should only be used for local development:
@@ -258,10 +263,9 @@ These endpoints are only available when profiling is enabled and should only be 
 An attacker who can reach the vLLM HTTP server can:
 
 1. **Bypass authentication** by using endpoints outside the protected path prefixes, such as `/invocations`, `/generative_scoring`, `/pooling`, `/classify`, `/score`, or `/rerank`, to run arbitrary inference without credentials
-2. **Cause denial of service** by calling `/pause`, `/scale_elastic_ep`, or `/abort_requests` without a token
-3. **Access operational controls** to manipulate server state (e.g., pausing generation, updating model weights via `/update_weights`)
-4. **If `--enable-tokenizer-info-endpoint` is set:** Access sensitive tokenizer configuration including chat templates, which may reveal prompt engineering strategies or other implementation details
-5. **If `VLLM_SERVER_DEV_MODE=1` is set:** Execute arbitrary RPC commands via `/collective_rpc`, reset caches, put the engine to sleep, and access detailed server configuration
+2. **Cause denial of service** by calling `/scale_elastic_ep` or the `--tokens-only` `/abort_requests` without a token
+3. **If `--enable-tokenizer-info-endpoint` is set:** Access sensitive tokenizer configuration including chat templates, which may reveal prompt engineering strategies or other implementation details
+4. **If `VLLM_SERVER_DEV_MODE=1` is set without `--api-key`:** Execute arbitrary RPC commands via `/collective_rpc`, replace or reset model weights, pause generation, reset caches, put the engine to sleep, and access detailed server configuration
 
 ### Recommended Security Practices
 

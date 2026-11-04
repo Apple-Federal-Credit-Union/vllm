@@ -237,7 +237,7 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 - `GET /is_sleeping` — Check if the model is sleeping.
 
 !!! note
-    These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
+    These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`. When `--api-key` is set, they require an `Authorization: Bearer <api-key>` header.
 
 ## Limitation
 
