@@ -21,4 +21,6 @@ pub use pb::control_server::ControlServer;
 pub use pb::inference_server::InferenceServer;
 
 #[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
 mod tests;
