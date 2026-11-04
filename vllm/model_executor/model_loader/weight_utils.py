@@ -9,6 +9,7 @@ import glob
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -848,6 +849,42 @@ def enable_tqdm(use_tqdm_on_load: bool):
     )
 
 
+_NP_CACHE_WEIGHT_NAMES_FILE = "weight_names.json"
+
+
+def _open_np_cache_entry(dir_fd: int, name: object, write: bool) -> IO[bytes]:
+    """Open a regular file directly inside the np cache directory `dir_fd`.
+
+    `name` comes from the checkpoint, so it must be a single path segment, and
+    the entry is opened without following symlinks. The opened file itself is
+    checked, so a swapped entry cannot redirect the read or write.
+    """
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+        or "\0" in name
+    ):
+        raise ValueError(f"Invalid tensor name for np_cache: {name!r}")
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= os.O_WRONLY | os.O_CREAT if write else os.O_RDONLY
+    fd = os.open(name, flags, 0o666, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ValueError(
+                f"np_cache entry {name!r} is not a regular file owned by the cache"
+            )
+        os.set_blocking(fd, True)
+        if write:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "wb" if write else "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: str | None,
@@ -863,35 +900,48 @@ def np_cache_weights_iterator(
     # faster loading.
     np_folder = os.path.join(hf_folder, "np")
     os.makedirs(np_folder, exist_ok=True)
-    weight_names_file = os.path.join(np_folder, "weight_names.json")
-    # Use file lock to prevent multiple processes from
-    # dumping the same model weights to numpy at the same time.
-    with get_lock(model_name_or_path, cache_dir):
-        if not os.path.exists(weight_names_file):
-            weight_names: list[str] = []
-            for bin_file in tqdm(
-                hf_weights_files,
-                desc="Loading np_cache checkpoint shards",
-                disable=not enable_tqdm(use_tqdm_on_load),
-                bar_format=_BAR_FORMAT,
-            ):
-                state = torch.load(bin_file, map_location="cpu", weights_only=True)
-                for name, param in state.items():
-                    param_path = os.path.join(np_folder, name)
-                    with open(param_path, "wb") as f:
-                        np.save(f, param.cpu().detach().numpy())
-                    weight_names.append(name)
-            with open(weight_names_file, "w") as f:
-                json.dump(weight_names, f)
+    np_dir_fd = os.open(np_folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # Use file lock to prevent multiple processes from
+        # dumping the same model weights to numpy at the same time.
+        with get_lock(model_name_or_path, cache_dir):
+            try:
+                os.stat(
+                    _NP_CACHE_WEIGHT_NAMES_FILE,
+                    dir_fd=np_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                weight_names: list[str] = []
+                for bin_file in tqdm(
+                    hf_weights_files,
+                    desc="Loading np_cache checkpoint shards",
+                    disable=not enable_tqdm(use_tqdm_on_load),
+                    bar_format=_BAR_FORMAT,
+                ):
+                    state = torch.load(bin_file, map_location="cpu", weights_only=True)
+                    for name, param in state.items():
+                        with _open_np_cache_entry(np_dir_fd, name, write=True) as f:
+                            np.save(f, param.cpu().detach().numpy())
+                        weight_names.append(name)
+                with _open_np_cache_entry(
+                    np_dir_fd, _NP_CACHE_WEIGHT_NAMES_FILE, write=True
+                ) as f:
+                    f.write(json.dumps(weight_names).encode())
 
-    with open(weight_names_file) as f:
-        weight_names = json.load(f)
+        with _open_np_cache_entry(
+            np_dir_fd, _NP_CACHE_WEIGHT_NAMES_FILE, write=False
+        ) as f:
+            weight_names = json.load(f)
+        if not isinstance(weight_names, list):
+            raise ValueError(f"Invalid {_NP_CACHE_WEIGHT_NAMES_FILE} in {np_folder}")
 
-    for name in weight_names:
-        param_path = os.path.join(np_folder, name)
-        with open(param_path, "rb") as f:
-            param = np.load(f)
-        yield name, torch.from_numpy(param)
+        for name in weight_names:
+            with _open_np_cache_entry(np_dir_fd, name, write=False) as f:
+                param = np.load(f)
+            yield name, torch.from_numpy(param)
+    finally:
+        os.close(np_dir_fd)
 
 
 def _local_snapshot_dirs(model_name_or_path: str, cache_dir: str | None) -> list[Path]:
