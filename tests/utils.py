@@ -22,6 +22,7 @@ from contextlib import ExitStack, contextmanager
 from multiprocessing import Process, get_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from unittest.mock import patch
 
 import anthropic
 import cloudpickle
@@ -169,6 +170,22 @@ def _temporarily_sanitized_pythonpath_env():
 def requires_spawn_multiprocessing() -> bool:
     """Whether this platform requires spawn instead of fork for test processes."""
     return current_platform.is_rocm() or current_platform.is_xpu()
+
+
+LOOPBACK_MEDIA_NETWORKS = "127.0.0.0/8,::1/128"
+
+
+@contextmanager
+def allow_loopback_media_urls():
+    """Let media URL fetches reach test servers bound to loopback."""
+    with patch.dict(
+        os.environ, {"VLLM_MEDIA_URL_ALLOWED_NETWORKS": LOOPBACK_MEDIA_NETWORKS}
+    ):
+        envs.disable_envs_cache()
+        try:
+            yield
+        finally:
+            envs.disable_envs_cache()
 
 
 def _run_in_new_process_group(
@@ -756,6 +773,8 @@ class RemoteOpenAIServer(RemoteVLLMServer):
         # the current process might initialize cuda,
         # to be safe, we should use spawn method
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Tests serve media to the server from loopback (local_asset_server).
+        env.setdefault("VLLM_MEDIA_URL_ALLOWED_NETWORKS", LOOPBACK_MEDIA_NETWORKS)
         if env_dict is not None:
             env.update(env_dict)
         _sanitize_pythonpath_env(env)
@@ -784,6 +803,7 @@ class RemoteLaunchRenderServer(RemoteVLLMServer):
     ) -> None:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        env.setdefault("VLLM_MEDIA_URL_ALLOWED_NETWORKS", LOOPBACK_MEDIA_NETWORKS)
         if env_dict is not None:
             env.update(env_dict)
         _sanitize_pythonpath_env(env)

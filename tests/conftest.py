@@ -42,6 +42,7 @@ from transformers import (
 )
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
+from tests.utils import allow_loopback_media_urls
 from tests.models.utils import (
     TokensTextLogprobs,
     TokensTextLogprobsPromptLogprobs,
@@ -1730,7 +1731,8 @@ class LocalAssetServer:
         return f"{self.base_url}/{name}"
 
     def get_image_asset(self, name: str) -> Image.Image:
-        image = fetch_image(self.url_for(name))
+        with allow_loopback_media_urls():
+            image = fetch_image(self.url_for(name))
         # Unwrap MediaWithBytes if present
         if isinstance(image, MediaWithBytes):
             image = image.media
@@ -1746,6 +1748,16 @@ def local_asset_server() -> Generator[LocalAssetServer, None, None]:
     """
     with LocalAssetServer() as srv:
         yield srv
+
+
+@pytest.fixture(autouse=True)
+def _allow_loopback_media_for_local_asset_server(request):
+    """Media fetches refuse loopback unless allowed; the asset server is there."""
+    if "local_asset_server" not in request.fixturenames:
+        yield
+        return
+    with allow_loopback_media_urls():
+        yield
 
 
 @pytest.fixture

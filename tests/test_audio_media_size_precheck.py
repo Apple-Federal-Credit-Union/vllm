@@ -21,6 +21,8 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 class _SyncResponse:
+    is_redirect = False
+
     def __init__(self, chunks: list[bytes], content_length: int | None = None):
         self.headers = (
             {} if content_length is None else {"Content-Length": str(content_length)}
@@ -57,7 +59,10 @@ class _AsyncContent:
 
 
 class _AsyncResponse:
+    status = 200
+
     def __init__(self, chunks: list[bytes], content_length: int | None = None):
+        self.headers: dict[str, str] = {}
         self.content_length = content_length
         self.content = _AsyncContent(chunks)
 

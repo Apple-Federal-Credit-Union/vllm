@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import ipaddress
 import json
 import logging
 import os
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
     VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB: int = 256
     VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB: int = 256
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
+    VLLM_MEDIA_URL_ALLOWED_NETWORKS: list[str] = []
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
@@ -445,6 +447,16 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def _get_ip_networks(env_name: str) -> list[str]:
+    networks = [v.strip() for v in os.getenv(env_name, "").split(",") if v.strip()]
+    for network in networks:
+        try:
+            ipaddress.ip_network(network, strict=False)
+        except ValueError as e:
+            raise ValueError(f"Invalid network {network!r} in {env_name}: {e}") from e
+    return networks
 
 
 def env_list_with_choices(
@@ -993,9 +1005,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", "256")
     ),
     # Whether to allow HTTP redirects when fetching from media URLs.
-    # Default to True
+    # Every redirect target is checked against `--allowed-media-domains` and
+    # the address policy below before it is requested. Default to True
     "VLLM_MEDIA_URL_ALLOW_REDIRECTS": lambda: bool(
         int(os.getenv("VLLM_MEDIA_URL_ALLOW_REDIRECTS", "1"))
+    ),
+    # Comma-separated CIDR networks that media URL fetches may connect to in
+    # addition to globally routable addresses, e.g. "10.0.0.0/8,::1/128".
+    # Loopback, private, link-local (including cloud metadata), and other
+    # special-purpose addresses are refused unless listed here. The check
+    # applies to every resolved address and every redirect hop. An HTTP proxy
+    # is used for media fetches only if its address is listed here.
+    "VLLM_MEDIA_URL_ALLOWED_NETWORKS": lambda: _get_ip_networks(
+        "VLLM_MEDIA_URL_ALLOWED_NETWORKS"
     ),
     # Max number of workers for the thread pool handling
     # media bytes loading. Set to 1 to disable parallel processing.
@@ -2442,6 +2464,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MEDIA_CACHE_TTL_HOURS",
         "VLLM_MEDIA_FETCH_MAX_RETRIES",
         "VLLM_MEDIA_URL_ALLOW_REDIRECTS",
+        "VLLM_MEDIA_URL_ALLOWED_NETWORKS",
         "VLLM_MEDIA_LOADING_THREAD_COUNT",
         "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB",
         "VLLM_MAX_AUDIO_DECODE_DURATION_S",
