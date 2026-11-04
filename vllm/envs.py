@@ -1027,10 +1027,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum bytes a client-supplied embedding payload (`prompt_embeds`,
     # `image_embeds`, `audio_embeds`, `video_embeds`) may allocate once it is
-    # densified. A sparse tensor carries its own declared shape, so a payload
-    # of a few hundred bytes can expand into hundreds of GiB. The limit is
-    # checked before `to_dense()` so the memory is never allocated. Set to 0
-    # to disable. Default is 2 GiB, which covers a 128K-token float32
+    # densified. A sparse tensor or a `.npy` header carries its own declared
+    # shape, so a payload of a few hundred bytes can expand into hundreds of
+    # GiB. The limit is checked before `to_dense()` or `numpy` reads the array
+    # so the memory is never allocated. Set to 0 to disable. Default is 2 GiB, which covers a 128K-token float32
     # embedding at hidden_size 4096.
     "VLLM_MAX_EMBED_DECODE_BYTES": lambda: int(
         os.getenv("VLLM_MAX_EMBED_DECODE_BYTES", "2147483648")

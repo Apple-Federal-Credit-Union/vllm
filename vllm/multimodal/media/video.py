@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import (
     check_sparse_tensor_invariants_threadsafe,
+    safe_load_numpy,
     safe_to_dense,
 )
 
@@ -250,8 +251,7 @@ class VideoEmbeddingMediaIO(MediaIO[torch.Tensor]):
             return safe_to_dense(tensor, parameter="video_embeds")
 
     def _load_numpy(self, data: bytes) -> torch.Tensor:
-        with BytesIO(data) as buffer:
-            return torch.from_numpy(np.load(buffer))
+        return safe_load_numpy(data, parameter="video_embeds")
 
     def load_bytes(self, data: bytes) -> torch.Tensor:
         if data[:6] == MAGIC_NUMPY_PREFIX:
@@ -264,7 +264,7 @@ class VideoEmbeddingMediaIO(MediaIO[torch.Tensor]):
 
     def load_file(self, filepath: Path) -> torch.Tensor:
         if filepath.suffix == ".npy":
-            return torch.from_numpy(np.load(filepath))
+            return self._load_numpy(filepath.read_bytes())
 
         with check_sparse_tensor_invariants_threadsafe():
             tensor = torch.load(filepath, weights_only=True)

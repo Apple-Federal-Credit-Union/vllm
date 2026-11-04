@@ -4,7 +4,8 @@
 
 `check_sparse_tensor_invariants_threadsafe()` is a thread-safe wrapper for
 sparse tensor invariant validation. `safe_to_dense()` bounds the memory a
-deserialized tensor may allocate when densified.
+deserialized tensor may allocate when densified, and `safe_load_numpy()`
+applies the same bound to `.npy` payloads before NumPy allocates them.
 
 PyTorch's `torch.sparse.check_sparse_tensor_invariants()` context manager
 manipulates a **process-global** flag (save/enable/restore). When multiple
@@ -17,9 +18,12 @@ which serializes access behind a lock.
 """
 
 import contextlib
+import math
 import threading
+from io import BytesIO
 
 import torch
+from numpy.lib import format as npy_format
 
 import vllm.envs as envs
 from vllm.exceptions import VLLMValidationError
@@ -55,18 +59,66 @@ def safe_to_dense(tensor: object, *, parameter: str) -> torch.Tensor:
             parameter=parameter,
         )
 
-    max_bytes = envs.VLLM_MAX_EMBED_DECODE_BYTES
-    if max_bytes > 0:
-        dense_bytes = tensor.numel() * tensor.element_size()
-        if dense_bytes > max_bytes:
+    _check_dense_bytes(
+        tuple(tensor.shape),
+        tensor.numel() * tensor.element_size(),
+        parameter=parameter,
+    )
+    return tensor.to_dense()
+
+
+def safe_load_numpy(data: bytes, *, parameter: str) -> torch.Tensor:
+    """Load a client-supplied `.npy` embedding within a memory budget.
+
+    `numpy.load` allocates the shape declared in the header before it reads
+    the body, so a header of a few hundred bytes can request any amount of
+    memory. Parse the header first and reject it unless its dense size is
+    within the limit and the body actually holds that many bytes.
+    """
+    with BytesIO(data) as buffer:
+        version = npy_format.read_magic(buffer)
+        if version == (1, 0):
+            header = npy_format.read_array_header_1_0(buffer)
+        elif version == (2, 0):
+            header = npy_format.read_array_header_2_0(buffer)
+        else:
             raise VLLMValidationError(
-                f"`{parameter}` declares shape {tuple(tensor.shape)}, which "
-                f"would allocate {dense_bytes} bytes "
-                f"({dense_bytes / MiB_bytes:.0f} MiB) once densified, "
-                f"exceeding the {max_bytes} byte limit. Set "
-                f"VLLM_MAX_EMBED_DECODE_BYTES to increase this limit.",
+                f"`{parameter}` uses unsupported .npy format version {version}.",
                 parameter=parameter,
-                value=dense_bytes,
+            )
+        shape, _fortran_order, dtype = header
+        if any(dim < 0 for dim in shape):
+            raise VLLMValidationError(
+                f"`{parameter}` declares negative dimensions {shape}.",
+                parameter=parameter,
             )
 
-    return tensor.to_dense()
+        dense_bytes = math.prod(shape) * dtype.itemsize
+        _check_dense_bytes(shape, dense_bytes, parameter=parameter)
+        if len(data) - buffer.tell() < dense_bytes:
+            raise VLLMValidationError(
+                f"`{parameter}` declares shape {shape} but its .npy body is "
+                f"shorter than the {dense_bytes} bytes that shape requires.",
+                parameter=parameter,
+            )
+
+        buffer.seek(0)
+        array = npy_format.read_array(buffer, allow_pickle=False)
+
+    return torch.from_numpy(array)
+
+
+def _check_dense_bytes(
+    shape: tuple[int, ...], dense_bytes: int, *, parameter: str
+) -> None:
+    max_bytes = envs.VLLM_MAX_EMBED_DECODE_BYTES
+    if max_bytes > 0 and dense_bytes > max_bytes:
+        raise VLLMValidationError(
+            f"`{parameter}` declares shape {shape}, which "
+            f"would allocate {dense_bytes} bytes "
+            f"({dense_bytes / MiB_bytes:.0f} MiB) once densified, "
+            f"exceeding the {max_bytes} byte limit. Set "
+            f"VLLM_MAX_EMBED_DECODE_BYTES to increase this limit.",
+            parameter=parameter,
+            value=dense_bytes,
+        )
