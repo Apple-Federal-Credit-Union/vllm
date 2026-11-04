@@ -33,6 +33,10 @@ class LoRARequest(
     tensors per expert). Only consulted when the engine is started with
     `enable_mixed_moe_lora_format=True`; otherwise it is ignored and the
     on-disk format is inferred from the base model."""
+    lora_path_root: str | None = None
+    """If set, `lora_path` must be a directory strictly below this canonical
+    directory, reached without following symlinks below it. Workers refuse to
+    load the adapter otherwise."""
 
     def __post_init__(self):
         if self.lora_int_id < 1:
