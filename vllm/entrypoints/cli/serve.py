@@ -57,8 +57,12 @@ class ServeSubcommand(CLISubcommand):
             args.model = args.model_tag
 
         if getattr(args, "grpc", False):
-            from vllm.entrypoints.launchers.grpc_server import serve_grpc
+            from vllm.entrypoints.launchers.grpc_server import (
+                check_api_key_support,
+                serve_grpc,
+            )
 
+            check_api_key_support(args)
             uvloop.run(serve_grpc(args))
             return
 

@@ -11,6 +11,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.tasks import SupportedTask
 
+from .authenticate import AuthenticationMiddleware, resolve_api_tokens
 from .log_response import log_response
 
 logger = init_logger(__name__)
@@ -29,10 +30,7 @@ def init_entrypoints_middleware(
         allow_headers=args.allowed_headers,
     )
 
-    # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
-    if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
-        from .authenticate import AuthenticationMiddleware
-
+    if tokens := resolve_api_tokens(args):
         app.add_middleware(AuthenticationMiddleware, tokens=tokens)
 
     if args.enable_request_id_headers:
