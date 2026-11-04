@@ -2,16 +2,15 @@
 
 vLLM provides an HTTP server that implements OpenAI's [Completions API](https://platform.openai.com/docs/api-reference/completions), [Chat API](https://platform.openai.com/docs/api-reference/chat), and more! This functionality lets you serve models and interact with them using an HTTP client.
 
-!!! warning "API key authentication does not protect every endpoint"
-    The `--api-key` option (or `VLLM_API_KEY` environment variable) only
-    authenticates requests to endpoints under the `/v1`, `/v2`, and
-    `/inference` path prefixes. Other endpoints on the same HTTP server are
-    **not** authenticated — most notably `/invocations`, which exposes the same
-    inference capabilities as the `/v1` endpoints. Do not rely on `--api-key`
-    alone to secure vLLM. See
-    [API Key Authentication Limitations](../../usage/security.md#api-key-authentication-limitations)
-    for the full list of protected and unprotected endpoints and recommended
-    hardening, such as deploying behind a reverse proxy.
+!!! warning "API key authentication is a single shared credential"
+    When the `--api-key` option (or `VLLM_API_KEY` environment variable) is
+    set, every endpoint except `/health`, `/ping`, and CORS preflight requests
+    requires the key, including operational control endpoints and `/metrics`.
+    Anyone with the key can call all of them. Do not rely on `--api-key` alone
+    to secure vLLM. See
+    [API Key Authentication](../../usage/security.md#api-key-authentication)
+    for details and recommended hardening, such as deploying behind a reverse
+    proxy.
 
 ## Supported APIs
 

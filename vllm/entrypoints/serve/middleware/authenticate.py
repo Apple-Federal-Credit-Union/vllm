@@ -4,23 +4,22 @@ import hashlib
 import secrets
 from collections.abc import Awaitable
 
+from starlette._utils import get_route_path
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")
+PUBLIC_PATHS = frozenset({"/health", "/ping"})
 
 
 class AuthenticationMiddleware:
     """Pure ASGI middleware that authenticates each request by checking
     if the Authorization Bearer token exists and equals anyof "{api_key}".
 
-    Notes
-    -----
-    There are two cases in which authentication is skipped:
-        1. The HTTP method is OPTIONS.
-        2. The request path doesn't start with GUARDED_PREFIX (e.g. /health).
-
+    Every route requires the token except:
+        1. CORS preflight requests, which `CORSMiddleware` answers before
+           routing.
+        2. Paths in PUBLIC_PATHS (`/health` and `/ping`).
     """
 
     def __init__(self, app: ASGIApp, tokens: list[str]) -> None:
@@ -44,19 +43,28 @@ class AuthenticationMiddleware:
 
         return token_match
 
-    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
+    @staticmethod
+    def is_public(scope: Scope, headers: Headers) -> bool:
+        # Must match the condition under which Starlette's CORSMiddleware
+        # answers a preflight itself; any other OPTIONS request reaches the
+        # router (e.g. the /metrics mount answers OPTIONS).
         if (
-            scope["type"] not in ("http", "websocket")
-            or scope.get("method") == "OPTIONS"
+            scope["type"] == "http"
+            and scope["method"] == "OPTIONS"
+            and "origin" in headers
+            and "access-control-request-method" in headers
         ):
+            return True
+        # Same path the router matches routes against.
+        return get_route_path(scope) in PUBLIC_PATHS
+
+    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
+        if scope["type"] not in ("http", "websocket"):
             # scope["type"] can be "lifespan" or "startup" for example,
             # in which case we don't need to do anything
             return self.app(scope, receive, send)
-        root_path = scope.get("root_path", "")
-        url_path = scope["path"].removeprefix(root_path)
         headers = Headers(scope=scope)
-        # Type narrow to satisfy mypy.
-        if url_path.startswith(GUARDED_PREFIX) and not self.verify_token(headers):
-            response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
-            return response(scope, receive, send)
-        return self.app(scope, receive, send)
+        if self.is_public(scope, headers) or self.verify_token(headers):
+            return self.app(scope, receive, send)
+        response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+        return response(scope, receive, send)
