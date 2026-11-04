@@ -13,18 +13,22 @@ use serde_json::json;
 
 use crate::state::{ApiKeyHash, AppState, hash_api_key};
 
-const GUARDED_PREFIXES: &[&str] = &["/v1", "/v2", "/inference"];
+/// Mirrors Python `PUBLIC_PATHS`.
+const PUBLIC_PATHS: &[&str] = &["/health", "/ping"];
 
-/// Authenticate guarded HTTP routes with an OpenAI-compatible bearer token.
+/// Authenticate every HTTP route except [`PUBLIC_PATHS`] with an
+/// OpenAI-compatible bearer token.
 ///
-/// Mirrors Python `AuthenticationMiddleware`: OPTIONS requests and non-guarded
-/// helper endpoints such as `/health` are allowed through without a token.
+/// OPTIONS requests are allowed through without a token because the CORS
+/// layer inside this one answers every OPTIONS request without routing it.
+/// Python only exempts CORS preflights, since Starlette routes other OPTIONS
+/// requests.
 pub async fn authenticate_api_key(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    if req.method() == Method::OPTIONS || !requires_auth(req.uri().path()) {
+    if req.method() == Method::OPTIONS || PUBLIC_PATHS.contains(&req.uri().path()) {
         return next.run(req).await;
     }
 
@@ -37,10 +41,6 @@ pub async fn authenticate_api_key(
         Json(json!({ "error": "Unauthorized" })),
     )
         .into_response()
-}
-
-fn requires_auth(path: &str) -> bool {
-    GUARDED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
 }
 
 fn verify_token(authorization: Option<&HeaderValue>, api_key_hashes: &[ApiKeyHash]) -> bool {
