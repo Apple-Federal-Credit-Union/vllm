@@ -161,7 +161,7 @@ Two implementations ship with vLLM:
 | Client | Talks to |
 | ------ | -------- |
 | `RayVLLMWeightSyncClient(handle)` | One or more `AsyncLLM`/`LLM` Ray actors. Accepts a list and fans each call out to every handle, blocking on all of them, so a multi-actor (e.g. multi-DP) deployment is driven as one unit |
-| `HTTPVLLMWeightSyncClient(base_url, timeout=300)` | A vLLM server over the RLHF HTTP routes |
+| `HTTPVLLMWeightSyncClient(base_url, timeout=300, api_key=None)` | A vLLM server over the RLHF HTTP routes; pass `api_key` when the server uses `--api-key` |
 
 Custom weight sync clients can be implemented like so:
 
