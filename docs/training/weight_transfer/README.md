@@ -84,7 +84,10 @@ engine = WeightTransferTrainerFactory.trainer_init(
         rank=0,                  # this trainer rank; rank 0 is the sender
         packed=True,
     ),
-    client=HTTPVLLMWeightSyncClient("http://localhost:8000"),
+    client=HTTPVLLMWeightSyncClient(
+        "http://localhost:8000",
+        api_key=None,  # server --api-key or VLLM_API_KEY when set
+    ),
     source=ModuleSource(model),
 )
 
@@ -93,6 +96,10 @@ for step in range(num_steps):
     train_one_step(model)
     engine.send_weights()
 ```
+
+`api_key` is optional. Set it to the server's `--api-key` or `VLLM_API_KEY` so
+the client sends `Authorization: Bearer` on the weight-transfer routes. Leave
+it unset when the server has no API key.
 
 `send_weights()` drives start → update → finish on the inference side *and* the
 data-plane transfer, including any concurrency the backend needs (NCCL, for
@@ -168,6 +175,10 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 
 !!! note
     The HTTP weight transfer endpoints require `VLLM_SERVER_DEV_MODE=1` to be set.
+    When the server is started with `--api-key` or `VLLM_API_KEY`, every request
+    also needs `Authorization: Bearer <api-key>`. `HTTPVLLMWeightSyncClient` sends
+    that header when constructed with `api_key`. Trainers that speak the HTTP
+    contract directly must send the same header.
 
 !!! warning
     If `/update_weights` fails, the model is left mid-reload while `/health`

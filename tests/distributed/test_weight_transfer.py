@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pybase64 as base64
 import pytest
 import ray
+import requests
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
@@ -1362,6 +1363,50 @@ class TestTrainerClients:
 
         client.shutdown_weight_transfer_engine()
         assert captured == {"path": "shutdown_weight_transfer_engine", "json": None}
+
+    def test_http_client_sends_api_key_as_bearer_token(self, monkeypatch):
+        """A configured API key is sent on every weight-transfer POST."""
+        captured: list[dict] = []
+
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured.append(
+                {"url": url, "json": json, "headers": headers, "timeout": timeout}
+            )
+            return _Response()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+        client = HTTPVLLMWeightSyncClient(
+            "http://localhost:8000/", api_key="secret-token", timeout=12
+        )
+        client.init_weight_transfer_engine({"packed": True})
+        client.start_weight_update()
+        client.update_weights({"names": ["w"]})
+        client.finish_weight_update("step-1")
+        client.shutdown_weight_transfer_engine()
+
+        assert [call["url"] for call in captured] == [
+            "http://localhost:8000/init_weight_transfer_engine",
+            "http://localhost:8000/start_weight_update",
+            "http://localhost:8000/update_weights",
+            "http://localhost:8000/finish_weight_update",
+            "http://localhost:8000/shutdown_weight_transfer_engine",
+        ]
+        assert all(
+            call["headers"] == {"Authorization": "Bearer secret-token"}
+            for call in captured
+        )
+        assert captured[0]["json"] == {"init_info": {"packed": True}}
+        assert captured[0]["timeout"] == 12
+        assert captured[3]["json"] == {"weight_version": "step-1"}
+        assert captured[4]["json"] is None
+
+        captured.clear()
+        HTTPVLLMWeightSyncClient("http://localhost:8000").start_weight_update()
+        assert captured[0]["headers"] is None
 
 
 class TestModuleSource:

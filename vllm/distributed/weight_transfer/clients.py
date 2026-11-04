@@ -61,17 +61,30 @@ class HTTPVLLMWeightSyncClient:
     Mirrors `vllm/entrypoints/rl/online/api_router.py`:
     `/init_weight_transfer_engine`, `/start_weight_update`, `/update_weights`,
     `/finish_weight_update`, `/shutdown_weight_transfer_engine`.
+
+    ``api_key`` is sent as ``Authorization: Bearer`` when the server was
+    started with ``--api-key`` or ``VLLM_API_KEY``. Leave it unset when the
+    server has no API key.
     """
 
-    def __init__(self, base_url: str, timeout: float = 300) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 300, api_key: str | None = None
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.api_key = api_key
 
     def _post(self, path: str, json: dict[str, Any] | None = None) -> None:
         import requests
 
+        headers = None
+        if self.api_key:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
         response = requests.post(
-            f"{self.base_url}/{path}", json=json, timeout=self.timeout
+            f"{self.base_url}/{path}",
+            json=json,
+            headers=headers,
+            timeout=self.timeout,
         )
         response.raise_for_status()
 
