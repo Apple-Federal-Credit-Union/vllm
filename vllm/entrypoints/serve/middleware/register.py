@@ -29,7 +29,9 @@ def init_entrypoints_middleware(
         allow_headers=args.allowed_headers,
     )
 
-    # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
+    # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY.
+    # AuthenticationMiddleware lets CORS preflights through unauthenticated,
+    # so CORSMiddleware must stay inside it to answer them before routing.
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
         from .authenticate import AuthenticationMiddleware
 

@@ -336,13 +336,11 @@ class FrontendArgs(BaseFrontendArgs):
     """If provided, the server will require one of these keys to be presented in
     the header.
 
-    Warning: this only authenticates endpoints under the `/v1`, `/v2`, and
-    `/inference` path prefixes. Other endpoints on the same server, including
-    `/invocations` (which exposes the same inference capabilities as `/v1`),
-    remain unauthenticated. Do not rely on `--api-key` alone to secure vLLM;
-    see
-    https://docs.vllm.ai/en/latest/usage/security.html#api-key-authentication-limitations
-    for what it does and does not protect."""
+    Every HTTP endpoint requires the key except `/health`, `/ping`, and CORS
+    preflight requests. This includes `/metrics`, so Prometheus scrapers must
+    send the key as a bearer token. See
+    https://docs.vllm.ai/en/latest/usage/security.html#api-key-authentication
+    for details."""
     ssl_keyfile: str | None = None
     """The file path to the SSL key file."""
     ssl_certfile: str | None = None

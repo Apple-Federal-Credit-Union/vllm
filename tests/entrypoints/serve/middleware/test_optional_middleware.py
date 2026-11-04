@@ -85,9 +85,8 @@ async def test_passed_api_token(server: RemoteOpenAIServer):
     indirect=True,
 )
 @pytest.mark.asyncio
-async def test_not_v1_or_v2_path_skips_auth(server: RemoteOpenAIServer):
-    # Authorization check is skipped for paths that
-    # don't start with /v1 or /v2 (e.g. /health, /metrics).
+async def test_public_path_skips_auth(server: RemoteOpenAIServer):
+    # Authorization check is skipped for public paths (/health, /ping).
     response = requests.get(server.url_for("health"))
     assert response.status_code == HTTPStatus.OK
 
