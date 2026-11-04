@@ -32,7 +32,11 @@ from urllib3.util import parse_url
 
 import vllm.envs as envs
 from vllm.config import config
-from vllm.connections import HTTPResponseSizeExceededError, global_http_connection
+from vllm.connections import (
+    HTTPResponseSizeExceededError,
+    global_http_connection,
+    trusted_http_connection,
+)
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.common.cli_args import BaseFrontendArgs
@@ -390,7 +394,7 @@ async def open_batch_input(
             )
             download_path = Path(download_dir, "input.jsonl")
             logger.info("Downloading %s to %s", path_or_url, download_path)
-            await global_http_connection.async_download_file(
+            await trusted_http_connection.async_download_file(
                 path_or_url,
                 download_path,
                 timeout=_INPUT_DOWNLOAD_TIMEOUT_S,
@@ -553,25 +557,32 @@ async def download_bytes_from_url(
 
     # Handle HTTP/HTTPS URLs
     elif parsed.scheme in ("http", "https"):
+        validate_url: Callable[[str], None] | None = None
         if allowed_media_domains is not None:
-            url_spec = parse_url(url)
-            if url_spec.hostname not in allowed_media_domains:
-                raise VLLMValidationError(
-                    f"The URL must be from one of the allowed domains: "
-                    f"{allowed_media_domains}. Input URL domain: "
-                    f"{url_spec.hostname}",
-                    parameter="url",
-                    value=url_spec.hostname,
-                )
+            domains = allowed_media_domains
+
+            def _validate_domain(candidate: str) -> None:
+                hostname = parse_url(candidate).hostname
+                if hostname not in domains:
+                    raise VLLMValidationError(
+                        f"The URL must be from one of the allowed domains: "
+                        f"{domains}. Input URL domain: {hostname}",
+                        parameter="url",
+                        value=hostname,
+                    )
+
+            _validate_domain(url)
+            validate_url = _validate_domain
             # Use the normalized URL to prevent parsing discrepancies
             # between urllib3 and aiohttp (e.g. backslash-@ attacks).
-            url = url_spec.url
+            url = parse_url(url).url
 
         try:
             return await global_http_connection.async_get_bytes(
                 url,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
                 max_bytes=_get_audio_download_limit_bytes(),
+                validate_redirect=validate_url,
             )
         except HTTPResponseSizeExceededError as exc:
             _raise_audio_filesize_limit(exc.received_bytes)

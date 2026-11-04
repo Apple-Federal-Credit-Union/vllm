@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import vllm.envs as envs
+from tests.utils import allow_loopback_media_urls
 from vllm.assets.audio import AudioAsset
 from vllm.connections import HTTPConnection
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -360,7 +361,8 @@ def batch_http_server() -> Generator[_BatchHTTPServer, None, None]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield server
+        with allow_loopback_media_urls():
+            yield server
     finally:
         server.shutdown()
         thread.join()
@@ -1284,7 +1286,7 @@ async def test_open_batch_input_downloads_a_url(tmp_path, monkeypatch):
         return save_path
 
     monkeypatch.setattr(
-        run_batch_module.global_http_connection,
+        run_batch_module.trusted_http_connection,
         "async_download_file",
         fake_download_file,
     )

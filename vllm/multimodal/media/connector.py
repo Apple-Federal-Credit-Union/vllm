@@ -378,6 +378,9 @@ class MediaConnector:
                 f"{url_spec.hostname}"
             )
 
+    def _validate_redirect(self, url: str) -> None:
+        self._assert_url_in_allowed_media_domains(parse_url(url))
+
     def load_from_url(
         self,
         url: str,
@@ -410,6 +413,7 @@ class MediaConnector:
                     timeout=fetch_timeout,
                     allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
                     max_bytes=max_bytes,
+                    validate_redirect=self._validate_redirect,
                     **budget_kwargs,
                 )
             except Exception as e:
@@ -469,6 +473,7 @@ class MediaConnector:
                     timeout=fetch_timeout,
                     allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
                     max_bytes=max_bytes,
+                    validate_redirect=self._validate_redirect,
                     **budget_kwargs,
                 )
             except Exception as e:

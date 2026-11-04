@@ -11,6 +11,7 @@ import pytest
 import requests
 
 import vllm.envs as envs
+from tests.utils import allow_loopback_media_urls
 from vllm.connections import (
     HTTPConnection,
     HTTPResponseSizeExceededError,
@@ -50,7 +51,8 @@ def local_media_server() -> Generator[str, None, None]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}"
+        with allow_loopback_media_urls():
+            yield f"http://127.0.0.1:{server.server_port}"
     finally:
         server.shutdown()
         thread.join()
@@ -58,6 +60,8 @@ def local_media_server() -> Generator[str, None, None]:
 
 
 class _SyncResponse:
+    is_redirect = False
+
     def __init__(self, chunks: list[bytes | Exception]) -> None:
         self.headers: dict[str, str] = {}
         self._chunks = chunks
@@ -102,7 +106,10 @@ class _AsyncContent:
 
 
 class _AsyncResponse:
+    status = 200
+
     def __init__(self, chunks: list[bytes | Exception]) -> None:
+        self.headers: dict[str, str] = {}
         self.content = _AsyncContent(chunks)
         self.content_length = None
         self.read = AsyncMock(
@@ -137,7 +144,7 @@ def test_get_bytes_with_limit_streams_instead_of_materializing() -> None:
         "http://example.com/media",
         stream=True,
         timeout=None,
-        allow_redirects=True,
+        allow_redirects=False,
     )
     assert response.content_accessed is False
     assert response.iterated == 2

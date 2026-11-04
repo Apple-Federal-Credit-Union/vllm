@@ -82,8 +82,25 @@ Without domain restrictions, a malicious user could supply URLs that:
 By explicitly allowlisting only the domains you expect media to come from, you
 significantly reduce the attack surface for these types of abuse.
 
-Also, consider setting `VLLM_MEDIA_URL_ALLOW_REDIRECTS=0` to prevent HTTP
-redirects from being followed to bypass domain restrictions.
+Redirects are followed one hop at a time (unless
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS=0`), and every redirect target must also pass
+`--allowed-media-domains`.
+
+Independently of the domain allowlist, media URL fetches only connect to
+globally routable addresses. Loopback, private, link-local (including cloud
+metadata such as `169.254.169.254`), and other special-purpose addresses are
+refused. The check is applied to each address a host name resolves to, at the
+moment of connecting, and again on every redirect hop. To fetch media from an
+internal network, list it in `VLLM_MEDIA_URL_ALLOWED_NETWORKS`
+(e.g. `VLLM_MEDIA_URL_ALLOWED_NETWORKS=10.20.0.0/16`).
+
+When an HTTP proxy is configured through `HTTP_PROXY`/`HTTPS_PROXY`, the proxy
+resolves and connects to the destination instead of vLLM. Media URL fetches
+are therefore sent through a proxy only if the proxy's address is listed in
+`VLLM_MEDIA_URL_ALLOWED_NETWORKS`, which hands destination filtering for host
+names to that proxy; otherwise the fetch is refused. URLs whose host is a
+literal IP address are still checked by vLLM. SOCKS proxies are not supported
+for media URL fetches.
 
 ### 5. **Restrict Media Download and Decode Sizes:**
 
