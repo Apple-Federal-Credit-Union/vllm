@@ -7,18 +7,19 @@ import functools
 from typing import Annotated, Literal
 
 import pydantic
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 import vllm.envs as envs
 from vllm.collect_env import get_env_info
 from vllm.config import VllmConfig
+from vllm.entrypoints.serve.middleware.authenticate import require_api_key
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 PydanticVllmConfig = pydantic.TypeAdapter(VllmConfig)
 
 

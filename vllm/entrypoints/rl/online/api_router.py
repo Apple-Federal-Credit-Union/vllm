@@ -5,7 +5,7 @@ import json
 from http import HTTPStatus
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from vllm.distributed.weight_transfer.base import (
@@ -15,6 +15,7 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.rl.online.metrics import weight_operation_metrics
+from vllm.entrypoints.serve.middleware.authenticate import require_api_key
 from vllm.logger import init_logger
 from vllm.v1.engine import PauseMode
 
@@ -25,7 +26,7 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 @router.post("/pause")

@@ -174,6 +174,7 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 ## Server in development mode
 
 When using the flag VLLM_SERVER_DEV_MODE=1, you enable development endpoints.
+When `--api-key` (or `VLLM_API_KEY`) is set, every endpoint in this section requires the same Bearer token as the `/v1` endpoints.
 
 **SECURITY WARNING: These endpoints should NOT be used in production!**
 

@@ -4,10 +4,11 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.middleware.authenticate import require_api_key
 from vllm.logger import init_logger
 from vllm.v1.engine import PauseMode
 
@@ -20,7 +21,7 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 @router.post("/sleep")
