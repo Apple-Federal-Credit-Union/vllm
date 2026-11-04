@@ -258,6 +258,7 @@ where
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
+            .layer(middleware::grpc_api_key_layer(state.clone()))
             .layer(middleware::request_runtime_layer(state.clone()))
             .add_service(health_service)
             .add_service(control_service)

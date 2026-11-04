@@ -39,11 +39,24 @@ except ImportError as e:
         "version mismatch — see the chained exception above for details."
     ) from e
 
+try:
+    from smg_grpc_servicer.vllm import resolve_servicer_impl
+except ImportError:  # Releases without the Rust servicer switch.
+    resolve_servicer_impl = None
+
 import uvloop
 
 from vllm import envs
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.common.startup import log_version_and_model
+from vllm.entrypoints.common.startup import (
+    log_version_and_model,
+    redact_sensitive_args,
+)
+from vllm.entrypoints.serve.middleware.authenticate import (
+    hash_api_tokens,
+    resolve_api_tokens,
+    verify_bearer_token,
+)
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -51,6 +64,68 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+# Like the HTTP /health route, the standard health service stays open so that
+# load balancers and Kubernetes gRPC probes, which send no metadata, work.
+_UNGUARDED_METHOD_PREFIX = "/grpc.health.v1.Health/"
+
+
+async def _reject_unauthenticated(request_or_iterator, context):
+    await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Unauthorized")
+
+
+class ApiKeyInterceptor(grpc.aio.ServerInterceptor):
+    """Require ``authorization: Bearer <api key>`` metadata on every RPC
+    except the standard health service, matching the HTTP
+    ``AuthenticationMiddleware``."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.api_tokens = hash_api_tokens(tokens)
+
+    def verify_token(self, metadata) -> bool:
+        for key, value in metadata or ():
+            if key == "authorization":
+                return isinstance(value, str) and verify_bearer_token(
+                    value, self.api_tokens
+                )
+        return False
+
+    async def intercept_service(self, continuation, handler_call_details):
+        handler = await continuation(handler_call_details)
+        if (
+            handler is None
+            or handler_call_details.method.startswith(_UNGUARDED_METHOD_PREFIX)
+            or self.verify_token(handler_call_details.invocation_metadata)
+        ):
+            return handler
+        # Match the RPC's streaming shape, and leave the request undecoded.
+        if handler.request_streaming and handler.response_streaming:
+            make_handler = grpc.stream_stream_rpc_method_handler
+        elif handler.request_streaming:
+            make_handler = grpc.stream_unary_rpc_method_handler
+        elif handler.response_streaming:
+            make_handler = grpc.unary_stream_rpc_method_handler
+        else:
+            make_handler = grpc.unary_unary_rpc_method_handler
+        return make_handler(_reject_unauthenticated)
+
+
+def check_api_key_support(args: argparse.Namespace) -> None:
+    """Refuse an API key that the selected servicer would not enforce.
+
+    smg-grpc-servicer replaces ``serve_grpc`` with its Rust servicer when
+    ``SMG_VLLM_SERVICER_IMPL`` or ``--servicer-impl`` selects ``rust``, which
+    skips ``ApiKeyInterceptor``. Must run before ``serve_grpc``.
+    """
+    if not resolve_api_tokens(args) or resolve_servicer_impl is None:
+        return
+    impl = resolve_servicer_impl(args)
+    if impl != "python":
+        raise ValueError(
+            "An API key is set (--api-key or VLLM_API_KEY), but the "
+            f"smg-grpc-servicer '{impl}' servicer does not enforce API keys. "
+            "Use the Python servicer or remove the API key."
+        )
 
 
 async def serve_grpc(args: argparse.Namespace):
@@ -61,9 +136,12 @@ async def serve_grpc(args: argparse.Namespace):
 
     """
     log_version_and_model(logger, VLLM_VERSION, args.model)
-    logger.info("vLLM gRPC server args: %s", args)
+    logger.info("vLLM gRPC server args: %s", redact_sensitive_args(vars(args)))
 
     start_time = time.time()
+
+    api_tokens = resolve_api_tokens(args)
+    interceptors = [ApiKeyInterceptor(api_tokens)] if api_tokens else []
 
     # Create engine args
     engine_args = AsyncEngineArgs.from_cli_args(args)
@@ -86,6 +164,7 @@ async def serve_grpc(args: argparse.Namespace):
 
     # Create gRPC server
     server = grpc.aio.server(
+        interceptors=interceptors,
         options=[
             ("grpc.max_send_message_length", -1),
             ("grpc.max_receive_message_length", -1),
@@ -196,6 +275,7 @@ def main():
 
     args = parser.parse_args()
     configure_logging_from_args(args)
+    check_api_key_support(args)
 
     # Run server
     try:

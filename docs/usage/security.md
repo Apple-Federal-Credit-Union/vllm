@@ -391,13 +391,15 @@ vLLM supports loading out-of-tree HTTP routes via the `vllm.endpoint_plugins` en
 
 ## gRPC Interface
 
-vLLM provides optional gRPC `Inference` and `Control` services on a separate TCP port, enabled via the `--grpc-port` flag. When not specified, no gRPC server is started. The gRPC listener binds to the same host address as the HTTP server.
+vLLM provides optional gRPC `Inference` and `Control` services on a separate TCP port, enabled via the `--grpc-port` flag. When not specified, no gRPC server is started. The gRPC listener binds to the same host address as the HTTP server. `vllm serve --grpc` instead replaces the HTTP server with the SMG `VllmEngine` gRPC server on `--port`.
 
-**Warning:** The gRPC interface is **insecure by default** — it does not implement authentication, authorization, or encryption. It should be considered a private, internal interface intended for use only between co-located services within a trusted network. Do not expose the gRPC port to the public internet or untrusted clients. If you enable the gRPC interface, protect it via network-level access controls such as firewall rules, network segmentation, or deployment on an isolated private network.
+**Warning:** The gRPC interface is **insecure by default** — without `--api-key` it does not implement authentication, and it implements no authorization. `vllm serve --grpc` never encrypts traffic, so an API key sent to it travels in plaintext. It should be considered a private, internal interface intended for use only between co-located services within a trusted network. Do not expose the gRPC port to the public internet or untrusted clients. If you enable the gRPC interface, protect it via network-level access controls such as firewall rules, network segmentation, or deployment on an isolated private network.
+
+When `--api-key` (or `VLLM_API_KEY`) is set, both gRPC servers require `authorization: Bearer <key>` metadata on every call and reject other calls with `UNAUTHENTICATED`. The standard `grpc.health.v1.Health` service stays unauthenticated, like the HTTP `/health` endpoint, so that Kubernetes gRPC probes keep working. smg-grpc-servicer's Rust servicer (`SMG_VLLM_SERVICER_IMPL=rust` or `--servicer-impl rust`) does not enforce API keys, so `vllm serve --grpc` refuses to start when it is selected together with an API key.
 
 ### Security Implications
 
-An attacker who can reach the gRPC port can:
+Without `--api-key`, an attacker who can reach the gRPC port can:
 
 1. **Run arbitrary inference** via the `Generate` and `GenerateStream` RPCs without any credentials
 2. **Mutate engine state** by pausing generation, sleeping the engine, or initiating configured RL weight updates through the `Control` service
