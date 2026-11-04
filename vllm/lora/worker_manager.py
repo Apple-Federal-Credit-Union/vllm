@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Literal
 
@@ -10,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.exceptions import LoRAAdapterNotFoundError
 from vllm.logger import init_logger
+from vllm.lora.adapter_path import bound_adapter_dir
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.model_manager import (
     LoRAModelManager,
@@ -22,6 +24,15 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _local_adapter_dir(lora_request: LoRARequest) -> Iterator[str]:
+    if lora_request.lora_path_root is None:
+        yield get_adapter_absolute_path(lora_request.lora_path)
+        return
+    with bound_adapter_dir(lora_request.lora_path_root, lora_request.lora_path) as path:
+        yield path
 
 
 class WorkerLoRAManager:
@@ -116,39 +127,40 @@ class WorkerLoRAManager:
                 if module == "experts":
                     expected_lora_lst.append(module)
             expected_lora_modules = set(expected_lora_lst)
-            lora_path = get_adapter_absolute_path(lora_request.lora_path)
 
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path, self.max_position_embeddings
-            )
+            with _local_adapter_dir(lora_request) as lora_path:
+                peft_helper = PEFTHelper.from_local_dir(
+                    lora_path, self.max_position_embeddings
+                )
 
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
-            peft_helper.validate_legal(self.lora_config)
+                # Validates the LoRA configuration against requirements before
+                # loading weights, throwing an exception if validation fails.
+                peft_helper.validate_legal(self.lora_config)
 
-            # For some models like Qwen2VL, we need to use hf_to_vllm_mapper to ensure
-            # correct loading of lora weights. We only need to know about renames for
-            # this, so we use get_rename_mapper() to ignore stacking and deletions.
-            model = self._adapter_manager.model
-            hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
-            if hf_to_vllm_mapper is not None:
-                hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
+                # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
+                # to ensure correct loading of lora weights. We only need to know
+                # about renames for this, so we use get_rename_mapper() to ignore
+                # stacking and deletions.
+                model = self._adapter_manager.model
+                hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+                if hf_to_vllm_mapper is not None:
+                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
 
-            # Get model-defined prefixes to skip during LoRA loading.
-            lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+                # Get model-defined prefixes to skip during LoRA loading.
+                lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
 
-            lora = self._lora_model_cls.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.lora_config.lora_dtype,
-                model_vocab_size=self.vocab_size,
-                weights_mapper=hf_to_vllm_mapper,
-                skip_prefixes=lora_skip_prefixes,
-                moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
-            )
+                lora = self._lora_model_cls.from_local_checkpoint(
+                    lora_path,
+                    expected_lora_modules,
+                    peft_helper=peft_helper,
+                    lora_model_id=lora_request.lora_int_id,
+                    device="cpu",
+                    dtype=self.lora_config.lora_dtype,
+                    model_vocab_size=self.vocab_size,
+                    weights_mapper=hf_to_vllm_mapper,
+                    skip_prefixes=lora_skip_prefixes,
+                    moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
+                )
             # Stamp the on-disk MoE layout onto the loaded model so the
             # adapter manager can route 3D-format checkpoints through the
             # 3D->2D conversion when running under the universal 2D wrapper.

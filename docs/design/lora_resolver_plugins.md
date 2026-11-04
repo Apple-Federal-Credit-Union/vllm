@@ -102,6 +102,8 @@ Each adapter directory must contain:
 
 - **`adapter_model.bin`**: The LoRA adapter weights file
 
+The requested model name is treated as a path relative to `VLLM_LORA_RESOLVER_CACHE_DIR` and must name a subdirectory of it. Absolute names, names containing `..` segments, and symlinks that resolve to a directory outside the cache directory are not resolved. Symlinks that stay inside the cache directory are followed, and the adapter is loaded from the resolved directory.
+
 #### Usage Example
 
 1. **Prepare your LoRA adapter**:
