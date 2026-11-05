@@ -1948,7 +1948,12 @@ class EngineCoreProc(EngineCore):
             input_sockets = [
                 stack.enter_context(
                     make_zmq_socket(
-                        ctx, input_address, zmq.DEALER, identity=identity, bind=False
+                        ctx,
+                        input_address,
+                        zmq.DEALER,
+                        identity=identity,
+                        bind=False,
+                        authenticate=False,
                     )
                 )
                 for input_address in input_addresses

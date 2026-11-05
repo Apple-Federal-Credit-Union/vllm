@@ -24,6 +24,7 @@ from fastapi import FastAPI, Response
 
 import vllm.envs as envs
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.utils.network_utils import require_shared_zmq_auth_secret
 from vllm.utils.system_utils import (
     decorate_logs,
     kill_process_tree,
@@ -561,4 +562,10 @@ class DPSupervisor:
 
 def run_dp_supervisor(args: argparse.Namespace) -> None:
     configure_logging_from_args(args)
-    uvloop.run(DPSupervisor(args).run())
+    supervisor = DPSupervisor(args)
+    if args.data_parallel_size_local < args.data_parallel_size:
+        require_shared_zmq_auth_secret(
+            "Data parallel ranks on other nodes must authenticate with the "
+            "ranks supervised here."
+        )
+    uvloop.run(supervisor.run())

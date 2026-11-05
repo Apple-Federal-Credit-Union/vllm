@@ -104,6 +104,7 @@ class ZmqClientTransport:
             path=make_zmq_path(scheme="tcp", host=host, port=port),
             socket_type=zmq.DEALER,
             bind=False,
+            authenticate=False,
         )
         dealer.setsockopt(zmq.HEARTBEAT_IVL, _HEARTBEAT_IVL_MS)
         dealer.setsockopt(zmq.HEARTBEAT_TIMEOUT, _HEARTBEAT_TIMEOUT_MS)
@@ -181,6 +182,7 @@ class ZmqServerTransport:
             path=make_zmq_path(scheme="tcp", host=host, port=port),
             socket_type=zmq.ROUTER,
             bind=True,
+            authenticate=False,
         )
         self._poller = zmq.Poller()
         self._poller.register(self._router, zmq.POLLIN)
