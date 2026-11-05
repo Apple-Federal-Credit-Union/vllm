@@ -310,9 +310,18 @@ Only deployments whose API clients are trusted should start the server with
 `--trust-request-mm-kwargs` to restore per-request overrides. Do not enable
 this option on an endpoint exposed to untrusted clients.
 
+### KV and EC Transfer Peers
+
+`kv_transfer_params` and `ec_transfer_params` in API requests carry the address of the peer instance to transfer KV cache or encoder outputs with (and MoRI-IO also reads it from the request id). vLLM only connects to a request-supplied peer whose host is listed in `kv_peer_hosts` of `--kv-transfer-config` (or, for `ECCPUConnector`, `ec_peer_hosts` of `--ec-transfer-config`); a request naming any other host is served without the transfer. Both lists are empty by default, which refuses every request-supplied peer.
+
+**Recommendations:**
+
+- List only the hosts or networks of the instances that pair with this one. A broad network such as `0.0.0.0/0` lets any API client direct the server to connect to arbitrary hosts, including cloud metadata services.
+- Peers on the list are trusted: a client can still pick which listed peer a request transfers with, so keep API access to P/D instances limited to the router where possible.
+
 ### P2P KV-Offload Peer Session Limits
 
-Deployments that enable the P2P secondary tier (`OffloadingConnector` with `TieringOffloadingSpec` and a `p2p` secondary tier) accept peer addresses from `kv_transfer_params` in API requests. Without limits, an attacker with API access could submit many unique non-listening peer addresses, each consuming ZeroMQ sockets until the context quota is exhausted, crashing the EngineCore.
+Deployments that enable the P2P secondary tier (`OffloadingConnector` with `TieringOffloadingSpec` and a `p2p` secondary tier) accept peer addresses from `kv_transfer_params` in API requests, restricted to `kv_peer_hosts` as described above. Without limits, an attacker with API access could submit many unique non-listening peer addresses on those hosts, each consuming ZeroMQ sockets until the context quota is exhausted, crashing the EngineCore.
 
 vLLM enforces several configurable limits to prevent this:
 

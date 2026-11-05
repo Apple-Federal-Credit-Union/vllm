@@ -18,6 +18,7 @@ from typing_extensions import override
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.core.kv_cache_utils import get_none_hash_seed
 from vllm.v1.kv_offload.base import (
     LookupResult,
@@ -327,6 +328,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # before init_none_hash runs, and a non-cryptographic hash algorithm
         # seeds NONE_HASH randomly, so the value is only known afterwards.
         self._hash_seed: str | None = None
+        self._peer_hosts = PeerHostAllowlist(
+            offloading_spec.config.peer_hosts, "kv_transfer_config.kv_peer_hosts"
+        )
         if host is None:
             host = envs.VLLM_P2P_SIDE_CHANNEL_HOST
         if port is None:
@@ -454,7 +458,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         _annotate_req_context(req_context)
         source = req_context.get_state(P2PSourceInfo)
         if source is not None:
-            session = self._get_or_create_session(source.peer_id)
+            session = None
+            if self._is_allowed_peer(source.peer_id):
+                session = self._get_or_create_session(source.peer_id)
             if session is None:
                 self._failed_req_ids.add(source.kv_request_id)
         dest = req_context.get_state(P2PDestInfo)
@@ -713,6 +719,20 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if self._hash_seed is None:
             self._hash_seed = get_none_hash_seed()
         return self._hash_seed
+
+    def _is_allowed_peer(self, peer_id: str) -> bool:
+        """Whether a request-supplied ``host:port`` names an allowed peer.
+
+        Splits the id exactly as the control transport does before dialing.
+        """
+        host, _, port = peer_id.rpartition(":")
+        try:
+            self._peer_hosts.check_host(host)
+            self._peer_hosts.check_port(port)
+        except ValueError as e:
+            logger.warning("P2P %s: refusing peer %s: %s", self._local_id, peer_id, e)
+            return False
+        return True
 
     def _get_or_create_session(self, peer_id: str) -> P2PSession | None:
         """Return the existing session for peer_id, or open one outbound.

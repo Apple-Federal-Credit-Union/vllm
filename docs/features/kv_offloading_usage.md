@@ -344,6 +344,8 @@ Rather than embedding `host`/`port` in each `secondary_tiers` entry, set them on
 
 #### Orchestration-Layer Protocol
 
+A consumer only opens a session to a `remote_host` listed in `kv_peer_hosts` of `--kv-transfer-config`; requests naming any other peer are served without the P2P pull. See [Allowed KV transfer peers](disagg_prefill.md#allowed-kv-transfer-peers).
+
 The P2P tier does not decide *which* peer to pull from — that is the orchestration layer's job (the router/EPP and its scheduler). The orchestrator drives every transfer through a request's `kv_transfer_params` dict: it picks the request's role, allocates a unique transaction ID, and supplies the remote peer's address. All block lookup, hash matching, and NIXL transfer happen at the tier level below; the orchestrator only sets the correct role keys and enforces the allowed combinations.
 
 Every vLLM instance is a symmetric **peer**. Per request it acts as a **consumer** (pulls KV blocks from a remote peer's CPU cache instead of computing locally) or a **producer** (serves blocks from its own CPU cache to remote consumers) — or both, on the same session, for different requests. Roles are chosen per request by the keys below; there are no fixed prefiller/decoder processes.

@@ -92,8 +92,10 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5601 \
 vllm serve Qwen/Qwen3-0.6B \
   --port 8200 \
   --enforce-eager \
-  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail","kv_peer_hosts":["localhost"]}'
 ```
+
+`kv_peer_hosts` lists the prefiller hosts this decoder may connect to; a `remote_host` outside it is refused. See [Allowed KV transfer peers](disagg_prefill.md#allowed-kv-transfer-peers).
 
 ### Proxy Server
 
@@ -353,7 +355,7 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
 UCX_NET_DEVICES=all \
 vllm serve Qwen/Qwen3-0.6B --port 8000 \
   --tensor-parallel-size 8 \
-  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail","kv_peer_hosts":["'"${IP1}"'","'"${IP2}"'"]}'
 
 # Decoder 2 on Machine D (example IP: ${IP4})
 VLLM_NIXL_SIDE_CHANNEL_HOST=${IP4} \
@@ -361,7 +363,7 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
 UCX_NET_DEVICES=all \
 vllm serve Qwen/Qwen3-0.6B --port 8000 \
   --tensor-parallel-size 8 \
-  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail","kv_peer_hosts":["'"${IP1}"'","'"${IP2}"'"]}'
 ```
 
 ### Proxy for Multiple Instances

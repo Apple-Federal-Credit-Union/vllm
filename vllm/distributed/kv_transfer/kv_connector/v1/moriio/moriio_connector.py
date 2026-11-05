@@ -103,6 +103,7 @@ from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import (
+    PeerHostAllowlist,
     make_zmq_path,
     make_zmq_socket,
 )
@@ -697,6 +698,9 @@ class MoRIIOConnectorScheduler:
         self.handshake_port = self.kv_transfer_config.kv_connector_extra_config[
             "handshake_port"
         ]
+        self._peer_hosts = PeerHostAllowlist(
+            self.kv_transfer_config.kv_peer_hosts, "kv_transfer_config.kv_peer_hosts"
+        )
         logger.info("Initializing MoRIIO Scheduler engine_id = %s", engine_id)
 
         self.side_notify_port = self.kv_transfer_config.kv_connector_extra_config[
@@ -864,11 +868,49 @@ class MoRIIOConnectorScheduler:
         the full length. On a full hit that leaves ``num_computed_tokens ==
         num_tokens`` and trips the scheduler's ``num_new_tokens > 0`` assert.
         """
+        self._authorize_remote_peers(request)
         if not (self.is_producer and self._has_mamba):
             return
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
             self._truncate_mamba_request_for_prefill(request)
+
+    def _authorize_remote_peers(self, request: "Request") -> None:
+        """Check every peer host this request could make this instance dial.
+
+        That is the peer address embedded in the request id plus
+        ``remote_host`` and ``remote_hosts``. A request naming any host outside
+        ``kv_peer_hosts`` is served without KV transfer.
+        """
+        params = request.kv_transfer_params
+        if not params:
+            return
+        dials_prefill = bool(params.get("do_remote_prefill"))
+        dials_decode = (
+            bool(params.get("do_remote_decode")) and self.mode == MoRIIOMode.WRITE
+        )
+        if not (dials_prefill or dials_decode):
+            return
+        try:
+            hosts: list[Any] = []
+            for is_producer, dials in ((False, dials_prefill), (True, dials_decode)):
+                if not dials:
+                    continue
+                peer_zmq = get_peer_zmq_from_request_id(request.request_id, is_producer)
+                if peer_zmq is not None:
+                    hosts.append(parse_moriio_zmq_address(peer_zmq)[0])
+            if params.get("remote_host"):
+                hosts.append(params["remote_host"])
+            pod_hosts = params.get("remote_hosts") or []
+            hosts.extend(pod_hosts if isinstance(pod_hosts, list) else [pod_hosts])
+            for host in hosts:
+                self._peer_hosts.check_host(host)
+        except ValueError as e:
+            logger.warning(
+                "Ignoring KV transfer for request %s: %s", request.request_id, e
+            )
+            params["do_remote_prefill"] = False
+            params["do_remote_decode"] = False
 
     def _truncate_mamba_request_for_prefill(self, request: "Request") -> None:
         """P-side only: drop the last prompt token so the prefiller computes
@@ -1024,6 +1066,7 @@ class MoRIIOConnectorScheduler:
         params = request.kv_transfer_params
         if not params:
             return
+        self._authorize_remote_peers(request)
         # LLM-D sidecar compat: the nixlv2 routing sidecar emits NIXL-shaped
         # kv_transfer_params without MoRI-IO's transfer_id. Synthesize one
         # deterministically from request_id so producer and consumer agree
@@ -1552,6 +1595,7 @@ class MoRIIOConnectorScheduler:
         if not params:
             return False, None
 
+        self._authorize_remote_peers(request)
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,
             # update_state_after_alloc must not have been called (the request

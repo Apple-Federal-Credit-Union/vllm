@@ -245,7 +245,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             temp_config = copy.copy(vllm_config)
             engine_id = ktc.get("engine_id", vllm_config.kv_transfer_config.engine_id)
             temp_config.kv_transfer_config = KVTransferConfig(
-                **ktc, engine_id=engine_id
+                **{
+                    "kv_peer_hosts": vllm_config.kv_transfer_config.kv_peer_hosts,
+                    **ktc,
+                },
+                engine_id=engine_id,
             )
             ret.append(
                 (

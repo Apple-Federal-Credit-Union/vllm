@@ -29,6 +29,7 @@ from vllm.distributed.ec_transfer.ec_connector.utils import (
     collect_ec_item_metadata,
 )
 from vllm.logger import init_logger
+from vllm.utils.network_utils import PeerHostAllowlist
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -85,6 +86,9 @@ class ECCPUScheduler:
         )
 
         self._ec_config = ec_config
+        self._peer_hosts = PeerHostAllowlist(
+            ec_config.ec_peer_hosts, "ec_transfer_config.ec_peer_hosts"
+        )
         # NIXL p2p is an option of this connector, not engine-wide behavior, so
         # it lives in extra config. Extra config is not type coerced, so a value
         # that arrived as a JSON/CLI string is parsed, not truth-tested.
@@ -294,6 +298,11 @@ class ECCPUScheduler:
             # held by a quarantined/settling DMA and cannot be reused.
             return False
 
+        try:
+            self._peer_hosts.check_host(remote["peer_host"])
+            remote["peer_port"] = self._peer_hosts.check_port(remote.get("peer_port"))
+        except ValueError as error:
+            raise _RemoteUnavailable(str(error)) from error
         try:
             size = int(remote["size_bytes"])
             shape = tuple(int(dim) for dim in remote["shape"])

@@ -27,7 +27,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --port 8010 --kv-transfer-config '{"kv_conne
 ### Decoder Node (192.168.0.3)
 
 ```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct --port 8020 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}'
+vllm serve Qwen/Qwen2.5-7B-Instruct --port 8020 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_peer_hosts":["192.168.0.2"]}'
 ```
 
 ### Proxy
@@ -74,6 +74,10 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
 - **kv_producer**: For prefiller instances that generate KV caches
 - **kv_consumer**: For decoder instances that consume KV caches from prefiller
 - **kv_both**: Enables symmetric functionality where the connector can act as both producer and consumer. This provides flexibility for experimental setups and scenarios where the role distinction is not predetermined.
+
+### kv_peer_hosts
+
+Hosts whose bootstrap server a decoder may query. The host of each request's `remote_bootstrap_addr` (an `http`/`https` URL) must be listed; other requests are served without remote prefill. See [Allowed KV transfer peers](disagg_prefill.md#allowed-kv-transfer-peers).
 
 ### kv_connector_extra_config
 

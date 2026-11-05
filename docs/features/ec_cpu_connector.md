@@ -49,9 +49,12 @@ Consumer — pulls encodings named in a request's `ec_transfer_params` before fa
 vllm serve <model> --ec-transfer-config '{
   "ec_connector": "ECCPUConnector",
   "ec_role": "ec_consumer",
+  "ec_peer_hosts": ["10.0.0.0/24"],
   "ec_connector_extra_config": {"ec_enable_nixl": true, "ec_cpu_bytes": 1073741824}
 }'
 ```
+
+The consumer only reads from a producer whose `peer_host` is listed in `ec_peer_hosts` (IP, CIDR network, or exact hostname); other announcements fall back to local encoding.
 
 ### Orchestration flow
 

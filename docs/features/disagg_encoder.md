@@ -62,6 +62,18 @@ and compares the disaggregated outputs against it. Set `MODEL` to use another mo
 or `MOONCAKE_EC_PROTOCOL=rdma` to use RDMA on supported hardware. See the script for
 additional configuration options.
 
+### Allowed EC transfer peers
+
+With `ECCPUConnector` and NIXL, a consumer only reads from the encoder
+producer's `peer_host` in a request's `ec_transfer_params` if that host is
+listed in `ec_peer_hosts` of `--ec-transfer-config`. Entries are IP addresses,
+CIDR networks, or exact hostnames; the default empty list refuses every
+request-supplied peer:
+
+```bash
+--ec-transfer-config '{"ec_connector":"ECCPUConnector","ec_role":"ec_consumer","ec_peer_hosts":["10.0.0.0/24"]}'
+```
+
 ### Audio inputs
 
 The Python EPD proxy also rewrites audio in `/v1/chat/completions` into

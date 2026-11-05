@@ -78,6 +78,14 @@ class KVTransferConfig:
     kv_connector_extra_config: dict[str, Any] = field(default_factory=dict)
     """any extra config that the connector may need."""
 
+    kv_peer_hosts: list[str] = field(default_factory=list)
+    """Hosts that `kv_transfer_params` in a request may tell this instance to
+    connect to for KV transfer: IP addresses, CIDR networks (e.g.
+    `10.0.0.0/16`), or hostnames. A requested IP must fall inside a listed
+    network; any other host must exactly match a listed hostname. Requests
+    naming any other peer are served without KV transfer. Empty (the default)
+    refuses every request-supplied peer."""
+
     kv_connector_module_path: str | None = None
     """The Python module path to dynamically load the KV connector from.
     Only supported in V1."""

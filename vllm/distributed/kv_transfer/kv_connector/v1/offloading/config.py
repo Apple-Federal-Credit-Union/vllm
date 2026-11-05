@@ -320,4 +320,5 @@ def build_offloading_config(
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
+        peer_hosts=tuple(kv_transfer_config.kv_peer_hosts),
     )
