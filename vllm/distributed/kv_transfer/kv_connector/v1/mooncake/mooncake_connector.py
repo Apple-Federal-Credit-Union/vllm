@@ -2452,7 +2452,12 @@ class MooncakeConnectorWorker:
             )
             try:
                 with make_zmq_socket(
-                    self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
+                    self.async_zmq_ctx,
+                    worker_addr,
+                    zmq.DEALER,
+                    bind=False,
+                    linger=0,
+                    authenticate=False,
                 ) as sock:
                     sock.setsockopt(
                         zmq.RCVTIMEO,

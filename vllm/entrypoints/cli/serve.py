@@ -23,7 +23,7 @@ from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import get_tcp_uri
+from vllm.utils.network_utils import get_tcp_uri, require_shared_zmq_auth_secret
 from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
 from vllm.v1.executor import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -231,6 +231,10 @@ def run_headless(args: argparse.Namespace):
         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
         executor.start_worker_monitor(inline=True)
         return
+
+    require_shared_zmq_auth_secret(
+        "Headless data parallel engines must authenticate with the head node."
+    )
 
     host = parallel_config.data_parallel_master_ip
     port = parallel_config.data_parallel_rpc_port

@@ -653,6 +653,8 @@ class MPClient(EngineCoreClient):
                 tensor_queue = client_addresses.get("tensor_queue")
                 input_listener = client_addresses.get("input_listener")
                 output_listener = client_addresses.get("output_listener")
+                # Engines only send a ready message on the input socket, at
+                # startup. Outputs arrive on the authenticated output socket.
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx,
                     input_address,
@@ -660,6 +662,7 @@ class MPClient(EngineCoreClient):
                     bind=True,
                     router_handover=enable_input_socket_handover,
                     listener=input_listener,
+                    authenticate=False,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx,
@@ -680,6 +683,7 @@ class MPClient(EngineCoreClient):
                     zmq.ROUTER,
                     bind=True,
                     router_handover=enable_input_socket_handover,
+                    authenticate=False,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, bind_addresses.outputs[0], zmq.PULL
@@ -770,9 +774,9 @@ class MPClient(EngineCoreClient):
                         f"timeout, set the environment variable: "
                         f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
-                identity, payload = sync_input_socket.recv_multipart()
-                identities.remove(identity)
-                self._apply_ready_response(payload)
+                identity = self._recv_ready_message(sync_input_socket, identities)
+                if identity is not None:
+                    identities.remove(identity)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -847,6 +851,30 @@ class MPClient(EngineCoreClient):
         Thread(
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
+
+    def _recv_ready_message(
+        self, input_socket: zmq.Socket, pending: set[EngineIdentity]
+    ) -> EngineIdentity | None:
+        """Apply one ready message from a pending engine.
+
+        Returns:
+            The engine identity, or None if the message was ignored.
+
+        """
+        frames = input_socket.recv_multipart()
+        if len(frames) != 2 or frames[0] not in pending:
+            logger.warning("Ignoring unexpected message on the engine input socket.")
+            return None
+        identity, payload = frames
+        try:
+            self._apply_ready_response(payload)
+        except msgspec.MsgspecError:
+            logger.warning(
+                "Ignoring malformed ready message for engine %d.",
+                int.from_bytes(identity, "little"),
+            )
+            return None
+        return identity
 
     def _apply_ready_response(self, payload: bytes) -> None:
         """Decode an EngineCoreReadyResponse and sync any post-initialization
@@ -1985,9 +2013,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     f"timeout, set the environment variable: "
                     f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                 )
-            identity, payload = sync_input_socket.recv_multipart()
-            new_engine_identities.discard(identity)
-            self._apply_ready_response(payload)
+            identity = self._recv_ready_message(
+                sync_input_socket, new_engine_identities
+            )
+            if identity is not None:
+                new_engine_identities.remove(identity)
 
     def _make_reconfig_request(
         self,

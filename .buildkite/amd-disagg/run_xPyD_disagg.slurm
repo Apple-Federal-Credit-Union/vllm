@@ -232,6 +232,10 @@ echo "[disagg-pd] LOG_PATH=$LOG_PATH"
 #   rank xP .. end   -> decode
 export IPADDRS
 
+# DP ranks on different nodes authenticate their ZMQ sockets with this secret.
+VLLM_ZMQ_AUTH_SECRET="${VLLM_ZMQ_AUTH_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
+export VLLM_ZMQ_AUTH_SECRET
+
 export WIDE_EP_MODE xP yD GPUS_PER_NODE RUN_AFTER_HEALTH HEALTH_TIMEOUT_S DRY_RUN MORIIO_READ_MODE
 export IMAGE SHARED_MOUNT CONTAINER_SCRIPTS DISAGG_SCRIPTS_DIR
 export CLUSTER_ENV="${CLUSTER_ENV_IN}"
@@ -505,6 +509,7 @@ run_node_container() {
         "${IONIC_MOUNTS[@]}" \
         --ulimit memlock=-1:-1 \
         -e HF_TOKEN \
+        -e VLLM_ZMQ_AUTH_SECRET \
 	-e HOME=/workspace \
         -e USER="$(id -un)" \
         -e LOGNAME="$(id -un)" \

@@ -20,6 +20,17 @@ This document focuses on online deployments (with the API server). DP + EP is al
 
 There are two distinct modes supported for online deployments - self-contained with internal load balancing, or externally per-rank process deployment and load balancing.
 
+## Authenticating Separately Launched Ranks
+
+When engines, front-ends, and the DP Coordinator communicate over TCP, their ZMQ sockets require ZMQ CURVE authentication keyed by the `VLLM_ZMQ_AUTH_SECRET` environment variable, and a socket rejects any peer that does not hold the secret. A single `vllm serve` command (including `--data-parallel-backend=ray`) generates the secret and passes it to every process it starts, so no setup is needed.
+
+When ranks are started by separate `vllm serve` commands (for example `--headless` nodes, `--data-parallel-rank`, `--data-parallel-start-rank`, or `--data-parallel-multi-port-external-lb` across nodes), set the same random value of at least 32 characters on every one of them, and keep it secret. vLLM refuses to start these ranks when it is unset:
+
+```bash
+# Generate once and distribute to every node, e.g. through your secret store.
+export VLLM_ZMQ_AUTH_SECRET="$(openssl rand -hex 32)"
+```
+
 ## Internal Load Balancing
 
 vLLM supports "self-contained" data parallel deployments that expose a single API endpoint.

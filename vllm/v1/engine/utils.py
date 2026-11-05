@@ -27,6 +27,7 @@ from vllm.utils.network_utils import (
     get_open_zmq_ipc_path,
     get_tcp_uri,
     make_zmq_listener,
+    require_shared_zmq_auth_secret,
     zmq_socket_ctx,
 )
 from vllm.utils.system_utils import get_mp_context, set_env_var
@@ -1358,6 +1359,14 @@ def launch_core_engines(
     else:
         local_handshake_address = handshake_address
         client_handshake_address = None
+
+    if client_handshake_address is not None or not all(
+        engine.local for engine in engines_to_handshake
+    ):
+        require_shared_zmq_auth_secret(
+            "Data parallel ranks launched by another vLLM process must "
+            "authenticate with this one."
+        )
 
     with zmq_socket_ctx(
         local_handshake_address, zmq.ROUTER, bind=True

@@ -2323,6 +2323,7 @@ class LookupKeyServer:
             socket_path,
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
+            authenticate=False,
         )
 
         self.store_worker = store_worker
@@ -2393,6 +2394,7 @@ class LookupKeyClient:
             socket_path,
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
+            authenticate=False,
         )
 
         # Async lookup support

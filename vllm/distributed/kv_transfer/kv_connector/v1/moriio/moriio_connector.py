@@ -909,7 +909,11 @@ class MoRIIOConnectorScheduler:
         if path not in self.paths:
             ctx = zmq.Context.instance()
             sock = make_zmq_socket(
-                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
+                ctx=ctx,
+                path=path,
+                socket_type=zmq.DEALER,
+                bind=False,
+                authenticate=False,
             )
             self.paths[path] = sock
 
@@ -933,7 +937,11 @@ class MoRIIOConnectorScheduler:
         if path not in self.paths:
             ctx = zmq.Context.instance()
             sock = make_zmq_socket(
-                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
+                ctx=ctx,
+                path=path,
+                socket_type=zmq.DEALER,
+                bind=False,
+                authenticate=False,
             )
             self.paths[path] = sock
 
