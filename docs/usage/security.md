@@ -25,6 +25,7 @@ The following options control internode communications in vLLM:
 
 - `data_parallel_master_ip`: IP of the data parallel master (default: 127.0.0.1)
 - `data_parallel_master_port`: Port of the data parallel master (default: 29500)
+- `VLLM_ZMQ_AUTH_SECRET`: Shared secret for the ZMQ CURVE authentication of the engine, DP Coordinator, and front-end sockets that use TCP. Ranks started by separate `vllm serve` commands must all set the same value; see [Data Parallel Deployment](../serving/data_parallel_deployment.md#authenticating-separately-launched-ranks). The engine input socket, which receives requests from the front-end, is not authenticated, and neither is the Rust front-end (`VLLM_USE_RUST_FRONTEND=1`).
 
 ### Notes on PyTorch Distributed
 
