@@ -15,6 +15,9 @@
 
 # set -xe
 
+# Shared key that authenticates the NIXL handshake between these instances.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
+
 # Resolve the repository root from the script location instead of `.git`.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 GIT_ROOT="${GIT_ROOT:-$(cd -- "${SCRIPT_DIR}/../../../.." && pwd -P)}"

@@ -29,6 +29,8 @@
 #                         NVIDIA options: FLASH_ATTN, FLASHINFER
 #   VLLM_SSM_CONV_STATE_LAYOUT - SSM conv state layout (e.g. "DS" required for Mamba models)
 #   VLLM_SERVE_EXTRA_ARGS - comma-separated extra args for vllm serve
+# Shared key that authenticates the NIXL handshake between these instances.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 set -ex
 
 # ── Model & spec decode config ──────────────────────────────────────────

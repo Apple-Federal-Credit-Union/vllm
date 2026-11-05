@@ -25,6 +25,8 @@
 #   VLLM_SERVE_EXTRA_ARGS    - comma-separated extra args for vllm serve
 #   SKIP_CROSS_LAYERS        - set to 1 to skip the cross-layer layout test
 #   SKIP_NORMAL_LAYOUT       - set to 1 to skip the normal layout test
+# Shared key that authenticates the NIXL handshake between these instances.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 set -xe
 
 # ── Configuration ────────────────────────────────────────────────────────

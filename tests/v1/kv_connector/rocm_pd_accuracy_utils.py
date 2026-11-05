@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import random
+import secrets
 import signal
 import socket
 import subprocess
@@ -177,6 +178,7 @@ def run_rocm_pd_accuracy(connector, model, prefill_tp, decode_tp, monkeypatch):
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_ROCM_USE_AITER": "1",
         "VLLM_KV_CACHE_LAYOUT": "HND",
+        "VLLM_NIXL_SIDE_CHANNEL_KEY": secrets.token_hex(32),
     }
     with contextlib.ExitStack() as stack:
         bootstrap_port = 0
