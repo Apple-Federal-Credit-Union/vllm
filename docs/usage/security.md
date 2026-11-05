@@ -329,6 +329,16 @@ Connections that fail (ZMQ socket errors, handshake failures) are handled gracef
 - **Public-facing deployments with P2P enabled:** Lower `VLLM_P2P_MAX_PEERS` to the expected number of legitimate peers (e.g., `16` or `32`).
 - **Sensitive deployments:** Consider deploying behind a reverse proxy that strips or validates `kv_transfer_params` from API requests to prevent client-supplied peer addresses entirely.
 
+### Mooncake Bootstrap Server
+
+`MooncakeConnector` prefillers run an HTTP bootstrap server where workers register their KV transfer endpoints and decoders look them up. It requires `Authorization: Bearer <VLLM_MOONCAKE_BOOTSTRAP_TOKEN>` on every request and rejects all requests when that variable is unset. It listens only on the prefiller's management address (`VLLM_MOONCAKE_BOOTSTRAP_HOST`, `127.0.0.1` by default), and a registered rank cannot be replaced by a different address or engine.
+
+**Recommendations:**
+
+- Generate a random `VLLM_MOONCAKE_BOOTSTRAP_TOKEN`, provide it through a secret store, and set the same value on prefillers, decoders and the proxy.
+- The token is sent in plain HTTP. Keep the bootstrap port on the isolated KV transfer network.
+- Decoders contact the `remote_bootstrap_addr` in `kv_transfer_params` with a credential derived from the token that only authorizes `GET /query`. Strip or validate `kv_transfer_params` at the proxy so untrusted API clients cannot choose the bootstrap and KV transfer endpoints a decoder contacts.
+
 ## Tool Server and MCP Security
 
 vLLM supports connecting to external tool servers via the `--tool-server` argument. This enables models to call tools through the Responses API (`/v1/responses`). Tool server support works with all models — it is not limited to specific model architectures.

@@ -1,20 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
+import hmac
 import socket
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
 from vllm.logger import init_logger
 
 WorkerAddr = str
 
 logger = init_logger(__name__)
+
+
+def _query_credential(token: bytes) -> bytes:
+    return (
+        hmac.new(token, b"mooncake-bootstrap-query", hashlib.sha256)
+        .hexdigest()
+        .encode()
+    )
+
+
+def bootstrap_auth_headers(*, query_only: bool = False) -> dict[str, str]:
+    """Returns the credential that bootstrap server clients must send.
+
+    Args:
+        query_only: Send a credential derived from the token that only
+            authorizes ``GET /query``. Decoders use it because they send it
+            to the bootstrap address named in ``kv_transfer_params``.
+
+    Raises:
+        RuntimeError: If VLLM_MOONCAKE_BOOTSTRAP_TOKEN is not set.
+
+    """
+    token = envs.VLLM_MOONCAKE_BOOTSTRAP_TOKEN
+    if not token:
+        raise RuntimeError(
+            "VLLM_MOONCAKE_BOOTSTRAP_TOKEN must be set to the same value on "
+            "every prefiller, decoder and proxy that uses the Mooncake "
+            "bootstrap server."
+        )
+    credential = _query_credential(token.encode()).decode() if query_only else token
+    return {"Authorization": f"Bearer {credential}"}
 
 
 class RegisterWorkerPayload(BaseModel):
@@ -33,14 +69,26 @@ class EngineEntry:
 
 
 class MooncakeBootstrapServer:
-    """A centralized registry for prefiller connection info (IP, port, ranks)."""
+    """A centralized registry for prefiller connection info (IP, port, ranks).
 
-    def __init__(self, host: str, port: int):
+    Every request must carry ``Authorization: Bearer <token>``; ``GET /query``
+    also accepts the query-only credential derived from it. Without a
+    configured token the server rejects every request.
+    """
+
+    def __init__(self, host: str, port: int, *, token: str | None):
         self.workers: dict[int, EngineEntry] = {}
 
         self.host = host
         self.port = port
-        self.app = FastAPI()
+        self._token = token.encode() if token else None
+        if self._token is None:
+            logger.error(
+                "VLLM_MOONCAKE_BOOTSTRAP_TOKEN is not set; the Mooncake "
+                "bootstrap server will reject every request."
+            )
+        self.app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+        self.app.middleware("http")(self._authenticate)
         self._register_routes()
         self.server_thread: threading.Thread | None = None
         self.server: uvicorn.Server | None = None
@@ -49,6 +97,33 @@ class MooncakeBootstrapServer:
 
     def __del__(self):
         self.shutdown()
+
+    def _is_authorized(self, request: Request) -> bool:
+        authorization = request.headers.get("authorization")
+        if self._token is None or authorization is None:
+            return False
+        scheme, _, credential = authorization.partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        presented = credential.strip().encode()
+        if hmac.compare_digest(presented, self._token):
+            return True
+        return (
+            request.method == "GET"
+            and request.scope["path"] == "/query"
+            and hmac.compare_digest(presented, _query_credential(self._token))
+        )
+
+    async def _authenticate(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if not self._is_authorized(request):
+            return JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
 
     def _register_routes(self):
         # All methods are async. No need to use lock to protect data.

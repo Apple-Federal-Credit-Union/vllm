@@ -15,6 +15,8 @@
 #   DECODE_PORTS: Comma-separated ports for decode servers
 #   PROXY_PORT: Proxy server port used to setup P/D disaggregated connection.
 #   TIMEOUT_SECONDS: Server startup timeout
+#   VLLM_MOONCAKE_BOOTSTRAP_TOKEN: Bootstrap server credential shared by all
+#     servers and the proxy. A random one is generated when unset.
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
@@ -27,6 +29,8 @@ DECODE_GPUS=${DECODE_GPUS:-1}
 PREFILL_PORTS=${PREFILL_PORTS:-8010}
 BOOTSTRAP_PORTS=${BOOTSTRAP_PORTS:-8998}
 DECODE_PORTS=${DECODE_PORTS:-8020}
+VLLM_MOONCAKE_BOOTSTRAP_TOKEN=${VLLM_MOONCAKE_BOOTSTRAP_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}
+export VLLM_MOONCAKE_BOOTSTRAP_TOKEN
 
 echo "Warning: Mooncake Connector support for vLLM v1 is experimental and subject to change."
 echo ""

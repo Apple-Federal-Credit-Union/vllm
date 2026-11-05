@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import random
+import secrets
 import signal
 import socket
 import subprocess
@@ -185,7 +186,9 @@ def run_rocm_pd_accuracy(connector, model, prefill_tp, decode_tp, monkeypatch):
                 MooncakeBootstrapServer,
             )
 
-            bootstrap = MooncakeBootstrapServer("127.0.0.1", 0)
+            token = secrets.token_urlsafe(32)
+            monkeypatch.setenv("VLLM_MOONCAKE_BOOTSTRAP_TOKEN", token)
+            bootstrap = MooncakeBootstrapServer("127.0.0.1", 0, token=token)
             stack.callback(bootstrap.shutdown)
             bootstrap.start()
             bootstrap_port = bootstrap.port

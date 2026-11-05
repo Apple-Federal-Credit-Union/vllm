@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
+    bootstrap_auth_headers,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
@@ -1348,8 +1349,10 @@ class MooncakeConnectorWorker:
 
             # Start bootstrap server on global rank 0.
             if should_launch_bootstrap_server(vllm_config):
-                _, port = get_mooncake_bootstrap_addr(vllm_config)
-                self.bootstrap_server = MooncakeBootstrapServer("0.0.0.0", port)
+                host, port = get_mooncake_bootstrap_addr(vllm_config)
+                self.bootstrap_server = MooncakeBootstrapServer(
+                    host, port, token=envs.VLLM_MOONCAKE_BOOTSTRAP_TOKEN
+                )
                 self.bootstrap_server.start()
 
         if not self.is_kv_producer:
@@ -1463,13 +1466,16 @@ class MooncakeConnectorWorker:
             pp_rank=self.pp_rank,
             addr=worker_addr,
         )
+        headers = bootstrap_auth_headers()
         timeout = envs.VLLM_MOONCAKE_CONNECTOR_TIMEOUT
         max_attempts = _BOOTSTRAP_MAX_ATTEMPTS
         backoff = 1.0
         for attempt in range(1, max_attempts + 1):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(url, json=payload.model_dump())
+                    response = await client.post(
+                        url, json=payload.model_dump(), headers=headers
+                    )
                     response.raise_for_status()
                 logger.debug("Successfully registered with bootstrap server at %s", url)
                 return
@@ -2584,13 +2590,14 @@ class MooncakeConnectorWorker:
         url = remote_bootstrap_addr + "/query"
         max_attempts = _BOOTSTRAP_MAX_ATTEMPTS
         try:
+            headers = bootstrap_auth_headers(query_only=True)
             async with httpx.AsyncClient(
                 timeout=envs.VLLM_MOONCAKE_CONNECTOR_TIMEOUT
             ) as client:
                 retry_delay = 0.1
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        response = await client.get(url)
+                        response = await client.get(url, headers=headers)
                         break
                     except httpx.RequestError as e:
                         if attempt == max_attempts:
@@ -3114,7 +3121,8 @@ def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
 
 def get_mooncake_bootstrap_addr(vllm_config: VllmConfig) -> tuple[str, int]:
     """Returns the address of the Mooncake bootstrap server.
-    This is only used by prefillers to register workers.
+    This is only used by prefillers to register workers, and is the only
+    address the embedded bootstrap server listens on.
     Decoders should get addr from kv_transfer_params.
     """
     if (kv_config := vllm_config.kv_transfer_config) is not None:
@@ -3128,6 +3136,9 @@ def get_mooncake_bootstrap_addr(vllm_config: VllmConfig) -> tuple[str, int]:
                     "bootstrap_server_address must specify a host and port"
                 )
             return host, port
+    port = envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
+    if override_host := envs.VLLM_MOONCAKE_BOOTSTRAP_HOST:
+        return override_host, port
     assert (parallel_config := vllm_config.parallel_config)
     if parallel_config.local_engines_only:
         # In hybrid or external LB mode, connect to local server.
@@ -3138,5 +3149,4 @@ def get_mooncake_bootstrap_addr(vllm_config: VllmConfig) -> tuple[str, int]:
         host = parallel_config.master_addr
     else:
         host = parallel_config.data_parallel_master_ip
-    port = envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
     return (host, port)
