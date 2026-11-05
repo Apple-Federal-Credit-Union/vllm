@@ -87,7 +87,10 @@ class ECMooncakeScheduler:
         self._push_wait_timeout = config.push_wait_timeout_s
         self._vllm_config = vllm_config
         self._model_config = vllm_config.model_config
-        self._control_client = ControlClient(config.control_timeout_ms)
+        self._consumer_zmq_addrs = {addr: addr for addr in config.consumer_zmq_addrs}
+        self._control_client = ControlClient(
+            config.control_timeout_ms, config.dialable_control_addrs
+        )
         self._control_executor = ThreadPoolExecutor(
             max_workers=_CONTROL_WORKERS,
             thread_name_prefix="ec-mooncake-control",
@@ -416,7 +419,20 @@ class ECMooncakeScheduler:
 
     def _prepare_push_spec(self, request: Any, index: int) -> None:
         params = getattr(request, "ec_transfer_params", None) or {}
-        consumer_zmq = params.get("consumer_zmq")
+        requested = params.get("consumer_zmq")
+        if not requested:
+            return
+        consumer_zmq = (
+            self._consumer_zmq_addrs.get(requested)
+            if isinstance(requested, str)
+            else None
+        )
+        if consumer_zmq is None:
+            logger.warning_once(
+                "EC Mooncake refused a push to a consumer_zmq that is not listed "
+                "in ec_connector_extra_config.consumer_zmq_addrs."
+            )
+            return
         mm_hash = request.mm_features[index].identifier
         transfer_id = self._request_transfer_id(request, index)
         if transfer_id is None:
@@ -425,10 +441,9 @@ class ECMooncakeScheduler:
             # beats none. But the consumer knows this transfer by the id it
             # sent, not by the one invented here, so its cancel will never
             # reach the reservation this push is about to take.
-            if consumer_zmq:
-                self._warn_unresolved_transfer_id(request, index, "push prepare")
+            self._warn_unresolved_transfer_id(request, index, "push prepare")
             transfer_id = f"{request.request_id}:{index}"
-        if not consumer_zmq or transfer_id in self._prepared_push_transfer_ids:
+        if transfer_id in self._prepared_push_transfer_ids:
             return
         output = self._encoder_output_spec(request, index)
         self._pushes_to_prepare[transfer_id] = ECMooncakePushSpec(
@@ -436,7 +451,7 @@ class ECMooncakeScheduler:
             nbytes=output.nbytes,
             shape=output.shape,
             dtype=output.dtype.removeprefix("torch."),
-            consumer_zmq=str(consumer_zmq),
+            consumer_zmq=consumer_zmq,
             transfer_id=transfer_id,
             request_id=request.request_id,
         )

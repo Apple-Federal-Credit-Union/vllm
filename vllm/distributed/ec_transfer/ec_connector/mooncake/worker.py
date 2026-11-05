@@ -130,7 +130,9 @@ class ECMooncakeWorker:
             config.pool_size,
             self._transfer,
         )
-        self._control_client = ControlClient(config.control_timeout_ms)
+        self._control_client = ControlClient(
+            config.control_timeout_ms, config.dialable_control_addrs
+        )
         self._shutdown_drain_timeout_s = config.control_timeout_ms / 1000
         self._io_executor = ThreadPoolExecutor(
             max_workers=_TRANSFER_WORKERS,

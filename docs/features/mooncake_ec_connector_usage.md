@@ -59,10 +59,16 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen2.5-VL-3B-Instruct \
     "ec_connector": "ECMooncakeConnector",
     "ec_role": "ec_producer",
     "ec_connector_extra_config": {
-      "mooncake_protocol": "rdma"
+      "mooncake_protocol": "rdma",
+      "consumer_zmq_addrs": ["tcp://127.0.0.1:19019"]
     }
   }'
 ```
+
+`consumer_zmq_addrs` lists every consumer control address this encoder may
+push to. The `consumer_zmq` the proxy puts in `ec_transfer_params` only
+selects one of these entries; the producer never connects to a value that is
+not listed, and skips the push instead.
 
 ### Prefill+Decode (consumer)
 
@@ -102,7 +108,8 @@ python examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py \
 
 `--ec-consumer-zmq-addrs` must align with `--decode-servers-urls` (the
 combined PD instances). For data-parallel consumers, list each replica
-consecutively and set `--ec-consumer-dp-size`.
+consecutively and set `--ec-consumer-dp-size`. List the same addresses in each
+encoder's `consumer_zmq_addrs`.
 
 ### Correctness script
 
@@ -128,6 +135,7 @@ Producer and consumer must use the same `mooncake_protocol`.
 | `mooncake_protocol` | `ec_connector_extra_config` | `rdma` | Set `tcp` when no verbs device is available. With TCP, also export `MC_FORCE_TCP=1`. |
 | `ec_ip` / `ec_port` | consumer `ECTransferConfig` | `127.0.0.1` / `14579` | First ZMQ control port. Tensor-parallel rank `r` listens on `ec_port + dp_index * tp_size + r`. |
 | `ec_buffer_size` | `ECTransferConfig` | `1e9` | Registered receive arena on the consumer, in bytes. |
+| `consumer_zmq_addrs` | producer `ec_connector_extra_config` | empty | `tcp://<ec_ip>:<ec_port>` of every consumer (TP rank 0 of each DP replica) this encoder may push to. Requests naming any other `consumer_zmq` are not pushed. Required for Mooncake EC. |
 | `control_timeout_s` | `ec_connector_extra_config` | `30` | Reservation RPC timeout. |
 | `push_wait_timeout_s` | `ec_connector_extra_config` | `60` | How long the consumer waits for a matching encoder push. |
 | `WITH_NVIDIA_PEERMEM` | process environment | `1` | Read by Mooncake. Set `0` on hosts without `nvidia-peermem` (DMA-BUF path). |
@@ -154,5 +162,6 @@ consumer as described in
 | `Failed to register memory ... Bad address [14]` | GPUDirect registration failed. Set `WITH_NVIDIA_PEERMEM=0`. |
 | Proxy startup error about E+PD only | `--ec-consumer-zmq-addrs` used with a real `--prefill-servers-urls`. |
 | Consumer waits then errors; encoder never finishes the push | `--ec-consumer-zmq-addrs` does not match consumer `ec_ip`/`ec_port`, or producer/consumer protocols differ. |
+| Encoder logs `refused a push to a consumer_zmq that is not listed` | The proxy's consumer address is missing from the encoder's `consumer_zmq_addrs`, or is spelled differently. |
 | TCP transfers stall on a host that also has RDMA | Export `MC_FORCE_TCP=1`. |
 | Producer rejected at startup | Encoder used tensor, pipeline, or data parallelism. Keep the producer unsharded. |

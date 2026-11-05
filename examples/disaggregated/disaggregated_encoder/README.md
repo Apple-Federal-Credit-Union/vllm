@@ -109,7 +109,7 @@ If you enable prefill instance (`--prefill-servers-urls` not disabled), you will
 | `--encode-servers-urls` | Comma-separated list of encoder endpoints. Every multimodal item extracted from the request is fanned out to one of these URLs in a round-robin fashion. |
 | `--prefill-servers-urls` | Comma-separated list of prefill endpoints. Set to `disable`, `none`, or `""` to skip the dedicated prefill phase and run E+PD (encoder + combined prefill/decode). |
 | `--decode-servers-urls` | Comma-separated list of decode endpoints. Non-stream and stream paths both round-robin over this list. |
-| `--ec-consumer-zmq-addrs` | Mooncake EC consumer control addresses, aligned with `--decode-servers-urls`. Required for `ECMooncakeConnector`. Supported only in E+PD mode (`--prefill-servers-urls disable`). |
+| `--ec-consumer-zmq-addrs` | Mooncake EC consumer control addresses, aligned with `--decode-servers-urls`. Required for `ECMooncakeConnector`; each encoder must list the same addresses in `consumer_zmq_addrs`. Supported only in E+PD mode (`--prefill-servers-urls disable`). |
 | `--ec-consumer-dp-size` | Data-parallel replicas per EC consumer (default 1). |
 | `--host`, `--port` | Bind address for the proxy itself (defaults: `0.0.0.0:8000`). |
 
@@ -162,7 +162,9 @@ the remaining TP ranks itself. For example, DP=2, TP=2, `ec_port=19019`:
 ```
 
 The proxy selects one consumer replica and uses it for both the encoder push
-and the consumer HTTP request. Standalone D does not need EC control addresses.
+and the consumer HTTP request. Every Mooncake encoder must also list each of
+these addresses in its `consumer_zmq_addrs` extra config at startup; it refuses
+to push to any address that is not listed, including ones registered later. Standalone D does not need EC control addresses.
 Port allocation and avoiding collisions remain the launcher's responsibility.
 
 Inspect or remove instances without restarting the proxy:

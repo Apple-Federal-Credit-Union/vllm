@@ -48,6 +48,31 @@ def _positive_float(name: str, value: object) -> float:
     return result
 
 
+def _consumer_zmq_addrs(value: object) -> tuple[str, ...]:
+    message = (
+        "ECMooncakeConnector requires consumer_zmq_addrs to be a list of "
+        "tcp://<host>:<port> addresses."
+    )
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [entry for entry in value.split(",") if entry.strip()]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(message)
+    addrs: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(message)
+        addr = entry.strip()
+        host, _, port = addr.removeprefix("tcp://").rpartition(":")
+        if not addr.startswith("tcp://") or not host or not port.isdigit():
+            raise ValueError(message)
+        if not 1 <= int(port) <= 65535:
+            raise ValueError(message)
+        addrs.append(addr)
+    return tuple(dict.fromkeys(addrs))
+
+
 @dataclass(frozen=True)
 class MooncakeECConfig:
     """Validated settings shared by the Scheduler and Worker roles.
@@ -57,6 +82,10 @@ class MooncakeECConfig:
     ``control_host`` is the address this instance both advertises and binds,
     so reaching a Consumer means being routed to it rather than finding it on
     every interface.
+
+    ``consumer_zmq_addrs`` lists the Consumer control addresses a Producer may
+    push to. A request's ``consumer_zmq`` only selects one of them; any other
+    value is refused, so callers cannot point the Producer at their own peers.
     """
 
     is_producer: bool
@@ -69,10 +98,19 @@ class MooncakeECConfig:
     control_timeout_ms: int
     push_wait_timeout_s: float
     pool_size: int
+    consumer_zmq_addrs: tuple[str, ...] = ()
     cross_encoder_cache: bool = False
     store_max_pending_items: int = 32
     store_max_pending_bytes: int = 2 * 1024**3
     store_read_buffer_bytes: int = 128 * 1024**2
+
+    @property
+    def dialable_control_addrs(self) -> frozenset[str]:
+        """Control addresses this instance may connect to."""
+        addrs = set(self.consumer_zmq_addrs if self.is_producer else ())
+        if self.is_consumer:
+            addrs.add(self.control_addr)
+        return frozenset(addrs)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> MooncakeECConfig:
@@ -142,6 +180,7 @@ class MooncakeECConfig:
                 "push_wait_timeout_s", get("push_wait_timeout_s", 60)
             ),
             pool_size=registered_buffer_size,
+            consumer_zmq_addrs=_consumer_zmq_addrs(get("consumer_zmq_addrs", None)),
             cross_encoder_cache=shared_reuse,
             store_max_pending_items=_positive_int(
                 "store_max_pending_items", get("store_max_pending_items", 32)
