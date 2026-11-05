@@ -172,3 +172,7 @@ When using the converter directly:
 source env.sh
 vllm serve --config config.yml
 ```
+
+The converter refuses recipes whose `env` names are not shell identifiers
+(`[A-Za-z_][A-Za-z0-9_]*`) or are evaluated by the shell (`BASH_ENV`, `ENV`,
+`PROMPT_COMMAND`, `PS0`-`PS4`), and writes no files in that case.
