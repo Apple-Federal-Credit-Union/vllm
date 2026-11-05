@@ -498,6 +498,38 @@ def _write_sweep_config(path: Path, config: dict[str, Any]) -> None:
     path.write_text(header + body, encoding="utf-8")
 
 
+def _bench_cmd_arg(
+    *, request_model: str, tokenizer: str, workload: WorkloadHints
+) -> str:
+    """Quote the benchmark argv for the consumer's ``shlex.split`` and the shell."""
+    argv = [
+        "vllm",
+        "bench",
+        "serve",
+        "--backend",
+        "vllm",
+        "--model",
+        request_model,
+        "--tokenizer",
+        tokenizer,
+        "--dataset-name",
+        "random",
+        "--request-rate",
+        "inf",
+        "--ignore-eos",
+        "--metric-percentiles",
+        "99",
+    ]
+    goodput_pairs: list[str] = []
+    if workload.ttft_sla_ms is not None:
+        goodput_pairs.append(f"ttft:{workload.ttft_sla_ms:g}")
+    if workload.tpot_sla_ms is not None:
+        goodput_pairs.append(f"tpot:{workload.tpot_sla_ms:g}")
+    if goodput_pairs:
+        argv.extend(["--goodput", *goodput_pairs])
+    return shlex.quote(shlex.join(argv))
+
+
 def _write_run_script(
     path: Path,
     *,
@@ -510,28 +542,9 @@ def _write_run_script(
     experiment_name: str = "runtime-tuning",
     prepare_config_rel: str | None = None,
 ) -> None:
-    bench_parts = [
-        "vllm bench serve",
-        "--backend vllm",
-        f"--model {shlex.quote(request_model)}",
-        f"--tokenizer {shlex.quote(tokenizer)}",
-        "--dataset-name random",
-        "--request-rate inf",
-        "--ignore-eos",
-        "--metric-percentiles 99",
-    ]
-
-    goodput_pairs: list[str] = []
-    if workload.ttft_sla_ms is not None:
-        goodput_pairs.append(f"ttft:{workload.ttft_sla_ms:g}")
-    if workload.tpot_sla_ms is not None:
-        goodput_pairs.append(f"tpot:{workload.tpot_sla_ms:g}")
-    if goodput_pairs:
-        bench_parts.append(
-            "--goodput " + " ".join(shlex.quote(pair) for pair in goodput_pairs)
-        )
-
-    bench_cmd = " ".join(bench_parts)
+    bench_cmd_arg = _bench_cmd_arg(
+        request_model=request_model, tokenizer=tokenizer, workload=workload
+    )
     prepare_config = ""
     if prepare_config_rel is not None:
         prepare_config = f"""
@@ -594,7 +607,7 @@ MAX_SWEEP_RETRIES="${{VLLM_RECIPE_SWEEP_RETRIES:-2}}"
 
 {prepare_config}vllm bench sweep serve \
   --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-  --bench-cmd "{bench_cmd}" \
+  --bench-cmd {bench_cmd_arg} \
   --serve-params "${{SCRIPT_DIR}}/{serve_params_name}" \
   --bench-params "${{SCRIPT_DIR}}/bench_params.json" \
   --output-dir "${{SCRIPT_DIR}}/results" \
@@ -1054,27 +1067,9 @@ def _write_concurrency_run_script(
     tokenizer: str,
     workload: WorkloadHints,
 ) -> None:
-    bench_parts = [
-        "vllm bench serve",
-        "--backend vllm",
-        f"--model {shlex.quote(request_model)}",
-        f"--tokenizer {shlex.quote(tokenizer)}",
-        "--dataset-name random",
-        "--request-rate inf",
-        "--ignore-eos",
-        "--metric-percentiles 99",
-    ]
-    goodput_pairs: list[str] = []
-    if workload.ttft_sla_ms is not None:
-        goodput_pairs.append(f"ttft:{workload.ttft_sla_ms:g}")
-    if workload.tpot_sla_ms is not None:
-        goodput_pairs.append(f"tpot:{workload.tpot_sla_ms:g}")
-    if goodput_pairs:
-        bench_parts.append(
-            "--goodput " + " ".join(shlex.quote(pair) for pair in goodput_pairs)
-        )
-
-    bench_cmd = " ".join(bench_parts)
+    bench_cmd_arg = _bench_cmd_arg(
+        request_model=request_model, tokenizer=tokenizer, workload=workload
+    )
     use_adaptive_sla_search = bool(
         workload.ttft_sla_ms is not None or workload.tpot_sla_ms is not None
     )
@@ -1125,7 +1120,7 @@ run_concurrency_sweep() {{
   if [[ "{int(use_adaptive_sla_search)}" == "1" ]]; then
     python3 "${{SCRIPT_DIR}}/adaptive_concurrency.py" \
       --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-      --bench-cmd "{bench_cmd}" \
+      --bench-cmd {bench_cmd_arg} \
       --results-dir "${{SCRIPT_DIR}}/results/concurrency-tuning" \
       {adaptive_args_text} \
       --server-ready-timeout "${{SERVER_READY_TIMEOUT}}" \
@@ -1134,7 +1129,7 @@ run_concurrency_sweep() {{
   else
     vllm bench sweep serve_workload \
       --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-      --bench-cmd "{bench_cmd}" \
+      --bench-cmd {bench_cmd_arg} \
       --bench-params "${{SCRIPT_DIR}}/concurrency_bench_params.json" \
       --output-dir "${{SCRIPT_DIR}}/results" \
       --experiment-name concurrency-tuning \
