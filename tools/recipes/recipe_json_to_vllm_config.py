@@ -91,6 +91,11 @@ DICT_SHORT_ALIASES = {
     "-ac": "attention-config",
 }
 
+# Variables whose values bash evaluates as code once env.sh is sourced.
+SHELL_EVALUATED_ENV_NAMES = frozenset(
+    {"BASH_ENV", "ENV", "PROMPT_COMMAND", "PS0", "PS1", "PS2", "PS3", "PS4"}
+)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -793,6 +798,34 @@ def recipe_argv(recipe: dict[str, Any]) -> list[Any]:
     raise ValueError("Recipe JSON does not contain an `argv` field")
 
 
+def check_env_name(name: object) -> str:
+    # For ASCII strings, isidentifier() is exactly [A-Za-z_][A-Za-z0-9_]*.
+    if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
+        raise ValueError(
+            f"Recipe env name {name!r} is not a valid shell variable name "
+            "([A-Za-z_][A-Za-z0-9_]*)."
+        )
+    if name in SHELL_EVALUATED_ENV_NAMES:
+        raise ValueError(
+            f"Recipe env name {name!r} is evaluated by the shell and is not allowed."
+        )
+    return name
+
+
+def recipe_env_vars(recipe: dict[str, Any]) -> dict[str, object]:
+    """Return the recipe `env` object with every name checked for env.sh."""
+    recipe_env = recipe.get("env") or {}
+    if not isinstance(recipe_env, dict):
+        raise ValueError(
+            f"Recipe `env` must be an object, got {type(recipe_env).__name__}"
+        )
+    return {check_env_name(key): value for key, value in recipe_env.items()}
+
+
+def comment_text(value: object) -> str:
+    return " ".join(str(value).splitlines())
+
+
 def write_config(
     path: str,
     source: str,
@@ -801,11 +834,11 @@ def write_config(
 ) -> None:
     metadata = [
         "# Generated from vLLM Recipes JSON.",
-        f"# Source: {source}",
+        f"# Source: {comment_text(source)}",
     ]
     for key in ("hardware", "strategy", "variant", "deploy_type"):
         if recipe.get(key) is not None:
-            metadata.append(f"# {key}: {recipe[key]}")
+            metadata.append(f"# {key}: {comment_text(recipe[key])}")
 
     body = yaml.safe_dump(
         config,
@@ -819,16 +852,10 @@ def write_config(
 def write_env(
     path: str,
     source: str,
-    recipe: dict[str, Any],
+    recipe_env: dict[str, object],
     *,
     env_overrides: dict[str, object] | None = None,
 ) -> None:
-    recipe_env = recipe.get("env") or {}
-    if not isinstance(recipe_env, dict):
-        raise ValueError(
-            f"Recipe `env` must be an object, got {type(recipe_env).__name__}"
-        )
-
     env = dict(recipe_env)
     overrides = env_overrides or {}
     env.update(overrides)
@@ -836,7 +863,7 @@ def write_env(
     lines = [
         "#!/usr/bin/env bash",
         "# Generated from vLLM Recipes JSON.",
-        f"# Source: {source}",
+        f"# Source: {comment_text(source)}",
         "",
     ]
 
@@ -845,7 +872,7 @@ def write_env(
 
     if env:
         for key, value in env.items():
-            lines.append(f"export {key}={shlex.quote(str(value))}")
+            lines.append(f"export {check_env_name(key)}={shlex.quote(str(value))}")
     else:
         lines.append("# No recipe-specific environment variables.")
 
@@ -903,6 +930,7 @@ def main() -> int:
 
         argv = recipe_argv(recipe)
         config = argv_to_config(argv)
+        recipe_env = recipe_env_vars(recipe)
 
         tuning_requested = (
             args.detect_hardware
@@ -981,12 +1009,7 @@ def main() -> int:
                         args.generate_parallel_layout_sweep or args.generate_full_sweep
                     )
                 ):
-                    recipe_env = recipe.get("env") or {}
-                    current_binding = (
-                        recipe_env.get("VLLM_CPU_OMP_THREADS_BIND")
-                        if isinstance(recipe_env, dict)
-                        else None
-                    )
+                    current_binding = recipe_env.get("VLLM_CPU_OMP_THREADS_BIND")
 
                     # Preserve an explicit recipe-provided manual binding.
                     # Replace an unset or "auto" value with the temporary
@@ -1015,7 +1038,7 @@ def main() -> int:
         write_env(
             args.env_out,
             source,
-            recipe,
+            recipe_env,
             env_overrides=env_overrides,
         )
 
