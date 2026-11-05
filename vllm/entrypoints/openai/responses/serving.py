@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -18,7 +19,7 @@ from openai.types.responses import (
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -101,6 +102,12 @@ from vllm.utils.collection_utils import as_list
 logger = init_logger(__name__)
 
 
+def _approx_size(obj: object) -> int:
+    if isinstance(obj, BaseModel):
+        return len(obj.model_dump_json().encode())
+    return len(json.dumps(obj, default=str))
+
+
 class OpenAIServingResponses(GenerateBaseServing):
     def __init__(
         self,
@@ -165,11 +172,20 @@ class OpenAIServingResponses(GenerateBaseServing):
         # behavior in OpenAI's Responses API is to store the response, but
         # vLLM's default behavior is not.
         self.enable_store = envs.VLLM_ENABLE_RESPONSES_API_STORE
+        self.store_max_entries = envs.VLLM_RESPONSES_API_STORE_MAX_ENTRIES
+        self.store_max_bytes = envs.VLLM_RESPONSES_API_STORE_MAX_BYTES
         if self.enable_store:
-            logger.warning_once(
-                "`VLLM_ENABLE_RESPONSES_API_STORE` is enabled. This may "
-                "cause a memory leak since we never remove responses from "
-                "the store."
+            if self.store_max_entries <= 0 or self.store_max_bytes <= 0:
+                raise ValueError(
+                    "VLLM_RESPONSES_API_STORE_MAX_ENTRIES and "
+                    "VLLM_RESPONSES_API_STORE_MAX_BYTES must be positive."
+                )
+            logger.info_once(
+                "`VLLM_ENABLE_RESPONSES_API_STORE` is enabled. Up to %d "
+                "responses (about %d bytes) are kept in memory; older "
+                "finished responses are evicted.",
+                self.store_max_entries,
+                self.store_max_bytes,
             )
 
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
@@ -179,27 +195,58 @@ class OpenAIServingResponses(GenerateBaseServing):
                 "and always enable tool use."
             )
         self.enable_auto_tools = enable_auto_tools
-        # HACK(woosuk): This is a hack. We should use a better store.
-        # FIXME: If enable_store=True, this may cause a memory leak since we
-        # never remove responses from the store.
+        # The three stores share keys and are evicted together; see
+        # `_record_stored_entry`.
         self.response_store: dict[str, ResponsesResponse] = {}
         self.response_store_lock = asyncio.Lock()
-
-        # HACK(woosuk): This is a hack. We should use a better store.
-        # FIXME: If enable_store=True, this may cause a memory leak since we
-        # never remove messages from the store.
         self.msg_store: dict[str, ResponsesPreviousMessages] = {}
-
-        # HACK(wuhang): This is a hack. We should use a better store.
-        # FIXME: If enable_store=True, this may cause a memory leak since we
-        # never remove events from the store.
         self.event_store: dict[
             str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
         ] = {}
+        # Approximate size of each stored entry, oldest first.
+        self._stored_entry_bytes: dict[str, int] = {}
+        self._stored_bytes = 0
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
         self.tool_server = tool_server
+
+    def _record_stored_entry(self, response_id: str) -> None:
+        """Re-measure a stored entry, mark it newest, and evict to stay
+        within the store limits. Callers must not await while the stores are
+        being mutated."""
+        size = 0
+        if (response := self.response_store.get(response_id)) is not None:
+            size += _approx_size(response)
+        if (messages := self.msg_store.get(response_id)) is not None:
+            size += _approx_size(messages)
+        if (events := self.event_store.get(response_id)) is not None:
+            size += sum(_approx_size(event) for event in events[0])
+        self._stored_bytes += size - self._stored_entry_bytes.pop(response_id, 0)
+        self._stored_entry_bytes[response_id] = size
+        self._evict_stored_entries()
+
+    def _evict_stored_entries(self) -> None:
+        for response_id in list(self._stored_entry_bytes):
+            if (
+                len(self._stored_entry_bytes) <= self.store_max_entries
+                and self._stored_bytes <= self.store_max_bytes
+            ):
+                return
+            # A running background request still needs its entry.
+            if response_id in self.background_tasks:
+                continue
+            self._remove_stored_entry(response_id)
+
+    def _finish_background_task(self, response_id: str) -> None:
+        self.background_tasks.pop(response_id, None)
+        self._evict_stored_entries()
+
+    def _remove_stored_entry(self, response_id: str) -> None:
+        self._stored_bytes -= self._stored_entry_bytes.pop(response_id, 0)
+        self.response_store.pop(response_id, None)
+        self.msg_store.pop(response_id, None)
+        self.event_store.pop(response_id, None)
 
     def _effective_chat_template_kwargs(
         self, request: ResponsesRequest
@@ -537,9 +584,10 @@ class OpenAIServingResponses(GenerateBaseServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
-        # Store the input messages.
-        if request.store:
-            self.msg_store[request.request_id] = messages
+        if request.store and not request.background:
+            async with self.response_store_lock:
+                self.msg_store[request.request_id] = messages
+                self._record_stored_entry(request.request_id)
 
         if request.background:
             created_time = int(time.time())
@@ -553,6 +601,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                 usage=None,
             )
             async with self.response_store_lock:
+                if request.store:
+                    self.msg_store[response.id] = messages
                 self.response_store[response.id] = response
 
             # Run the request in the background.
@@ -588,9 +638,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             # For cleanup.
             response_id = response.id
             self.background_tasks[response_id] = task
-            task.add_done_callback(
-                lambda _: self.background_tasks.pop(response_id, None)
-            )
+            self._record_stored_entry(response_id)
+            task.add_done_callback(lambda _: self._finish_background_task(response_id))
 
             if request.stream:
                 return self.responses_background_stream_generator(request.request_id)
@@ -944,9 +993,13 @@ class OpenAIServingResponses(GenerateBaseServing):
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
-                # If the response is already cancelled, don't update it.
-                if stored_response is None or stored_response.status != "cancelled":
+                # Skip entries that were evicted while generating, and don't
+                # update a response that is already cancelled.
+                if response.id in self._stored_entry_bytes and (
+                    stored_response is None or stored_response.status != "cancelled"
+                ):
                     self.response_store[response.id] = response
+                    self._record_stored_entry(response.id)
         return response
 
     def _topk_logprobs(
@@ -1091,9 +1144,11 @@ class OpenAIServingResponses(GenerateBaseServing):
         *args,
         **kwargs,
     ):
+        response_id = request.request_id
         event_deque: deque[StreamingResponsesResponse] = deque()
         new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        if response_id in self._stored_entry_bytes:
+            self.event_store[response_id] = (event_deque, new_event_signal)
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
@@ -1101,6 +1156,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                 new_event_signal.set()  # Signal new event available
         finally:
             new_event_signal.set()
+            # The entry stops being protected once this task is done, so
+            # account for the final events now.
+            self.background_tasks.pop(response_id, None)
+            if response_id in self.event_store:
+                self._record_stored_entry(response_id)
 
     async def _run_background_request(
         self,
@@ -1115,8 +1175,10 @@ class OpenAIServingResponses(GenerateBaseServing):
             response_id = request.request_id
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response_id)
-                assert stored_response is not None
-                if stored_response.status not in ("completed", "cancelled"):
+                if stored_response is not None and stored_response.status not in (
+                    "completed",
+                    "cancelled",
+                ):
                     stored_response.status = "failed"
 
     async def responses_background_stream_generator(

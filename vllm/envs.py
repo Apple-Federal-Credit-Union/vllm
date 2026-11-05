@@ -275,6 +275,8 @@ if TYPE_CHECKING:
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
+    VLLM_RESPONSES_API_STORE_MAX_ENTRIES: int = 1000
+    VLLM_RESPONSES_API_STORE_MAX_BYTES: int = 1024 * 1024 * 1024
     VLLM_ENABLE_COHERE_API: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
@@ -1963,10 +1965,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NOTE/WARNING:
     # 1. Messages are kept in memory only (not persisted to disk) and will be
     #    lost when the vLLM server shuts down.
-    # 2. Enabling this option will cause a memory leak, as stored messages are
-    #    never removed from memory until the server terminates.
+    # 2. The store is bounded by VLLM_RESPONSES_API_STORE_MAX_ENTRIES and
+    #    VLLM_RESPONSES_API_STORE_MAX_BYTES; the oldest finished responses
+    #    are evicted first.
     "VLLM_ENABLE_RESPONSES_API_STORE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_RESPONSES_API_STORE", "0"))
+    ),
+    # Maximum number of responses kept by the Responses API store.
+    "VLLM_RESPONSES_API_STORE_MAX_ENTRIES": lambda: int(
+        os.getenv("VLLM_RESPONSES_API_STORE_MAX_ENTRIES", "1000")
+    ),
+    # Approximate maximum size in bytes of the serialized responses, input
+    # messages, and streaming events kept by the Responses API store.
+    "VLLM_RESPONSES_API_STORE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_RESPONSES_API_STORE_MAX_BYTES", str(1024 * 1024 * 1024))
     ),
     # If set to 1, expose the Cohere Chat v2 API at ``POST /cohere/v2/chat``
     # and its render endpoint at ``POST /cohere/v2/chat/render``.
