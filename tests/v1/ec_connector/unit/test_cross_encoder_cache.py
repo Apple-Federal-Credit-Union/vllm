@@ -53,6 +53,9 @@ def test_push_shapes_follow_each_modality(monkeypatch):
     monkeypatch.setattr(scheduler, "ensure_mooncake_available", lambda: None)
     widths = {"image": 8192, "audio": 2048}
     config = create_ec_vllm_config(ec_role="ec_producer", encoder_output_widths=widths)
+    config.ec_transfer_config.ec_connector_extra_config["consumer_zmq_addrs"] = [
+        "tcp://consumer:1234"
+    ]
     request = SimpleNamespace(
         request_id="mixed",
         mm_features=[SimpleNamespace(identifier=m, modality=m) for m in widths],

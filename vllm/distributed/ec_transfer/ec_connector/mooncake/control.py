@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from concurrent.futures import Executor, Future
 from typing import Any
 
@@ -33,13 +33,19 @@ ControlResponse = dict[str, Any]
 
 
 class ControlClient:
-    """Send control requests through reusable, thread-local REQ sockets."""
+    """Send control requests through reusable, thread-local REQ sockets.
 
-    def __init__(self, timeout_ms: int) -> None:
+    Only `allowed_addrs`, which come from operator configuration, and the shards
+    those Consumers report are ever connected.
+    """
+
+    def __init__(self, timeout_ms: int, allowed_addrs: Collection[str]) -> None:
         self._context = zmq.Context()
         self._timeout_ms = timeout_ms
+        self._allowed_addrs = frozenset(allowed_addrs)
         self._local = threading.local()
         self._topologies: dict[str, list[str]] = {}
+        self._shard_addrs: set[str] = set()
         self._closed = False
 
     def _sockets(self) -> dict[str, zmq.Socket]:
@@ -55,6 +61,10 @@ class ControlClient:
             socket.close(linger=0)
 
     def _exchange(self, addr: str, payload: ControlRequest) -> ControlResponse:
+        if addr not in self._allowed_addrs and addr not in self._shard_addrs:
+            raise PermissionError(
+                f"EC Mooncake control address {addr!r} is not configured"
+            )
         sockets = self._sockets()
         socket = sockets.get(addr)
         if socket is None:
@@ -83,6 +93,11 @@ class ControlClient:
     def discover_shards(self, base_addr: str) -> list[str] | None:
         if base_addr in self._topologies:
             return self._topologies[base_addr]
+        if base_addr not in self._allowed_addrs:
+            logger.warning(
+                "EC Mooncake refused to contact unconfigured consumer %r", base_addr
+            )
+            return None
         try:
             reply = self.request(base_addr, {"op": "peers"})
             ports = reply.get("ports") if isinstance(reply, dict) else None
@@ -97,6 +112,7 @@ class ControlClient:
                 exc_info=True,
             )
             return None
+        self._shard_addrs.update(shards)
         self._topologies[base_addr] = shards
         return shards
 

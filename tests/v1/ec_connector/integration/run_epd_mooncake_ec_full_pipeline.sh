@@ -80,11 +80,18 @@ VLLM_SERVE=("$PYTHON_BIN" -m vllm.entrypoints.cli.main serve)
 
 ENC_EC_JSON=$("$PYTHON_BIN" <<PY
 import json, os
+
+from vllm.utils.network_utils import make_zmq_path
+
 print(json.dumps({
     "ec_connector": "ECMooncakeConnector",
     "ec_role": "ec_producer",
     "ec_connector_extra_config": {
         "mooncake_protocol": os.environ.get("MOONCAKE_EC_PROTOCOL", "tcp"),
+        "consumer_zmq_addrs": [make_zmq_path(
+            "tcp", os.environ["EC_MOONCAKE_RESERVATION_HOST"],
+            int(os.environ["EC_MOONCAKE_RESERVATION_PORT"]),
+        )],
     },
 }, separators=(",", ":")))
 PY
