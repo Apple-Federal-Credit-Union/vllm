@@ -275,7 +275,8 @@ run_baseline_1p_1d() {
         --allowed-local-media-path "${GIT_ROOT}"/tests/v1/ec_connector/integration \
         --kv-transfer-config '{
             "kv_connector": "NixlConnector",
-            "kv_role": "kv_producer"
+            "kv_role": "kv_producer",
+            "kv_peer_hosts": ["localhost", "127.0.0.1"]
         }' \
         > "$LOG_PATH"/1p1d_prefill.log 2>&1 &
     PIDS+=($!)
@@ -294,7 +295,8 @@ run_baseline_1p_1d() {
         --allowed-local-media-path "${GIT_ROOT}"/tests/v1/ec_connector/integration \
         --kv-transfer-config '{
             "kv_connector": "NixlConnector",
-            "kv_role": "kv_consumer"
+            "kv_role": "kv_consumer",
+            "kv_peer_hosts": ["localhost", "127.0.0.1"]
         }' \
         > "$LOG_PATH"/1p1d_decode.log 2>&1 &
     PIDS+=($!)
@@ -404,7 +406,8 @@ run_epd_1e_1p_1d() {
         }' \
         --kv-transfer-config '{
             "kv_connector": "NixlConnector",
-            "kv_role": "kv_producer"
+            "kv_role": "kv_producer",
+            "kv_peer_hosts": ["localhost", "127.0.0.1"]
         }' \
         > "$LOG_PATH"/1e1p1d_prefill.log 2>&1 &
     PIDS+=($!)
@@ -424,7 +427,8 @@ run_epd_1e_1p_1d() {
         --allowed-local-media-path "${GIT_ROOT}"/tests/v1/ec_connector/integration \
         --kv-transfer-config '{
             "kv_connector": "NixlConnector",
-            "kv_role": "kv_consumer"
+            "kv_role": "kv_consumer",
+            "kv_peer_hosts": ["localhost", "127.0.0.1"]
         }' \
         > "$LOG_PATH"/1e1p1d_decode.log 2>&1 &
     PIDS+=($!)

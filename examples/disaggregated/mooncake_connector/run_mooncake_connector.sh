@@ -161,7 +161,7 @@ main() {
         --kv-transfer-config \
         "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}" > prefill$((i+1)).log 2>&1 &
         PIDS+=($!)
-        proxy_args+=(--prefill "http://0.0.0.0:${port}" "$bootstrap_port")
+        proxy_args+=(--prefill "http://127.0.0.1:${port}" "$bootstrap_port")
     done
 
     # =============================================================================
@@ -177,9 +177,9 @@ main() {
         CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
         --port "$port" \
         --kv-transfer-config \
-        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\"}" > decode$((i+1)).log 2>&1 &
+        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_peer_hosts\":[\"127.0.0.1\"]}" > decode$((i+1)).log 2>&1 &
         PIDS+=($!)
-        proxy_args+=(--decode "http://0.0.0.0:${port}")
+        proxy_args+=(--decode "http://127.0.0.1:${port}")
     done
 
     # =============================================================================

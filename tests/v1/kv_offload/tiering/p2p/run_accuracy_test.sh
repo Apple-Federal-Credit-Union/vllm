@@ -166,8 +166,8 @@ get_num_gpus() {
 # Mirrors deploy_local.sh:131.
 build_kv_config() {
   local pd_port=$1
-  printf '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":%s,"secondary_tiers":[{"type":"p2p","host":"%s","port":%s}]}}' \
-    "${CPU_BYTES}" "${P2P_HOST}" "${pd_port}"
+  printf '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_peer_hosts":["%s"],"kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":%s,"secondary_tiers":[{"type":"p2p","host":"%s","port":%s}]}}' \
+    "${P2P_HOST}" "${CPU_BYTES}" "${P2P_HOST}" "${pd_port}"
 }
 
 # ---------------------------------------------------------------------------

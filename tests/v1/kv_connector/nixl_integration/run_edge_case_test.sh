@@ -23,9 +23,9 @@ echo "Running edge case tests with kv_buffer_device=$KV_BUFFER_DEVICE (GPUs: $PR
 
 # Build the kv-transfer-config once
 if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
-  KV_CONFIG='{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+  KV_CONFIG='{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_peer_hosts":["localhost","127.0.0.1"]}'
 else
-  KV_CONFIG="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"$KV_BUFFER_DEVICE\"}"
+  KV_CONFIG="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"$KV_BUFFER_DEVICE\",\"kv_peer_hosts\":[\"localhost\",\"127.0.0.1\"]}"
 fi
 
 # Models to run

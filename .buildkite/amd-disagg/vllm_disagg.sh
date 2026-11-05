@@ -102,6 +102,13 @@ moriio_read_mode_kv() {
     esac
 }
 
+# Every node IP as a JSON list: the peers MoRI-IO may dial for KV transfer.
+moriio_peer_hosts_json() {
+    local ip out=""
+    for ip in "${IP_ARRAY[@]}"; do out+="${out:+,}\"${ip}\""; done
+    printf '[%s]' "${out}"
+}
+
 # ----------------------------------------------------------------- topology
 # Resolves MODEL_PATH, MODELS_YAML, the IP array, and the master/proxy addresses.
 # IP_ARRAY[0..xP-1] = prefill nodes, [xP..xP+yD-1] = decode nodes.
@@ -299,6 +306,7 @@ build_tp_cmd() {
 {
   "kv_connector": "MoRIIOConnector",
   "kv_role": "${KV_ROLE}",
+  "kv_peer_hosts": $(moriio_peer_hosts_json),
   "kv_connector_extra_config": {
     "proxy_ip": "${PROXY_IP}",
     "proxy_ping_port": "${PROXY_PING_PORT}",
@@ -346,6 +354,7 @@ build_ep_cmd() {
 {
   "kv_connector": "MoRIIOConnector",
   "kv_role": "${KV_ROLE}",
+  "kv_peer_hosts": $(moriio_peer_hosts_json),
   "kv_port": "${KV_PORT}",
   "kv_connector_extra_config": {
     "proxy_ip": "${PROXY_IP}",

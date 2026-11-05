@@ -16,11 +16,14 @@ from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnectorScheduler,
+    MoRIIOMode,
 )
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.request import RequestStatus
 
 _request_finished = MoRIIOConnectorScheduler.request_finished
 _clip_blocks = MoRIIOConnectorScheduler.get_exchange_clipped_blocks
+_authorize_remote_peers = MoRIIOConnectorScheduler._authorize_remote_peers
 
 
 def _producer(global_dp_rank: int, dp_size: int, dp_size_local: int):
@@ -35,6 +38,8 @@ def _producer(global_dp_rank: int, dp_size: int, dp_size_local: int):
         host_ip="10.0.0.1",
         handshake_port=6300,
         side_notify_port=7300,
+        mode=MoRIIOMode.READ,
+        _peer_hosts=PeerHostAllowlist([], "kv_peer_hosts"),
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
                 data_parallel_size=dp_size,
@@ -44,6 +49,7 @@ def _producer(global_dp_rank: int, dp_size: int, dp_size_local: int):
         ),
     )
     s.get_exchange_clipped_blocks = _clip_blocks.__get__(s)
+    s._authorize_remote_peers = _authorize_remote_peers.__get__(s)
     return s
 
 

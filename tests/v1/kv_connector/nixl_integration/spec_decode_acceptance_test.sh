@@ -203,11 +203,11 @@ run_test_for_device() {
   local kv_device=$1
 
   if [[ "$kv_device" == "cuda" ]]; then
-    local kv_config_p='{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
-    local kv_config_d='{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+    local kv_config_p='{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_peer_hosts":["'"${NIXL_SIDE_CHANNEL_HOST}"'"]}'
+    local kv_config_d='{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_peer_hosts":["'"${NIXL_SIDE_CHANNEL_HOST}"'"]}'
   else
-    local kv_config_p="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_device\":\"${kv_device}\"}"
-    local kv_config_d="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_device\":\"${kv_device}\"}"
+    local kv_config_p="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_device\":\"${kv_device}\",\"kv_peer_hosts\":[\"${NIXL_SIDE_CHANNEL_HOST}\"]}"
+    local kv_config_d="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_device\":\"${kv_device}\",\"kv_peer_hosts\":[\"${NIXL_SIDE_CHANNEL_HOST}\"]}"
   fi
 
   echo ""

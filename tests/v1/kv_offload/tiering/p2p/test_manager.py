@@ -18,6 +18,7 @@ import pytest
 
 from tests.v1.kv_offload.tiering.test_tiering_offloading import _mock_mmap_region
 from vllm.utils.hashing import sha256
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.core.kv_cache_utils import DEFAULT_NONE_HASH_SEED, init_none_hash
 from vllm.v1.kv_offload.base import (
     LookupResult,
@@ -122,6 +123,9 @@ def _job_metadata(
     )
 
 
+_PEER_HOSTS = ("10.0.0.0/24", "127.0.0.1", "A", "B")
+
+
 def _make_manager() -> P2PSecondaryTierManager:
     """Create a manager with stubbed __init__."""
     mgr = P2PSecondaryTierManager.__new__(P2PSecondaryTierManager)
@@ -139,13 +143,16 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._reaped_stores = {}
     mgr._unbound_store_timeout_s = _UNBOUND_STORE_TIMEOUT_S
     mgr._failed_serve_ctxs = []
+    mgr._peer_hosts = PeerHostAllowlist(_PEER_HOSTS, "kv_peer_hosts")
     return mgr
 
 
 def _init_offloading_spec() -> SimpleNamespace:
     """Minimal offloading_spec for driving the real __init__."""
     return SimpleNamespace(
-        config=SimpleNamespace(parallel=SimpleNamespace(data_parallel_index=0)),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(data_parallel_index=0), peer_hosts=_PEER_HOSTS
+        ),
         blocks_per_chunk=1,
     )
 
@@ -1984,7 +1991,8 @@ class TestBindHostPortDefaults:
         spec = SimpleNamespace(
             blocks_per_chunk=1,
             config=SimpleNamespace(
-                parallel=SimpleNamespace(data_parallel_index=dp_index)
+                parallel=SimpleNamespace(data_parallel_index=dp_index),
+                peer_hosts=_PEER_HOSTS,
             ),
         )
         return P2PSecondaryTierManager(spec, memoryview(b""), **kwargs)

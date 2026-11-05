@@ -200,6 +200,7 @@ def run_rocm_pd_accuracy(connector, model, prefill_tp, decode_tp, monkeypatch):
             config = {
                 "kv_connector": connector_name,
                 "kv_role": role,
+                "kv_peer_hosts": ["localhost", "127.0.0.1"],
                 "kv_connector_extra_config": extra,
             }
             env = {

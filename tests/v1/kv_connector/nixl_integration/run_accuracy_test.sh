@@ -54,13 +54,16 @@ fi
 # Connector: default pull NixlConnector; NixlPushConnector enables PP prefill.
 KV_CONNECTOR=${KV_CONNECTOR:-NixlConnector}
 
+# P and D reach each other over the local side channel.
+KV_PEER_HOSTS=',"kv_peer_hosts":["localhost","127.0.0.1"]'
+
 # Build the kv-transfer-config for P and D
 if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then
-  KV_CONFIG_P='{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_producer"'${KV_CONFIG_HETERO_LAYOUT}'}'
-  KV_CONFIG_D='{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_consumer"'${KV_CONFIG_HETERO_LAYOUT}'}'
+  KV_CONFIG_P='{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_producer"'${KV_CONFIG_HETERO_LAYOUT}${KV_PEER_HOSTS}'}'
+  KV_CONFIG_D='{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_consumer"'${KV_CONFIG_HETERO_LAYOUT}${KV_PEER_HOSTS}'}'
 else
-  KV_CONFIG_P="{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_producer\",\"kv_buffer_device\":\"${KV_BUFFER_DEVICE}\"${KV_CONFIG_HETERO_LAYOUT}}"
-  KV_CONFIG_D="{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_consumer\",\"kv_buffer_device\":\"${KV_BUFFER_DEVICE}\"${KV_CONFIG_HETERO_LAYOUT}}"
+  KV_CONFIG_P="{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_producer\",\"kv_buffer_device\":\"${KV_BUFFER_DEVICE}\"${KV_CONFIG_HETERO_LAYOUT}${KV_PEER_HOSTS}}"
+  KV_CONFIG_D="{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_consumer\",\"kv_buffer_device\":\"${KV_BUFFER_DEVICE}\"${KV_CONFIG_HETERO_LAYOUT}${KV_PEER_HOSTS}}"
 fi
 
 # Models to run

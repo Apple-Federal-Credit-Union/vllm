@@ -557,6 +557,7 @@ def _moriio_config(
     return {
         "kv_connector": "MoRIIOConnector",
         "kv_role": role,
+        "kv_peer_hosts": ["127.0.0.1"],
         "kv_connector_extra_config": {
             "backend": BACKEND,
             "read_mode": read_mode,
