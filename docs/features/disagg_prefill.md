@@ -49,6 +49,16 @@ Now supports 9 types of connectors:
   --kv-transfer-config '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
   ```
 
+## Allowed KV transfer peers
+
+The router tells each instance which peer to transfer KV with through `kv_transfer_params` in the request (for example `remote_host` and `remote_port` for NIXL, `remote_bootstrap_addr` for Mooncake, or the address embedded in the MoRI-IO request id). An instance only connects to a peer listed in `kv_peer_hosts`; a request naming any other host is served without KV transfer. The default empty list refuses every request-supplied peer, so P/D deployments must list the hosts of the instances they pair with (prefill hosts on decode instances, and decode hosts on prefill instances for push or WRITE modes):
+
+```bash
+--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_peer_hosts":["10.0.0.0/24","prefill-0.svc"]}'
+```
+
+Each entry is an IP address, a CIDR network, or a hostname. A requested IP must fall inside a listed network; any other host must exactly match a listed hostname, so names are never resolved before the check. Keep the list as narrow as the deployment allows.
+
 ## Reusing prefill token ids on decode
 
 !!! note

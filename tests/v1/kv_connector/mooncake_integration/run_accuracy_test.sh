@@ -37,6 +37,7 @@ fi
 MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME-mlx5_12}
 kv_config() {
   printf '{"kv_connector":"MooncakeConnector","kv_role":"%s",' "$1"
+  printf '%s,' '"kv_peer_hosts":["localhost","127.0.0.1"]'
   printf '"kv_connector_extra_config":{"device_name":"%s"}}' "${MOONCAKE_DEVICE_NAME}"
 }
 KV_CONFIG_P=$(kv_config kv_producer)

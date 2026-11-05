@@ -114,6 +114,8 @@ python examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py
 
 The connector is configured at two levels: the application level and the transport level.
 
+Set `kv_peer_hosts` in `--kv-transfer-config` on every instance to the hosts of the instances it pairs with. The peer address MoRI-IO dials, whether embedded in the request id by the proxy or passed as `remote_host`/`remote_hosts`, must be listed; other requests are served without KV transfer. See [Allowed KV transfer peers](disagg_prefill.md#allowed-kv-transfer-peers).
+
 ### Application-level configuration
 
 **Modes:** MoRI has two modes of operation: WRITE and READ mode.

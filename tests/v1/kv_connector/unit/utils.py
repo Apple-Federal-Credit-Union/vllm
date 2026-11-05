@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (  # 
 )
 from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -161,6 +162,7 @@ def create_vllm_config(
         enable_permute_local_kv=enable_permute_local_kv,
         kv_connector_extra_config=kv_connector_extra_config or {},
         kv_load_failure_policy=kv_load_failure_policy,
+        kv_peer_hosts=["my-host"],
     )
     attention_config = AttentionConfig(backend=attention_backend)
     speculative_config = (
@@ -558,6 +560,7 @@ def make_nixl_scheduler(
     )
 
     sched = object.__new__(NixlConnectorScheduler)
+    sched._peer_hosts = PeerHostAllowlist(["my-host"], "kv_peer_hosts")
     sched._has_mamba = has_mamba
     sched._bounded_replay = bounded_replay
     sched._is_hma_required = is_hma_required

@@ -31,7 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.utils.network_utils import make_zmq_path
+from vllm.utils.network_utils import PeerHostAllowlist, make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -79,6 +79,10 @@ class NixlBaseConnectorScheduler:
             + vllm_config.parallel_config.data_parallel_index
         )
         assert vllm_config.kv_transfer_config is not None
+        self._peer_hosts = PeerHostAllowlist(
+            vllm_config.kv_transfer_config.kv_peer_hosts,
+            "kv_transfer_config.kv_peer_hosts",
+        )
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "kv_lease_duration", 30
@@ -199,9 +203,35 @@ class NixlBaseConnectorScheduler:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
 
+    def _authorize_remote_peer(self, params: dict[str, Any], req_id: ReqId) -> None:
+        """Bind ``remote_host``/``remote_port`` to an allowed peer.
+
+        A request naming any other peer loses its remote address and is
+        served without KV transfer, so no later hook can dial it.
+        """
+        if not (
+            params.get("do_remote_prefill")
+            or "remote_host" in params
+            or "remote_port" in params
+        ):
+            return
+        try:
+            host = self._peer_hosts.check_host(params.get("remote_host"))
+            port = self._peer_hosts.check_port(params.get("remote_port"))
+        except ValueError as e:
+            logger.warning("Ignoring KV transfer for request %s: %s", req_id, e)
+            for key in ("remote_host", "remote_port", "remote_block_ids"):
+                params.pop(key, None)
+            params["do_remote_prefill"] = False
+            return
+        params["remote_host"] = host
+        params["remote_port"] = port
+
     def on_new_request(self, request: "Request") -> None:
-        """Track a request that may need heartbeats."""
+        """Vet the request's remote peer and track it for heartbeats."""
         params = request.kv_transfer_params
+        if params is not None:
+            self._authorize_remote_peer(params, request.request_id)
         if params is not None and params.get("do_remote_decode"):
             self._truncate_request_for_prefill(request)
 

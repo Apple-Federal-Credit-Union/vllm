@@ -62,6 +62,7 @@ def create_ec_vllm_config(
         ec_connector="ECCPUConnector",
         ec_role=ec_role,
         engine_id=str(uuid.uuid4()),
+        ec_peer_hosts=["h"],
     )
     ec_transfer_config.mm_encoder_output_widths = (
         dict.fromkeys(("image", "video", "audio"), _EMBED_WIDTH)

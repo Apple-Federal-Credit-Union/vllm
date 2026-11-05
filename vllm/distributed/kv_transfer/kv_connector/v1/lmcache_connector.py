@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -106,6 +107,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             cls = LMCacheConnectorLatestImpl
 
         self._lmcache_engine = cls(vllm_config, role, self)
+        self._peer_hosts = PeerHostAllowlist(
+            vllm_config.kv_transfer_config.kv_peer_hosts,
+            "kv_transfer_config.kv_peer_hosts",
+        )
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 
@@ -288,7 +293,38 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         """Update KVConnector state after block allocation."""
+        self._authorize_disagg_receiver(request)
         self._lmcache_engine.update_state_after_alloc(request, num_external_tokens)
+
+    def on_new_request(self, request: "Request") -> None:
+        self._authorize_disagg_receiver(request)
+
+    def _authorize_disagg_receiver(self, request: "Request") -> None:
+        """Drop a ``disagg_spec`` whose receiver is not an allowed peer.
+
+        LMCache sends the request's KV to ``receiver_host``; without the spec
+        the request is served without KV transfer.
+        """
+        params = request.kv_transfer_params
+        spec = params.get("disagg_spec") if params else None
+        if spec is None:
+            return
+        assert params is not None
+        try:
+            if not isinstance(spec, dict):
+                raise ValueError(f"invalid disagg_spec {spec!r}")
+            self._peer_hosts.check_host(spec.get("receiver_host"))
+            for key in ("receiver_init_port", "receiver_alloc_port"):
+                spec[key] = self._peer_hosts.check_port(spec.get(key))
+            if spec.get("receiver_query_port") is not None:
+                spec["receiver_query_port"] = self._peer_hosts.check_port(
+                    spec["receiver_query_port"]
+                )
+        except ValueError as e:
+            logger.warning(
+                "Ignoring KV transfer for request %s: %s", request.request_id, e
+            )
+            del params["disagg_spec"]
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

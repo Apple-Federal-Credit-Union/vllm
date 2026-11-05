@@ -8,6 +8,7 @@ import sys
 import tempfile
 import warnings
 from collections.abc import (
+    Iterable,
     Iterator,
     Sequence,
 )
@@ -144,6 +145,69 @@ def join_host_port(host: str, port: int) -> str:
         return f"[{host}]:{port}"
     else:
         return f"{host}:{port}"
+
+
+class PeerHostAllowlist:
+    """Operator-configured hosts that request parameters may name as a peer.
+
+    Entries are IP addresses, CIDR networks, or hostnames. An IP literal is
+    allowed if it falls inside a network entry; any other host must equal a
+    hostname entry, so a name is never resolved before it is checked. An empty
+    allowlist refuses every host.
+    """
+
+    def __init__(self, entries: Iterable[str], setting: str) -> None:
+        self.setting = setting
+        self._networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        self._hostnames: set[str] = set()
+        for entry in entries:
+            try:
+                self._networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                self._hostnames.add(entry.lower())
+
+    def check_host(self, host: Any) -> str:
+        """Return ``host`` if it is allowed, else raise ``ValueError``."""
+        if isinstance(host, str) and host:
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                if host.lower() in self._hostnames:
+                    return host
+            else:
+                if any(address in network for network in self._networks):
+                    return host
+        raise ValueError(f"peer host {host!r} is not listed in {self.setting}")
+
+    @staticmethod
+    def check_port(port: Any) -> int:
+        """Return ``port`` as an int, or raise ``ValueError``."""
+        if isinstance(port, str) and port.isascii() and port.isdigit():
+            port = int(port)
+        if isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536:
+            return port
+        raise ValueError(f"invalid peer port {port!r}")
+
+    def check_url(self, url: Any, schemes: Sequence[str] = ("http", "https")) -> str:
+        """Return ``scheme://host[:port]`` rebuilt from an allowed ``url``.
+
+        Path, query, and fragment are dropped, so the caller dials exactly the
+        host and port that were checked.
+        """
+        if not isinstance(url, str):
+            raise ValueError(f"invalid peer URL {url!r}")
+        parsed = parse_url(url)
+        if parsed.scheme not in schemes or parsed.auth:
+            raise ValueError(f"invalid peer URL {url!r}")
+        host = parsed.hostname or ""
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        self.check_host(host)
+        if parsed.port is not None:
+            return f"{parsed.scheme}://{join_host_port(host, parsed.port)}"
+        if is_valid_ipv6_address(host):
+            return f"{parsed.scheme}://[{host}]"
+        return f"{parsed.scheme}://{host}"
 
 
 def get_distributed_init_method(ip: str, port: int) -> str:

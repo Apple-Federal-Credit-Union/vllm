@@ -61,7 +61,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+from vllm.utils.network_utils import (
+    PeerHostAllowlist,
+    get_ip,
+    make_zmq_path,
+    make_zmq_socket,
+)
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -941,6 +946,10 @@ class MooncakeConnectorScheduler:
         self.is_kv_consumer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        self._peer_hosts = PeerHostAllowlist(
+            vllm_config.kv_transfer_config.kv_peer_hosts,
+            "kv_transfer_config.kv_peer_hosts",
+        )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
         self._is_hma_required = (
@@ -1036,8 +1045,30 @@ class MooncakeConnectorScheduler:
             request.max_tokens = 1
             params["_p_side_truncated"] = True
 
+    def _authorize_remote_prefill(self, request: "Request") -> bool:
+        """Bind ``remote_bootstrap_addr`` to an allowed peer URL.
+
+        A request naming any other bootstrap server is served without remote
+        prefill.
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        try:
+            params["remote_bootstrap_addr"] = self._peer_hosts.check_url(
+                params.get("remote_bootstrap_addr")
+            )
+        except ValueError as e:
+            logger.warning(
+                "Ignoring remote prefill for request %s: %s", request.request_id, e
+            )
+            params["do_remote_prefill"] = False
+            return False
+        return True
+
     def on_new_request(self, request: "Request") -> None:
         params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_prefill"):
+            self._authorize_remote_prefill(request)
         if (
             params is not None
             and params.get("do_remote_decode")
@@ -1103,10 +1134,13 @@ class MooncakeConnectorScheduler:
 
         if params.get("do_remote_prefill"):
             assert not self.is_kv_producer
-            if all(
-                p in params
-                for p in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id")
-            ):
+            if not all(p in params for p in ("remote_engine_id", "transfer_id")):
+                logger.warning(
+                    "Got invalid KVTransferParams: %s. This "
+                    "request will not utilize KVTransfer",
+                    params,
+                )
+            elif self._authorize_remote_prefill(request):
                 # If remote_blocks and num_external_tokens = 0, we have
                 # a full prefix cache hit on the D worker. We need to call
                 # send_notif in _read_blocks to free the memory on the P.
@@ -1118,12 +1152,6 @@ class MooncakeConnectorScheduler:
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
-            else:
-                logger.warning(
-                    "Got invalid KVTransferParams: %s. This "
-                    "request will not utilize KVTransfer",
-                    params,
-                )
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
@@ -1194,7 +1222,8 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            if self._authorize_remote_prefill(request):
+                self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
             return False, None
 

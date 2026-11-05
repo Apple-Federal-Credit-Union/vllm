@@ -93,3 +93,5 @@ class OffloadingConfig:
     canonical_layout: bool = False
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None
+    # KVTransferConfig.kv_peer_hosts: peers that kv_transfer_params may name.
+    peer_hosts: tuple[str, ...] = ()

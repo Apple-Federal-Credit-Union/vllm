@@ -14,7 +14,7 @@ ATTENTION_BACKEND=${ATTENTION_BACKEND:-FLASHINFER}
 
 echo "Running Mamba prefix cache test (GPUs: P=$PREFILL_GPU_ID, D=$DECODE_GPU_ID, model=$MODEL, backend=$ATTENTION_BACKEND)"
 
-KV_CONFIG='{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+KV_CONFIG='{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_peer_hosts":["localhost","127.0.0.1"]}'
 
 # Resolve repository root
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

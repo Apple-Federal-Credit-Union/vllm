@@ -58,6 +58,7 @@ fi
 KV_CONFIG_NORMAL='{
   "kv_connector":"MultiConnector",
   "kv_role":"kv_both",
+  "kv_peer_hosts":["localhost","127.0.0.1"],
   "kv_connector_extra_config":{
     "connectors":[
       {"kv_connector":"NixlConnector","kv_role":"kv_both",

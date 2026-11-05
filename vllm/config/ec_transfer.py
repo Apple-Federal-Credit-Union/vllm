@@ -51,6 +51,14 @@ class ECTransferConfig:
     ec_connector_extra_config: dict[str, Any] = field(default_factory=dict)
     """any extra config that the connector may need."""
 
+    ec_peer_hosts: list[str] = field(default_factory=list)
+    """Hosts that `ec_transfer_params` in a request may tell this instance to
+    connect to for EC transfer (`ECCPUConnector` with NIXL consumers): IP
+    addresses, CIDR networks (e.g. `10.0.0.0/16`), or hostnames. A requested IP
+    must fall inside a listed network; any other host must exactly match a
+    listed hostname. Empty (the default) refuses every request-supplied
+    peer."""
+
     ec_connector_module_path: str | None = None
     """The Python module path to dynamically load the EC connector from.
     Only supported in V1."""

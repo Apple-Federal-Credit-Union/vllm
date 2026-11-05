@@ -17,6 +17,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.utils.network_utils import PeerHostAllowlist
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
@@ -54,6 +55,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
 
     def __init__(self, **attrs):
         self.mode = MoRIIOMode.READ
+        self._peer_hosts = PeerHostAllowlist(["127.0.0.0/8"], "kv_peer_hosts")
         self._mamba_group_ids: list[int] = []
         self._attn_group_ids: list[int] = [0]
         self._num_ssm_scratch_blocks = 0
@@ -147,6 +149,7 @@ def _gate_vllm_config(
                 "notify_port": 6002,
             },
             kv_role="kv_consumer",
+            kv_peer_hosts=["127.0.0.0/8"],
         ),
         speculative_config=speculative_config,
         cache_config=SimpleNamespace(
@@ -1099,6 +1102,7 @@ def test_register_kv_caches_allows_hma_divergent_block_size():
 # --------------------------------------------------------------------------
 def _mk_request(prompt, max_tokens=64, params=None):
     return SimpleNamespace(
+        request_id="req",
         kv_transfer_params={} if params is None else params,
         num_prompt_tokens=len(prompt),
         prompt_token_ids=list(prompt),

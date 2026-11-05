@@ -547,7 +547,7 @@ def test_basic_interface():
     request.kv_transfer_params.update(
         {
             "transfer_id": request_id,
-            "remote_bootstrap_addr": 54321,
+            "remote_bootstrap_addr": "http://my-host:54321",
         }
     )
 
@@ -596,7 +596,7 @@ def test_prompt_less_than_block_size():
     request.kv_transfer_params.update(
         {
             "transfer_id": request.request_id,
-            "remote_bootstrap_addr": 54321,
+            "remote_bootstrap_addr": "http://my-host:54321",
         }
     )
 
