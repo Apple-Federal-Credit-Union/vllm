@@ -1051,7 +1051,7 @@ def test_d_node_request_finished_exports_blocks_expiry_time():
     assert kv["remote_blocks_expiry_time"] > time.perf_counter()
 
 
-def test_handshake_listener_appends_perf_counter_frame():
+def test_handshake_listener_appends_perf_counter_frame(nixl_side_channel_key):
     """The handshake reply carries a 2nd frame with the listener's live
     perf_counter."""
     import threading
@@ -1063,7 +1063,10 @@ def test_handshake_listener_appends_perf_counter_frame():
         NixlBaseConnectorScheduler,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        get_side_channel_keys,
+        zmq_ctx,
+    )
     from vllm.utils.network_utils import get_open_port, make_zmq_path
 
     encoded_data = {(0, 0): b"payload-rank-0"}
@@ -1071,16 +1074,17 @@ def test_handshake_listener_appends_perf_counter_frame():
     stop_event = threading.Event()
     host = "127.0.0.1"
     port = get_open_port()
+    keys = get_side_channel_keys()
     listener = threading.Thread(
         target=NixlBaseConnectorScheduler._nixl_handshake_listener,
-        args=(encoded_data, ready_event, stop_event, host, port),
+        args=(encoded_data, ready_event, stop_event, host, port, keys),
         daemon=True,
     )
     listener.start()
     try:
         assert ready_event.wait(timeout=5)
         path = make_zmq_path("tcp", host, port)
-        with zmq_ctx(zmq.REQ, path) as sock:
+        with zmq_ctx(zmq.REQ, path, keys) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 5000)
             t0 = time.perf_counter()
             sock.send(msgspec.msgpack.encode((GET_META_MSG, 0, 0)))

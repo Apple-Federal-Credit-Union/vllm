@@ -419,7 +419,7 @@ def test_prefill_exports_cached_tokens_in_kv_transfer_params():
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
-def test_kv_transfer_handshake(dist_init):
+def test_kv_transfer_handshake(dist_init, nixl_side_channel_key):
     """Unit test for basic NixlConnector interface functionality."""
     # Test setup, we creates a scheduler that contains a NixlConnector
     # of role SCHEDULER, and expect it to be serving NixlAgentMetadata from
@@ -4737,6 +4737,7 @@ def test_scheduler_advertises_transfer_topology(
 def test_compatibility_hash_validation(
     default_vllm_config,
     dist_init,
+    nixl_side_channel_key,
     mismatch_type,
     config_overrides,
     version_override,
