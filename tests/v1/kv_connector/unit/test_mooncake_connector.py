@@ -611,10 +611,19 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
+_BOOTSTRAP_TOKEN = "placeholder-bootstrap-token"
+_BOOTSTRAP_AUTH = {"Authorization": f"Bearer {_BOOTSTRAP_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _bootstrap_token(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_BOOTSTRAP_TOKEN", _BOOTSTRAP_TOKEN)
+
+
 @pytest.fixture
 def bootstrap_server():
     """Fixture to launch and cleanup a Mooncake Bootstrap HTTP Server."""
-    server = MooncakeBootstrapServer("127.0.0.1", 0)
+    server = MooncakeBootstrapServer("127.0.0.1", 0, token=_BOOTSTRAP_TOKEN)
     try:
         server.start()
         yield server
@@ -624,7 +633,9 @@ def bootstrap_server():
 
 def test_bootstrap_server_occupied_port_raises_to_caller():
     with socket.create_server(("127.0.0.1", 0)) as listener:
-        server = MooncakeBootstrapServer("127.0.0.1", listener.getsockname()[1])
+        server = MooncakeBootstrapServer(
+            "127.0.0.1", listener.getsockname()[1], token=_BOOTSTRAP_TOKEN
+        )
         try:
             with pytest.raises(OSError) as exc_info:
                 server.start(timeout=0.05)
@@ -660,7 +671,7 @@ def test_bootstrap_server_startup_failure_releases_port(monkeypatch, failure):
                 pass
 
     monkeypatch.setattr(mooncake_utils.uvicorn.Server, "run", run_without_starting)
-    server = MooncakeBootstrapServer("127.0.0.1", 0)
+    server = MooncakeBootstrapServer("127.0.0.1", 0, token=_BOOTSTRAP_TOKEN)
     try:
         error = TimeoutError if failure == "timeout" else RuntimeError
         with pytest.raises(error):
@@ -682,7 +693,7 @@ def test_bootstrap_server_rejects_stale_started_state(monkeypatch, state):
         release.wait()
 
     monkeypatch.setattr(mooncake_utils.uvicorn.Server, "run", run_until_released)
-    server = MooncakeBootstrapServer("127.0.0.1", 0)
+    server = MooncakeBootstrapServer("127.0.0.1", 0, token=_BOOTSTRAP_TOKEN)
     try:
         server.start()
         thread = server.server_thread
@@ -728,7 +739,7 @@ async def test_register_worker_recovers_from_slow_bootstrap_server(
     monkeypatch.setenv("VLLM_MOONCAKE_CONNECTOR_TIMEOUT", "0.5")
     monkeypatch.setattr(mooncake_connector, "_BOOTSTRAP_MAX_ATTEMPTS", 5)
 
-    server = MooncakeBootstrapServer("127.0.0.1", 0)
+    server = MooncakeBootstrapServer("127.0.0.1", 0, token=_BOOTSTRAP_TOKEN)
     server.start()
     try:
         monkeypatch.setenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", str(server.port))
@@ -742,7 +753,9 @@ async def test_register_worker_recovers_from_slow_bootstrap_server(
         assert state["calls"] == 2
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"http://127.0.0.1:{server.port}/query")
+            response = await client.get(
+                f"http://127.0.0.1:{server.port}/query", headers=_BOOTSTRAP_AUTH
+            )
             assert response.status_code == 200
             assert response.json()["0"]["engine_id"] == "eng-1"
     finally:
@@ -761,7 +774,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
 
     # Query when empty
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{base_url}/query")
+        response = await client.get(f"{base_url}/query", headers=_BOOTSTRAP_AUTH)
         assert response.status_code == 200
         assert response.json() == {}
 
@@ -774,7 +787,9 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{base_url}/register", json=payload1)
+        response = await client.post(
+            f"{base_url}/register", headers=_BOOTSTRAP_AUTH, json=payload1
+        )
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
@@ -786,13 +801,15 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{base_url}/register", json=payload2)
+        response = await client.post(
+            f"{base_url}/register", headers=_BOOTSTRAP_AUTH, json=payload2
+        )
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
     # Query after registration should preserve the PP dimension.
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{base_url}/query")
+        response = await client.get(f"{base_url}/query", headers=_BOOTSTRAP_AUTH)
         assert response.status_code == 200
         data = response.json()
         assert "0" in data
@@ -802,14 +819,18 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
 
     # Re-registering the identical payload is idempotent.
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{base_url}/register", json=payload1)
+        response = await client.post(
+            f"{base_url}/register", headers=_BOOTSTRAP_AUTH, json=payload1
+        )
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
     # Test failure: same ranks, conflicting address
     payload1_conflict = dict(payload1, addr="tcp://9.9.9.9:9999")
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{base_url}/register", json=payload1_conflict)
+        response = await client.post(
+            f"{base_url}/register", headers=_BOOTSTRAP_AUTH, json=payload1_conflict
+        )
         assert response.status_code == 400
         assert "is already registered" in response.text
 
@@ -822,7 +843,9 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "addr": "tcp://3.3.3.3:3333",
     }
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{base_url}/register", json=payload3_fail)
+        response = await client.post(
+            f"{base_url}/register", headers=_BOOTSTRAP_AUTH, json=payload3_fail
+        )
         assert response.status_code == 400
         assert "Engine ID mismatch" in response.text
 
@@ -901,7 +924,7 @@ class _FlakyAsyncClient:
     async def __aexit__(self, *exc_info):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         self.calls.append(1)
         if len(self.calls) <= self.failures:
             raise httpx.ReadTimeout("simulated slow bootstrap server")

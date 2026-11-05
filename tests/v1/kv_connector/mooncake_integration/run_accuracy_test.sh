@@ -26,7 +26,12 @@ if [[ -n "$VLLM_SERVE_EXTRA_ARGS" ]]; then
 fi
 
 # Mooncake discovers peers via its bootstrap server, so no side-channel
-# or layout env vars are needed.
+# or layout env vars are needed. Every instance and the proxy share a
+# per-run bootstrap credential, kept out of the xtrace output.
+{ set +x; } 2>/dev/null
+VLLM_MOONCAKE_BOOTSTRAP_TOKEN=${VLLM_MOONCAKE_BOOTSTRAP_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}
+export VLLM_MOONCAKE_BOOTSTRAP_TOKEN
+set -x
 
 # Comma-separated whitelist restricting RDMA topology discovery to named HCAs.
 # This default is specific to the b200-k8s CI pool: those nodes expose four

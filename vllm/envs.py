@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
+    VLLM_MOONCAKE_BOOTSTRAP_HOST: str | None = None
+    VLLM_MOONCAKE_BOOTSTRAP_TOKEN: str | None = None
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
@@ -1794,6 +1796,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": lambda: int(
         os.getenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", "8998")
     ),
+    # Address the embedded Mooncake bootstrap server listens on and that
+    # prefiller workers register at. Defaults to the engine's management
+    # address (127.0.0.1 unless a data-parallel or master address is set).
+    "VLLM_MOONCAKE_BOOTSTRAP_HOST": lambda: (
+        os.getenv("VLLM_MOONCAKE_BOOTSTRAP_HOST") or None
+    ),
+    # Shared secret required on every Mooncake bootstrap server request. Must
+    # match on prefillers, decoders and the proxy. Unset rejects all requests.
+    "VLLM_MOONCAKE_BOOTSTRAP_TOKEN": lambda: (
+        os.getenv("VLLM_MOONCAKE_BOOTSTRAP_TOKEN") or None
+    ),
     # Log per-batch memory/disk tier breakdown on external GETs.
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
@@ -2403,6 +2416,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",
+        "VLLM_MOONCAKE_BOOTSTRAP_HOST",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
         "VLLM_MODEL_REDIRECT_PATH",
         "VLLM_HOST_IP",
@@ -2416,6 +2430,7 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        "VLLM_MOONCAKE_BOOTSTRAP_TOKEN",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

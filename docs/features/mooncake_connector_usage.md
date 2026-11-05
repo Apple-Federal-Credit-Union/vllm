@@ -18,21 +18,26 @@ Refer to [Mooncake official repository](https://github.com/kvcache-ai/Mooncake) 
 
 ## Usage
 
+The prefiller, decoder and proxy must share the same `VLLM_MOONCAKE_BOOTSTRAP_TOKEN`. Generate one, for example with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, and distribute it to every node through your secret store.
+
 ### Prefiller Node (192.168.0.2)
 
 ```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct --port 8010 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
+export VLLM_MOONCAKE_BOOTSTRAP_TOKEN=<shared token>
+VLLM_MOONCAKE_BOOTSTRAP_HOST=192.168.0.2 vllm serve Qwen/Qwen2.5-7B-Instruct --port 8010 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
 ```
 
 ### Decoder Node (192.168.0.3)
 
 ```bash
+export VLLM_MOONCAKE_BOOTSTRAP_TOKEN=<shared token>
 vllm serve Qwen/Qwen2.5-7B-Instruct --port 8020 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}'
 ```
 
 ### Proxy
 
 ```bash
+export VLLM_MOONCAKE_BOOTSTRAP_TOKEN=<shared token>
 python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --prefill http://192.168.0.2:8010 --decode http://192.168.0.3:8020
 ```
 
@@ -48,6 +53,17 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
     - Required only for prefiller instances
     - For headless instances, must be the same as the master instance
     - Each instance needs a unique port on its host; using the same port number across different hosts is fine
+
+- `VLLM_MOONCAKE_BOOTSTRAP_TOKEN`: Shared secret for the Mooncake bootstrap server. (Required)
+    - Every `/register` and `/query` request must send `Authorization: Bearer <token>`; anything else gets `401`
+    - Must be set to the same value on every prefiller, decoder and proxy. Prefiller workers send it when they register, decoders and the proxy send it when they query
+    - If it is unset, the embedded bootstrap server rejects every request and prefiller workers fail to register
+    - Decoders send the `remote_bootstrap_addr` in `kv_transfer_params` a credential derived from the token that authorizes only `GET /query`, never the token itself
+
+- `VLLM_MOONCAKE_BOOTSTRAP_HOST`: Address the embedded bootstrap server listens on and that prefiller workers register at. (Optional)
+    - Default: the engine's management address: `127.0.0.1` for hybrid or external load balancing, the master address for multi-node TP/PP, otherwise `--data-parallel-address` (default `127.0.0.1`)
+    - The server listens only on this address, not on every interface. Set it to the prefiller's routable IP when decoders or the proxy run on other hosts
+    - Must be reachable from every rank of the prefiller instance
 
 - `VLLM_MOONCAKE_CONNECTOR_TIMEOUT`: Per-request timeout (in seconds) for MooncakeConnector HTTP calls to the bootstrap server, including prefiller worker registration at startup and metadata queries. (Optional)
     - Default: 30.0
@@ -80,7 +96,7 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
 - **num_workers**: Size of thread pool for one prefiller worker to transfer KV caches by mooncake. (default 10)
 - **mooncake_protocol**: Mooncake connector protocol. (default "rdma")
 - **device_name**: Comma-separated whitelist of RDMA devices (e.g. `"mlx5_0,mlx5_1"`) to restrict topology discovery to. Empty discovers every device. Useful on hosts exposing a mix of InfiniBand and RoCE ports, where both peers must settle on the same link layer.
-- **bootstrap_server_address**: Optional `"host:port"` of an already running Mooncake bootstrap server. All prefiller ranks register with this endpoint instead of launching an embedded server. The caller owns the server lifetime and must configure the proxy to use the same endpoint. The example proxy assumes the bootstrap server is on the prefiller API host; a different host requires a proxy that supplies that address in `remote_bootstrap_addr`. Omit this option to use the embedded server and `VLLM_MOONCAKE_BOOTSTRAP_PORT`.
+- **bootstrap_server_address**: Optional `"host:port"` of an already running Mooncake bootstrap server. All prefiller ranks register with this endpoint instead of launching an embedded server. The caller owns the server lifetime and must configure the proxy to use the same endpoint. The example proxy assumes the bootstrap server is on the prefiller API host; a different host requires a proxy that supplies that address in `remote_bootstrap_addr`. Omit this option to use the embedded server and `VLLM_MOONCAKE_BOOTSTRAP_PORT`. An external `MooncakeBootstrapServer` must be constructed with the same `VLLM_MOONCAKE_BOOTSTRAP_TOKEN`.
 
 ## Prometheus metrics
 

@@ -47,7 +47,11 @@ async def get_prefiller_info(prefill_clients: list, ready: asyncio.Event):
                 continue
 
             response = await prefill_client["client"].get(
-                prefill_client["bootstrap_addr"] + "/query"
+                prefill_client["bootstrap_addr"] + "/query",
+                headers={
+                    "Authorization": "Bearer "
+                    + os.environ["VLLM_MOONCAKE_BOOTSTRAP_TOKEN"]
+                },
             )
             response.raise_for_status()
             data = response.json()
@@ -169,6 +173,11 @@ def parse_args():
     args = parser.parse_args()
     args.prefill = _parse_prefill_urls(args.prefill_raw)
     args.decode = _parse_decode_urls(args.decode_raw)
+    if not os.environ.get("VLLM_MOONCAKE_BOOTSTRAP_TOKEN"):
+        parser.error(
+            "VLLM_MOONCAKE_BOOTSTRAP_TOKEN must be set to the bootstrap token "
+            "configured on the prefill servers."
+        )
 
     return args
 
