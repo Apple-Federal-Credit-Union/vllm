@@ -9,6 +9,7 @@ import weakref
 import msgspec.msgpack
 import zmq
 
+from vllm import envs
 from vllm.config import LoggingConfig, ParallelConfig
 from vllm.logger import configure_logging, init_logger
 from vllm.utils.network_utils import make_zmq_socket
@@ -217,6 +218,8 @@ class DPCoordinatorProc:
                 ctx=self.ctx,
                 socket_type=zmq.XPUB,
                 bind=True,
+                # The Rust frontend subscribes here and only speaks NULL.
+                authenticate=not envs.VLLM_USE_RUST_FRONTEND,
             ) as publish_front,
             make_zmq_socket(
                 path=back_output_address,  # IPC or TCP

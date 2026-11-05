@@ -145,6 +145,11 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
+    # Output paths use NULL when the peer is the Rust frontend, which cannot
+    # complete a CURVE handshake. Handshake and coordinator sockets stay on
+    # CURVE: those peers are Python, including ranks that never see
+    # VLLM_USE_RUST_FRONTEND.
+    null_output_sockets: bool = False
 
 
 def _make_control_bundle(node_ip: str) -> dict[str, float]:
@@ -1552,6 +1557,7 @@ def wait_for_engine_startup(
                 EngineHandshakeMetadata(
                     addresses=launch.addresses,
                     parallel_config=parallel_config_payload,
+                    null_output_sockets=envs.VLLM_USE_RUST_FRONTEND,
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)

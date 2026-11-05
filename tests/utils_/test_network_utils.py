@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import socket
 import threading
 
 import pytest
 import zmq
 
+from vllm import envs
 from vllm.utils import network_utils
 from vllm.utils.network_utils import (
     get_file_store_init_method,
@@ -16,6 +18,7 @@ from vllm.utils.network_utils import (
     make_zmq_listener,
     make_zmq_path,
     make_zmq_socket,
+    require_shared_zmq_auth_secret,
     split_host_port,
     split_zmq_path,
 )
@@ -250,6 +253,76 @@ def test_make_zmq_listener_failed_ipc_bind_keeps_existing_path(tmp_path):
             client.connect(str(path))
     finally:
         owner.close()
+
+
+def _close_zmq(ctx: zmq.Context, *sockets: zmq.Socket | None) -> None:
+    for sock in sockets:
+        if sock is not None:
+            sock.close(linger=0)
+    ctx.term()
+
+
+def test_rust_frontend_flag_keeps_tcp_curve(monkeypatch: pytest.MonkeyPatch):
+    """Separately launched ranks do not set VLLM_USE_RUST_FRONTEND.
+
+    A head process that does must still speak CURVE, or the handshake hangs.
+    """
+    secret = "ab" * 32
+    monkeypatch.setattr(envs, "VLLM_ZMQ_AUTH_SECRET", secret, raising=False)
+    monkeypatch.setattr(envs, "VLLM_ZMQ_NULL_MECHANISM", False, raising=False)
+    monkeypatch.setattr(envs, "VLLM_USE_RUST_FRONTEND", True, raising=False)
+
+    ctx = zmq.Context()
+    server = client = None
+    try:
+        server = make_zmq_socket(ctx, "tcp://127.0.0.1:0", zmq.PULL)
+        assert server.getsockopt(zmq.MECHANISM) == zmq.CURVE
+        endpoint = server.getsockopt(zmq.LAST_ENDPOINT).decode()
+
+        # The other node does not run the Rust frontend.
+        monkeypatch.setattr(envs, "VLLM_USE_RUST_FRONTEND", False, raising=False)
+        client = make_zmq_socket(ctx, endpoint, zmq.PUSH, bind=False)
+        assert client.getsockopt(zmq.MECHANISM) == zmq.CURVE
+        client.send(b"ok")
+        assert server.poll(1000)
+        assert server.recv() == b"ok"
+    finally:
+        _close_zmq(ctx, server, client)
+
+
+def test_zmq_null_mechanism_env_forces_null(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_ZMQ_NULL_MECHANISM", True, raising=False)
+    ctx = zmq.Context()
+    server = None
+    try:
+        server = make_zmq_socket(ctx, "tcp://127.0.0.1:0", zmq.PULL)
+        assert server.getsockopt(zmq.MECHANISM) == zmq.NULL
+    finally:
+        _close_zmq(ctx, server)
+
+
+def test_rust_frontend_flag_does_not_skip_shared_secret(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    secret = "ab" * 32
+    monkeypatch.setattr(envs, "VLLM_USE_RUST_FRONTEND", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_ZMQ_NULL_MECHANISM", False, raising=False)
+    monkeypatch.setattr(envs, "VLLM_ZMQ_AUTH_SECRET", secret, raising=False)
+    monkeypatch.setattr(
+        network_utils, "_generated_zmq_auth_secret", (os.getpid(), secret)
+    )
+    with pytest.raises(ValueError, match="VLLM_ZMQ_AUTH_SECRET"):
+        require_shared_zmq_auth_secret("Peers on other nodes")
+
+
+def test_null_mechanism_skips_shared_secret(monkeypatch: pytest.MonkeyPatch):
+    secret = "ab" * 32
+    monkeypatch.setattr(envs, "VLLM_ZMQ_NULL_MECHANISM", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_ZMQ_AUTH_SECRET", secret, raising=False)
+    monkeypatch.setattr(
+        network_utils, "_generated_zmq_auth_secret", (os.getpid(), secret)
+    )
+    require_shared_zmq_auth_secret("Peers on other nodes")
 
 
 def test_make_zmq_path():

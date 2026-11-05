@@ -1199,6 +1199,12 @@ class EngineCoreProc(EngineCore):
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
 
+        # Ray actors skip the handshake that carries this bit. Engines
+        # launched for a Rust frontend inherit the flag and must send
+        # outputs with NULL; the handshake overwrites it for everyone else.
+        self._null_output_sockets = (
+            envs.VLLM_USE_RUST_FRONTEND or envs.VLLM_ZMQ_NULL_MECHANISM
+        )
         with self._perform_handshakes(
             handshake_address,
             identity,
@@ -1397,8 +1403,8 @@ class EngineCoreProc(EngineCore):
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
-    @staticmethod
     def startup_handshake(
+        self,
         handshake_socket: zmq.Socket,
         local_client: bool,
         headless: bool,
@@ -1456,6 +1462,9 @@ class EngineCoreProc(EngineCore):
                     num_redundant_experts
                 )
 
+        self._null_output_sockets = (
+            init_message.null_output_sockets or envs.VLLM_ZMQ_NULL_MECHANISM
+        )
         return init_message.addresses
 
     @staticmethod
@@ -2063,7 +2072,13 @@ class EngineCoreProc(EngineCore):
         with ExitStack() as stack, zmq.Context() as ctx:
             sockets = [
                 stack.enter_context(
-                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
+                    make_zmq_socket(
+                        ctx,
+                        output_path,
+                        zmq.PUSH,
+                        linger=4000,
+                        authenticate=not self._null_output_sockets,
+                    )
                 )
                 for output_path in output_paths
             ]
@@ -2664,7 +2679,11 @@ class DPEngineCoreProc(EngineCoreProc):
             encoder = MsgpackEncoder()
             ctx = zmq.Context.instance()
             with make_zmq_socket(
-                ctx, self.addresses.outputs[0], zmq.PUSH, linger=4000
+                ctx,
+                self.addresses.outputs[0],
+                zmq.PUSH,
+                linger=4000,
+                authenticate=not self._null_output_sockets,
             ) as socket:
                 socket.send_multipart(encoder.encode(outputs))
 

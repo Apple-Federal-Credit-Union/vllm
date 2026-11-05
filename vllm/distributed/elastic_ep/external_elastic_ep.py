@@ -13,6 +13,7 @@ import msgspec
 import msgspec.msgpack
 import zmq
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
@@ -169,6 +170,7 @@ class ExternalElasticEPScaleUpHandshakeServer:
                                 engine_metadata=EngineHandshakeMetadata(
                                     addresses=self.addresses,
                                     parallel_config=parallel_config,
+                                    null_output_sockets=envs.VLLM_USE_RUST_FRONTEND,
                                 ),
                                 num_redundant_experts=self.num_redundant_experts,
                                 elastic_ep_max_dp_size=self.elastic_ep_max_dp_size,

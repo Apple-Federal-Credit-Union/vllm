@@ -654,7 +654,8 @@ class MPClient(EngineCoreClient):
                 input_listener = client_addresses.get("input_listener")
                 output_listener = client_addresses.get("output_listener")
                 # Engines only send a ready message on the input socket, at
-                # startup. Outputs arrive on the authenticated output socket.
+                # startup. Outputs use CURVE unless the peer is the Rust
+                # frontend, which speaks only NULL.
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx,
                     input_address,
@@ -669,6 +670,9 @@ class MPClient(EngineCoreClient):
                     output_address,
                     zmq.PULL,
                     listener=output_listener,
+                    # The Rust frontend adopts this listener and only speaks
+                    # NULL. Engines learn that from the handshake.
+                    authenticate=not envs.VLLM_USE_RUST_FRONTEND,
                 )
 
                 # Engines are managed externally: this process does not fork
@@ -686,7 +690,10 @@ class MPClient(EngineCoreClient):
                     authenticate=False,
                 )
                 self.resources.output_socket = make_zmq_socket(
-                    self.ctx, bind_addresses.outputs[0], zmq.PULL
+                    self.ctx,
+                    bind_addresses.outputs[0],
+                    zmq.PULL,
+                    authenticate=not envs.VLLM_USE_RUST_FRONTEND,
                 )
 
                 # EngineZmqAddresses contains only endpoints resolved by the
@@ -1557,7 +1564,13 @@ class DPAsyncMPClient(AsyncMPClient):
 
         async def run_engine_stats_update_task():
             with (
-                make_zmq_socket(self.ctx, stats_addr, zmq.XSUB, linger=0) as socket,
+                make_zmq_socket(
+                    self.ctx,
+                    stats_addr,
+                    zmq.XSUB,
+                    linger=0,
+                    authenticate=not envs.VLLM_USE_RUST_FRONTEND,
+                ) as socket,
                 make_zmq_socket(
                     self.ctx, self.scale_sock_addr, zmq.PAIR, bind=False, linger=0
                 ) as scale_rcv_socket,

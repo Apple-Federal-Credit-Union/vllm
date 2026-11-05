@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_CHAT_TEMPLATE_FUEL: int = 500000
     VLLM_API_KEY: str | None = None
     VLLM_ZMQ_AUTH_SECRET: str | None = None
+    VLLM_ZMQ_NULL_MECHANISM: bool = False
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
@@ -837,6 +838,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # multi-node data parallel deployment and at least 32 characters long.
     # Generated per process tree when unset.
     "VLLM_ZMQ_AUTH_SECRET": lambda: os.environ.get("VLLM_ZMQ_AUTH_SECRET", None),
+    # Set by the Rust frontend on engines it spawns. Those engines' ZMQ peers
+    # are the Rust implementation, which only speaks the NULL mechanism.
+    # Do not set this on a Python `vllm serve` process: separately launched
+    # ranks do not inherit it and would then disagree on the mechanism.
+    "VLLM_ZMQ_NULL_MECHANISM": lambda: os.environ.get("VLLM_ZMQ_NULL_MECHANISM") == "1",
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
@@ -2423,6 +2429,7 @@ def compile_factors() -> dict[str, object]:
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
         "VLLM_ZMQ_AUTH_SECRET",
+        "VLLM_ZMQ_NULL_MECHANISM",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

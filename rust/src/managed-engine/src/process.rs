@@ -58,8 +58,14 @@ impl ManagedEngineConfig {
     /// `VLLM_USE_RUST_FRONTEND=1` tells Python vLLM to keep frontend-side
     /// multimodal normalization (`mm_device_do_normalize = False`,
     /// vllm/config/model.py) instead of expecting raw uint8 pixels.
+    /// `VLLM_ZMQ_NULL_MECHANISM=1` keeps every ZMQ socket in that engine on
+    /// NULL, the only mechanism this frontend implements. Separately launched
+    /// ranks must not set it: their handshake peer is Python and uses CURVE.
     pub fn rust_frontend_envs() -> Vec<(String, String)> {
-        vec![("VLLM_USE_RUST_FRONTEND".to_string(), "1".to_string())]
+        vec![
+            ("VLLM_USE_RUST_FRONTEND".to_string(), "1".to_string()),
+            ("VLLM_ZMQ_NULL_MECHANISM".to_string(), "1".to_string()),
+        ]
     }
 
     /// Build the concrete Python command line for the managed headless engine.
@@ -275,6 +281,12 @@ mod tests {
                         "1",
                     ),
                 ),
+                (
+                    "VLLM_ZMQ_NULL_MECHANISM",
+                    Some(
+                        "1",
+                    ),
+                ),
             ]
         "#]]
         .assert_debug_eq(&envs);
@@ -286,6 +298,10 @@ mod tests {
             [
                 (
                     "VLLM_USE_RUST_FRONTEND",
+                    "1",
+                ),
+                (
+                    "VLLM_ZMQ_NULL_MECHANISM",
                     "1",
                 ),
             ]
