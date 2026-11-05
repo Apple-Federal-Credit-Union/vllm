@@ -265,6 +265,15 @@ class TestPeerIdFromParams:
         assert result is None
 
 
+class TestAllowedPeer:
+    def test_bracketed_ipv6_matches_listed_network(self):
+        """The dialable peer id is ``[addr]:port``; the allowlist lists ``addr``."""
+        mgr = _make_manager()
+        mgr._peer_hosts = PeerHostAllowlist(["2001:db8::/32"], "kv_peer_hosts")
+        assert mgr._is_allowed_peer("[2001:db8::1]:8000")
+        assert not mgr._is_allowed_peer("[2001:db9::1]:8000")
+
+
 # ---------------------------------------------------------------------------
 # Tests for lookup
 # ---------------------------------------------------------------------------

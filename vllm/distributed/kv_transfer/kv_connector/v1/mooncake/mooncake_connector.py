@@ -1048,8 +1048,8 @@ class MooncakeConnectorScheduler:
     def _authorize_remote_prefill(self, request: "Request") -> bool:
         """Bind ``remote_bootstrap_addr`` to an allowed peer URL.
 
-        A request naming any other bootstrap server is served without remote
-        prefill.
+        A request naming any other bootstrap server is served without KV
+        transfer.
         """
         params = request.kv_transfer_params
         assert params is not None
@@ -1059,9 +1059,12 @@ class MooncakeConnectorScheduler:
             )
         except ValueError as e:
             logger.warning(
-                "Ignoring remote prefill for request %s: %s", request.request_id, e
+                "Ignoring KV transfer for request %s: %s", request.request_id, e
             )
+            # Leave neither role set. A request can carry both flags; keeping
+            # do_remote_decode selects the producer path on a decode instance.
             params["do_remote_prefill"] = False
+            params["do_remote_decode"] = False
             return False
         return True
 

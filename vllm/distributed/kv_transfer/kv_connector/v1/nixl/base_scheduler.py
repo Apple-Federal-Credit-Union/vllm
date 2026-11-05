@@ -222,7 +222,10 @@ class NixlBaseConnectorScheduler:
             logger.warning("Ignoring KV transfer for request %s: %s", req_id, e)
             for key in ("remote_host", "remote_port", "remote_block_ids"):
                 params.pop(key, None)
+            # Leave neither role set. A request can carry both flags; keeping
+            # do_remote_decode selects the producer path on a decode instance.
             params["do_remote_prefill"] = False
+            params["do_remote_decode"] = False
             return
         params["remote_host"] = host
         params["remote_port"] = port

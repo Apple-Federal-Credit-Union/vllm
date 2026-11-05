@@ -8,6 +8,7 @@ import zmq
 
 from vllm.utils import network_utils
 from vllm.utils.network_utils import (
+    PeerHostAllowlist,
     get_file_store_init_method,
     get_open_port,
     get_open_ports_list,
@@ -260,6 +261,19 @@ def test_make_zmq_path():
 def test_get_tcp_uri():
     assert get_tcp_uri("127.0.0.1", 5555) == "tcp://127.0.0.1:5555"
     assert get_tcp_uri("::1", 5555) == "tcp://[::1]:5555"
+
+
+def test_check_host_accepts_bracketed_ipv6():
+    """P2P peer ids keep the brackets the transport dials with."""
+    allow = PeerHostAllowlist(["2001:db8::/32", "prefill.internal"], "kv_peer_hosts")
+    assert allow.check_host("[2001:db8::1]") == "2001:db8::1"
+    assert allow.check_host("2001:db8::1") == "2001:db8::1"
+    with pytest.raises(ValueError, match="not listed"):
+        allow.check_host("[2001:db9::1]")
+    # Brackets are unwrapped only for IPv6 literals.
+    with pytest.raises(ValueError, match="not listed"):
+        allow.check_host("[prefill.internal]")
+    assert allow.check_url("http://[2001:db8::1]:8080") == "http://[2001:db8::1]:8080"
 
 
 def test_split_host_port():

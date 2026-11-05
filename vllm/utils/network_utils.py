@@ -167,16 +167,28 @@ class PeerHostAllowlist:
                 self._hostnames.add(entry.lower())
 
     def check_host(self, host: Any) -> str:
-        """Return ``host`` if it is allowed, else raise ``ValueError``."""
+        """Return an allowed host, or raise ``ValueError``.
+
+        A bracketed IPv6 literal is accepted and returned without brackets.
+        """
         if isinstance(host, str) and host:
+            # Peer ids use ``[addr]:port``. The brackets are not part of the
+            # address, and an allowlist entry is the bare literal.
+            bare = host
+            if (
+                host.startswith("[")
+                and host.endswith("]")
+                and is_valid_ipv6_address(host[1:-1])
+            ):
+                bare = host[1:-1]
             try:
-                address = ipaddress.ip_address(host)
+                address = ipaddress.ip_address(bare)
             except ValueError:
-                if host.lower() in self._hostnames:
-                    return host
+                if bare.lower() in self._hostnames:
+                    return bare
             else:
                 if any(address in network for network in self._networks):
-                    return host
+                    return bare
         raise ValueError(f"peer host {host!r} is not listed in {self.setting}")
 
     @staticmethod

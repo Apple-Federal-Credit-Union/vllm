@@ -37,7 +37,12 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from .test_mooncake_connector import patch_worker_dependencies
-from .utils import create_request, create_vllm_config, maybe_update_block_size
+from .utils import (
+    create_request,
+    create_vllm_config,
+    make_kv_cache_config,
+    maybe_update_block_size,
+)
 
 
 def noop_shutdown():
@@ -141,6 +146,41 @@ def test_hybrid_gdn_remote_decode_truncates_prefill_before_cache_lookup():
 
     assert num_new_tokens == 0
     assert is_async is False
+
+
+@pytest.mark.cpu_test
+def test_refused_peer_drops_remote_decode_on_consumer():
+    """A refused bootstrap peer must not arm the producer path on decode."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+    )
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config,
+        "engine",
+        make_kv_cache_config(vllm_config.cache_config.block_size, mamba_enabled=True),
+    )
+    request = create_request(num_tokens=8)
+    assert request.prompt_token_ids is not None
+    original_tokens = list(request.prompt_token_ids)
+    request.kv_transfer_params = {
+        "do_remote_prefill": True,
+        "do_remote_decode": True,
+        "remote_bootstrap_addr": "http://evil.example:9",
+        "remote_engine_id": "remote",
+        "transfer_id": "tx",
+    }
+
+    scheduler.on_new_request(request)
+
+    params = request.kv_transfer_params
+    assert params is not None
+    assert params["do_remote_prefill"] is False
+    assert params["do_remote_decode"] is False
+    assert request.prompt_token_ids == original_tokens
+    assert request.num_prompt_tokens == len(original_tokens)
+    scheduler.update_state_after_alloc(request, None, 0)
+    assert scheduler.request_finished(request, ()) == (False, None)
 
 
 def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):

@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MLAAttentionSpec,
 )
+from vllm.v1.request import RequestStatus
 
 from .utils import (
     create_request,
@@ -1692,6 +1693,28 @@ def test_mamba_n1_p_side_truncation():
     logprobs_req.sampling_params.skip_reading_prefix_cache = True
     swa_sched.on_new_request(logprobs_req)
     assert len(logprobs_req.prompt_token_ids) == 10
+
+
+@pytest.mark.cpu_test
+def test_refused_peer_drops_remote_decode_and_keeps_prompt():
+    """A refused peer is not a producer: both flags drop and the prompt stays."""
+    sched = make_nixl_scheduler(has_mamba=True, heartbeat=True)
+    req = create_request(num_tokens=8, do_remote_prefill=True)
+    assert req.prompt_token_ids is not None
+    assert req.kv_transfer_params is not None
+    original = list(req.prompt_token_ids)
+    req.kv_transfer_params["do_remote_decode"] = True
+    req.kv_transfer_params["remote_host"] = "evil.example"
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+    sched.on_new_request(req)
+
+    assert req.kv_transfer_params["do_remote_prefill"] is False
+    assert req.kv_transfer_params["do_remote_decode"] is False
+    assert "remote_host" not in req.kv_transfer_params
+    assert req.prompt_token_ids == original
+    assert req.num_prompt_tokens == len(original)
+    assert sched.request_finished(req, ([1],)) == (False, None)
 
 
 @pytest.mark.cpu_test
