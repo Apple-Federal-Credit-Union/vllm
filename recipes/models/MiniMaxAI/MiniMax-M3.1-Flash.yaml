@@ -518,6 +518,7 @@ guide: |
   ```bash
   VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 \
   VLLM_KV_CACHE_LAYOUT=BLHNC VLLM_NIXL_SIDE_CHANNEL_HOST=<P_IP> \
+  VLLM_NIXL_SIDE_CHANNEL_KEY=<shared-nixl-key> \
   vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
     -tp 4 \
     --reasoning-parser minimax_m3 \
@@ -539,6 +540,7 @@ guide: |
   ```bash
   VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 \
   VLLM_KV_CACHE_LAYOUT=BLHNC VLLM_NIXL_SIDE_CHANNEL_HOST=<D_IP> \
+  VLLM_NIXL_SIDE_CHANNEL_KEY=<shared-nixl-key> \
   vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
     -tp 4 \
     --reasoning-parser minimax_m3 \
@@ -554,6 +556,10 @@ guide: |
 
   - `<P_IP>` and `<D_IP>` are each node's own address, reachable from the
     other node (the NIXL side channel).
+  - `<shared-nixl-key>` is one secret of at least 32 characters, the same on
+    both nodes, for example from
+    `python3 -c 'import secrets; print(secrets.token_hex(32))'`. It
+    authenticates the NIXL handshake.
   - `VLLM_KV_CACHE_LAYOUT=BLHNC` goes on both nodes. It keeps all layers of a
     block contiguous, so NIXL reads one region per block instead of one per
     layer.
@@ -582,6 +588,7 @@ guide: |
   ```bash
   VLLM_FLOAT32_MATMUL_PRECISION=high VLLM_USE_V2_MODEL_RUNNER=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_NIXL_SIDE_CHANNEL_HOST=<P_IP> \
+  VLLM_NIXL_SIDE_CHANNEL_KEY=<shared-nixl-key> \
   vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
     --data-parallel-size 2 \
     --enable-expert-parallel \
@@ -608,6 +615,7 @@ guide: |
   ```bash
   VLLM_FLOAT32_MATMUL_PRECISION=high VLLM_USE_V2_MODEL_RUNNER=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_NIXL_SIDE_CHANNEL_HOST=<D_IP> \
+  VLLM_NIXL_SIDE_CHANNEL_KEY=<shared-nixl-key> \
   vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
     --data-parallel-size 4 \
     --enable-expert-parallel \

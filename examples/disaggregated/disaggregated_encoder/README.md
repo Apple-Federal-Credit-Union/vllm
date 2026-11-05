@@ -86,7 +86,7 @@ To enable filesystem encoder disaggregation, add:
 
 `$EC_SHARED_STORAGE_PATH` is the path where the EC connector temporarily stores the cache.
 
-If you enable prefill instance (`--prefill-servers-urls` not disabled), you will need --kv-transfer-config to facilitate the PD disaggregation. Currently, we use the `NixlConnector` for this purpose. Refer to `tests/v1/kv_connector/nixl_integration` for more example codes on PD disaggregation with Nixl.
+If you enable prefill instance (`--prefill-servers-urls` not disabled), you will need --kv-transfer-config to facilitate the PD disaggregation. Currently, we use the `NixlConnector` for this purpose. Refer to `tests/v1/kv_connector/nixl_integration` for more example codes on PD disaggregation with Nixl. Both instances must also share the same `VLLM_NIXL_SIDE_CHANNEL_KEY` (see the [NixlConnector Usage Guide](../../../docs/features/nixl_connector_usage.md#environment-variables)).
 
 ```bash
 # Add to prefill instance:    

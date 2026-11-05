@@ -253,6 +253,9 @@ guide: |
   > Note: `num_speculative_tokens` must be the same in prefill and decode instance
 
   ```bash
+  # Both pools must share this key to authenticate the NIXL handshake.
+  export VLLM_NIXL_SIDE_CHANNEL_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+
   # Prefill pool
   CUDA_VISIBLE_DEVICES=0,1,2,3 \
   VLLM_SSM_CONV_STATE_LAYOUT=DS \

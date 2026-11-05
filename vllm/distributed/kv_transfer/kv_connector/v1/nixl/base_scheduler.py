@@ -27,7 +27,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    SideChannelKeys,
+    get_side_channel_keys,
+    zmq_ctx,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -78,6 +82,14 @@ class NixlBaseConnectorScheduler:
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT
             + vllm_config.parallel_config.data_parallel_index
         )
+        self._side_channel_keys = get_side_channel_keys()
+        if self._side_channel_keys is None:
+            logger.warning(
+                "VLLM_NIXL_SIDE_CHANNEL_KEY is not set, so this instance will "
+                "not serve NIXL handshakes and remote instances cannot transfer "
+                "KV cache with it. Set the same key on every prefill and "
+                "decode instance."
+            )
         assert vllm_config.kv_transfer_config is not None
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -322,7 +334,10 @@ class NixlBaseConnectorScheduler:
             )
 
         # Only start the listener when we have metadata to serve.
-        if self._nixl_handshake_listener_t is None:
+        if (
+            self._nixl_handshake_listener_t is None
+            and self._side_channel_keys is not None
+        ):
             ready_event = threading.Event()
             self._nixl_handshake_listener_t = threading.Thread(
                 target=self._nixl_handshake_listener,
@@ -332,6 +347,7 @@ class NixlBaseConnectorScheduler:
                     self._stop_event,
                     self.side_channel_host,
                     self.side_channel_port,
+                    self._side_channel_keys,
                 ),
                 daemon=True,
                 name="nixl_handshake_listener",
@@ -346,6 +362,7 @@ class NixlBaseConnectorScheduler:
         stop_event: threading.Event,
         host: str,
         port: int,
+        keys: SideChannelKeys,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -354,7 +371,7 @@ class NixlBaseConnectorScheduler:
         # Listen for new requests for metadata.
         path = make_zmq_path("tcp", host, port)
         logger.debug("Starting listening on path: %s", path)
-        with zmq_ctx(zmq.ROUTER, path) as sock:
+        with zmq_ctx(zmq.ROUTER, path, keys) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
             while True:
@@ -373,6 +390,7 @@ class NixlBaseConnectorScheduler:
                 )
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
+                    continue
                 # Echo our perf_counter so P can estimate the clock offset.
                 # perf_counter is only comparable within a process, so this
                 # listener must run in the same process that stamps the block

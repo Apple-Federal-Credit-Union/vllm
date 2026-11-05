@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import random
+import secrets
 import shutil
 import socket
 import subprocess
@@ -306,6 +307,7 @@ def _serve(deployment: Deployment, mode: Mode) -> Iterator[list[RemoteOpenAIServ
         servers: list[RemoteOpenAIServer] = []
         stack.callback(RemoteOpenAIServer.shutdown_many, servers)
         next_gpu = 0
+        side_channel_key = secrets.token_hex(32)
         for instance in deployment.instances:
             env = {}
             if deployment.offload:
@@ -317,6 +319,7 @@ def _serve(deployment: Deployment, mode: Mode) -> Iterator[list[RemoteOpenAIServ
                 env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
                 env["VLLM_SSM_CONV_STATE_LAYOUT"] = "DS"
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
+                env["VLLM_NIXL_SIDE_CHANNEL_KEY"] = side_channel_key
             servers.append(
                 RemoteOpenAIServer(
                     MODEL,

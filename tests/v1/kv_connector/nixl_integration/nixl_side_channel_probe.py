@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Probe a NIXL side-channel socket for handshake metadata readiness."""
+"""Probe a NIXL side-channel socket for handshake metadata readiness.
+
+Authenticates with ``VLLM_NIXL_SIDE_CHANNEL_KEY`` like a decode worker does.
+"""
 
 import argparse
-import ipaddress
 
 import msgspec
 import zmq
 
-GET_META_MSG = b"get_meta_msg"
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_side_channel_keys,
+    zmq_ctx,
+)
+from vllm.utils.network_utils import make_zmq_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,28 +28,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_zmq_path(host: str, port: int) -> str:
-    try:
-        if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
-            return f"tcp://[{host}]:{port}"
-    except ValueError:
-        pass
-    return f"tcp://{host}:{port}"
-
-
 def main() -> None:
     args = parse_args()
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.REQ)
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.setsockopt(zmq.RCVTIMEO, args.timeout_ms)
-    try:
-        sock.connect(make_zmq_path(args.host, args.port))
+    keys = get_side_channel_keys()
+    if keys is None:
+        raise SystemExit("VLLM_NIXL_SIDE_CHANNEL_KEY is not set")
+    path = make_zmq_path("tcp", args.host, args.port)
+    with zmq_ctx(zmq.REQ, path, keys) as sock:
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, args.timeout_ms)
         sock.send(msgspec.msgpack.encode((GET_META_MSG, args.pp_rank, args.rank)))
         sock.recv()
-    finally:
-        sock.close()
-        ctx.term()
 
 
 if __name__ == "__main__":

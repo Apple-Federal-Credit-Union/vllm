@@ -21,6 +21,8 @@
 #   BLOCK_SIZE               - KV cache block size (default: 128)
 #   ATTENTION_BACKEND        - optional attention backend for vllm serve
 #   VLLM_SERVE_EXTRA_ARGS    - comma-separated extra args for vllm serve
+# Shared key that authenticates the NIXL handshake between these instances.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 set -xe
 
 # ── Configuration ────────────────────────────────────────────────────────

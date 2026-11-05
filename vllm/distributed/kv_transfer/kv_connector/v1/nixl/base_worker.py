@@ -59,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    get_side_channel_keys,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -1038,6 +1039,7 @@ class NixlBaseConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+        self._side_channel_keys = get_side_channel_keys()
 
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
@@ -1110,6 +1112,11 @@ class NixlBaseConnectorWorker:
         notif_agents_only: bool = False,
     ) -> tuple[dict[tuple[int, int], str], float]:
         """Do a NIXL handshake with a remote instance."""
+        if self._side_channel_keys is None:
+            raise RuntimeError(
+                "VLLM_NIXL_SIDE_CHANNEL_KEY is not set. Set it to the key the "
+                "remote instance uses to authenticate NIXL handshakes."
+            )
         if self._is_csa_linear:
             self._validate_csa_linear_tp_layout(remote_tp_size)
 
@@ -1142,7 +1149,7 @@ class NixlBaseConnectorWorker:
         best_rtt = float("inf")
         best_offset: float | None = None
 
-        with zmq_ctx(zmq.REQ, path) as sock:
+        with zmq_ctx(zmq.REQ, path, self._side_channel_keys) as sock:
             for remote_pp_rank, remote_rank in itertools.product(
                 range(remote_pp_size), p_remote_ranks
             ):

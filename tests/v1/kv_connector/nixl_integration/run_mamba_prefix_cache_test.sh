@@ -1,4 +1,6 @@
 #!/bin/bash
+# Shared key that authenticates the NIXL handshake between these instances.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 set -xe
 
 # E2E test: Mamba hybrid prefix cache hits in PD disaggregation.

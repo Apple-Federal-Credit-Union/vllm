@@ -7,6 +7,8 @@ declare -a PIDS=()
 # Configuration -- override via env before running
 ###############################################################################
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
+# Prefill and decode must share this key to authenticate the NIXL handshake.
+export VLLM_NIXL_SIDE_CHANNEL_KEY="${VLLM_NIXL_SIDE_CHANNEL_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 LOG_PATH="${LOG_PATH:-./logs}"
 mkdir -p "$LOG_PATH"
 

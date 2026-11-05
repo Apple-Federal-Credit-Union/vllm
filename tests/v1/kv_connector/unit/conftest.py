@@ -5,6 +5,14 @@ import pytest
 from vllm.platforms import current_platform
 
 
+@pytest.fixture
+def nixl_side_channel_key(monkeypatch):
+    """Configure the shared key the NIXL handshake listener and client use."""
+    monkeypatch.setenv(
+        "VLLM_NIXL_SIDE_CHANNEL_KEY", "placeholder-nixl-side-channel-key-for-tests"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _mock_cpu_backend_block_sizes(monkeypatch):
     """Mock the CPU attention backend's kernel block-size declaration.

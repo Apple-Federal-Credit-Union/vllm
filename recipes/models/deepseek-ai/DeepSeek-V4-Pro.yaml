@@ -650,6 +650,7 @@ guide: |
   export VLLM_HOST_IP="$NODE_IP"
   export VLLM_NIXL_SIDE_CHANNEL_HOST="$NODE_IP"
   export VLLM_NIXL_SIDE_CHANNEL_PORT=20096
+  export VLLM_NIXL_SIDE_CHANNEL_KEY="<shared-nixl-key>"  # Same on every node.
   export DYN_SYSTEM_PORT=8081
   export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_DSV4_MEGA_FP8_COMBINE=1
   export PYTHONHASHSEED=0
