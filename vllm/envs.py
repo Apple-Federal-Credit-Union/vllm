@@ -247,6 +247,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
+    VLLM_HF3FS_METADATA_TOKEN: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
@@ -1816,6 +1817,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": lambda: os.getenv(
         "MOONCAKE_REQUESTER_LOCAL_HOSTNAME"
     ),
+    # Shared bearer token for the HF3FS KV connector metadata server. Required:
+    # the server refuses to start and the connector refuses to connect without
+    # it, and every metadata request must send `Authorization: Bearer <token>`.
+    "VLLM_HF3FS_METADATA_TOKEN": lambda: os.getenv("VLLM_HF3FS_METADATA_TOKEN"),
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
@@ -2416,6 +2421,7 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        "VLLM_HF3FS_METADATA_TOKEN",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

@@ -17,6 +17,7 @@ import atexit
 import concurrent
 import copy
 import hashlib
+import hmac
 import os
 import queue
 import signal
@@ -495,6 +496,14 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         self._metadata_server_url = kv_config.get_from_extra_config(
             "hf3fs_metadata_server_url", "http://localhost:18000"
         )
+        block_hash_salt = kv_config.get_from_extra_config("hf3fs_block_hash_salt", "")
+        if not isinstance(block_hash_salt, str) or not block_hash_salt:
+            raise ValueError(
+                "HF3FSKVConnector requires kv_connector_extra_config"
+                "['hf3fs_block_hash_salt']: a secret string shared by every "
+                "instance that uses the same metadata server"
+            )
+        self._block_hash_salt = block_hash_salt.encode()
         self._file_size = kv_config.get_from_extra_config(
             "hf3fs_file_size", 1024 * 1024 * 1024
         )
@@ -508,7 +517,7 @@ class HF3FSKVConnector(KVConnectorBase_V1):
 
         if self._role == KVConnectorRole.SCHEDULER:
             self._scheduling_states: dict[str, RequestSchedulingState] = {}
-            self._metadata_client = Hf3fsMetadataClient()
+            self._metadata_client = Hf3fsMetadataClient(self._metadata_server_url)
             self._metadata_client.initialize(0, role="scheduler")
 
         atexit.register(self.close)
@@ -595,7 +604,7 @@ class HF3FSKVConnector(KVConnectorBase_V1):
 
             # Initialize metadata client
             num_pages = self._file_size // self._bytes_per_page
-            self._metadata_client = Hf3fsMetadataClient()
+            self._metadata_client = Hf3fsMetadataClient(self._metadata_server_url)
             self._metadata_client.initialize(self._rank, num_pages, role="worker")
         except Exception as e:
             logger.error("HF3FS client initialization failed: %s", e)
@@ -1004,9 +1013,11 @@ class HF3FSKVConnector(KVConnectorBase_V1):
     def _compute_prefix_hash(
         self, token_ids: list[int], previous_hash: str = ""
     ) -> str:
-        """Compute prefix hash for token block."""
+        """Compute prefix hash for token block, keyed by the deployment salt."""
         combined_string = f"{previous_hash}_{token_ids}"
-        return hashlib.md5(combined_string.encode()).hexdigest()
+        return hmac.new(
+            self._block_hash_salt, combined_string.encode(), hashlib.sha256
+        ).hexdigest()
 
     def _align_to_block_size(self, num_tokens: int) -> int:
         """Align token count to block size."""
