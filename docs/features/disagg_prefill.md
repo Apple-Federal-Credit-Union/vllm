@@ -49,6 +49,14 @@ Now supports 9 types of connectors:
   --kv-transfer-config '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
   ```
 
+- **HF3FSKVConnector**: stores KV cache pages in 3FS and tracks them with a metadata server. Start the server with the same `VLLM_HF3FS_METADATA_TOKEN` that every vLLM instance uses; the server and connector refuse to start without it, and the server rejects requests that do not send it as a bearer token. The server listens on `127.0.0.1:18000` by default; pass `--host` with an internal address to serve other nodes. `hf3fs_block_hash_salt` is required and must be a secret shared by every instance that uses the same metadata server:
+
+  ```bash
+  VLLM_HF3FS_METADATA_TOKEN=<token> python -m vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_metadata_server --port 18000
+  VLLM_HF3FS_METADATA_TOKEN=<token> vllm serve <model> \
+    --kv-transfer-config '{"kv_connector":"HF3FSKVConnector","kv_role":"kv_both","kv_connector_extra_config":{"hf3fs_storage_path":"/mnt/hf3fs","hf3fs_metadata_server_url":"http://127.0.0.1:18000","hf3fs_block_hash_salt":"<secret>"}}'
+  ```
+
 ## Reusing prefill token ids on decode
 
 !!! note

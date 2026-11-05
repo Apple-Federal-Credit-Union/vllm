@@ -3,6 +3,7 @@
 """HF3FS Metadata Server with key-based organization."""
 
 import argparse
+import hmac
 import logging
 import threading
 from abc import ABC, abstractmethod
@@ -15,10 +16,27 @@ from fastapi.responses import ORJSONResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import vllm.envs as envs
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+TOKEN_ENV = "VLLM_HF3FS_METADATA_TOKEN"
+
+
+def _is_page_index(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _load_metadata_token() -> str:
+    token = envs.VLLM_HF3FS_METADATA_TOKEN
+    if not token:
+        raise ValueError(
+            f"{TOKEN_ENV} must be set to the shared HF3FS metadata server token"
+        )
+    return token
 
 
 @dataclass
@@ -81,12 +99,15 @@ class GlobalMetadataState:
         self.global_lock = threading.RLock()
         self.rank_metadata: dict[int, RankFileMetadata] = {}
         self.key_metadata: dict[str, KeyMetadata] = {}
+        # rank -> page -> key for pages allocated but not yet confirmed.
+        self.pending_pages: dict[int, dict[int, str]] = {}
 
     def clear(self) -> None:
         """Clear all metadata state."""
         with self.global_lock:
             self.rank_metadata.clear()
             self.key_metadata.clear()
+            self.pending_pages.clear()
             logger.info("Cleared all metadata state")
 
     def initialize_rank(self, rank: int, num_pages: int) -> None:
@@ -114,6 +135,13 @@ class GlobalMetadataState:
         with self.global_lock:
             if rank not in self.rank_metadata:
                 raise ValueError(f"Rank {rank} not initialized")
+            if not all(
+                isinstance(item, (list, tuple))
+                and len(item) == 2
+                and isinstance(item[0], str)
+                for item in keys
+            ):
+                raise ValueError("Keys must be (key, prefix_key) pairs")
 
             # Batch allocate pages for all keys
             num_pages_needed = len(keys)
@@ -127,6 +155,7 @@ class GlobalMetadataState:
                     num_pages_needed,
                 )
 
+            pending = self.pending_pages.setdefault(rank, {})
             allocation_results = {}
             for i, (key, prefix_key) in enumerate(keys):
                 if key in self.key_metadata:
@@ -141,6 +170,7 @@ class GlobalMetadataState:
 
                 if i < len(allocated_pages):
                     allocation_results[key] = allocated_pages[i]
+                    pending[allocated_pages[i]] = key
                 else:
                     allocation_results[key] = -1  # No pages available
 
@@ -154,31 +184,79 @@ class GlobalMetadataState:
     ) -> None:
         """Confirm write operations for keys and update metadata.
 
+        A confirmation is accepted only for the page this rank was allocated
+        for that key, or for the page the key is already bound to on this rank.
+        The whole batch is rejected if any confirmation is not. Only pages that
+        are allocated on this rank and not yet confirmed can be released.
+
         Args:
             rank: Rank ID that confirmed the writes
             key_confirmations: List of (key, page_index) tuples
             pages_to_release: List of page indices to release back to free pool
 
+        Raises:
+            ValueError: If the rank is not initialized or the input is malformed.
+            PermissionError: If a confirmation names a page that was not
+                allocated to that key on this rank.
+
         """
         with self.global_lock:
-            # Confirm successful writes
+            if rank not in self.rank_metadata:
+                raise ValueError(f"Rank {rank} not initialized")
+            pending = self.pending_pages.setdefault(rank, {})
+
+            for confirmation in key_confirmations:
+                if (
+                    not isinstance(confirmation, (list, tuple))
+                    or len(confirmation) != 2
+                ):
+                    raise ValueError("Confirmations must be (key, page_index) pairs")
+                key, page_index = confirmation
+                if not isinstance(key, str) or not _is_page_index(page_index):
+                    raise ValueError("Confirmations must be (key, page_index) pairs")
+                key_meta = self.key_metadata.get(key)
+                bound_page = key_meta.get_rank_page(rank) if key_meta else None
+                if bound_page != page_index and pending.get(page_index) != key:
+                    raise PermissionError(
+                        f"Page {page_index} on rank {rank} was not allocated "
+                        "for this key"
+                    )
+
             for key, page_index in key_confirmations:
                 if key not in self.key_metadata:
                     # Need to determine tp_world_size from rank_metadata
                     tp_world_size = len(self.rank_metadata)
                     self.key_metadata[key] = KeyMetadata(key, {}, tp_world_size)
+                key_meta = self.key_metadata[key]
+                bound_page = key_meta.get_rank_page(rank)
+                if bound_page == page_index:
+                    continue
+                del pending[page_index]
+                if bound_page is None:
+                    key_meta.add_rank_page(rank, page_index)
+                else:
+                    # A concurrent save already bound this key on this rank.
+                    self.rank_metadata[rank].release_pages([page_index])
 
-                # Add confirmed page to key metadata
-                self.key_metadata[key].add_rank_page(rank, page_index)
-
-            # Release specified pages back to free pool
-            if pages_to_release:
-                self.rank_metadata[rank].release_pages(pages_to_release)
+            released = []
+            for page_index in pages_to_release or []:
+                if _is_page_index(page_index) and page_index in pending:
+                    del pending[page_index]
+                    released.append(page_index)
+                else:
+                    logger.warning(
+                        "Ignoring release of page %s on rank %s: not an "
+                        "unconfirmed allocation",
+                        page_index,
+                        rank,
+                    )
+            if released:
+                self.rank_metadata[rank].release_pages(released)
                 logger.debug(
                     "Released %s pages on rank %s: %s",
-                    len(pages_to_release),
+                    len(released),
                     rank,
-                    pages_to_release,
+                    released,
                 )
 
     def batch_key_exists(self, keys: list[str]) -> list[bool]:
@@ -237,9 +315,27 @@ class Hf3fsMetadataServer:
     """HF3FS Metadata Server with improved key-based organization."""
 
     def __init__(self, persistence_path: str | None = None, save_interval: int = 60):
+        self._expected_authorization = f"Bearer {_load_metadata_token()}".encode()
         self.state = GlobalMetadataState()
-        self.app = FastAPI(default_response_class=ORJSONResponse)
+        self.app = FastAPI(
+            default_response_class=ORJSONResponse,
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
+        )
+        self.app.middleware("http")(self._authorize)
         self._setup_routes()
+
+    async def _authorize(self, request: Request, call_next):
+        """Reject any request that does not carry the shared bearer token."""
+        provided = request.headers.get("authorization", "").encode()
+        if not hmac.compare_digest(provided, self._expected_authorization):
+            return ORJSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
 
     async def _read_json(self, request: Request) -> dict:
         """Parse request JSON using orjson."""
@@ -295,6 +391,8 @@ class Hf3fsMetadataServer:
             # Convert results to response format
             response = {"rank": rank, "results": list(results.items())}
             return ORJSONResponse(response)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:
             raise HTTPException(
                 status_code=500, detail=f"Allocation failed: {str(e)}"
@@ -308,7 +406,11 @@ class Hf3fsMetadataServer:
         pages_to_release = data.get("pages_to_release", [])
 
         # Validate input format
-        if rank is None or not isinstance(confirmations, list):
+        if (
+            rank is None
+            or not isinstance(confirmations, list)
+            or not isinstance(pages_to_release, list)
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid request format: need 'rank' and 'confirmations'",
@@ -319,6 +421,11 @@ class Hf3fsMetadataServer:
 
             return Response(status_code=204)
 
+        except PermissionError as e:
+            logger.warning("Rejected write confirmation on rank %s: %s", rank, e)
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:
             logger.error("Confirm write for keys failed: %s", e)
             raise HTTPException(
@@ -367,7 +474,7 @@ class Hf3fsMetadataServer:
         self.state.clear()
         return Response(status_code=204)
 
-    def run(self, host: str = "0.0.0.0", port: int = 18000):
+    def run(self, host: str = "127.0.0.1", port: int = 18000):
         """Run the metadata server."""
         import uvicorn
 
@@ -418,6 +525,7 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
     def __init__(self, base_url: str = "http://localhost:18000", max_retries: int = 3):
         self.base_url = base_url.rstrip("/")
         self._session = requests.Session()
+        self._session.headers["Authorization"] = f"Bearer {_load_metadata_token()}"
 
         retry_strategy = Retry(
             total=max_retries,
@@ -484,7 +592,7 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
 
 
 def run_metadata_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 18000,
 ):
     """Run the improved HF3FS metadata server."""
@@ -494,9 +602,19 @@ def run_metadata_server(
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Improved HF3FS Metadata Server")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Improved HF3FS Metadata Server. Requires the "
+            f"{TOKEN_ENV} environment variable; clients must send it as a "
+            "bearer token."
+        )
+    )
     parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind the server to."
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind the server to. Use an internal address to serve "
+        "other nodes.",
     )
     parser.add_argument(
         "--port", type=int, default=18000, help="Port to run the server on."

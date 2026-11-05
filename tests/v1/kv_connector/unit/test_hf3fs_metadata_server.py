@@ -178,15 +178,17 @@ class TestGlobalMetadataStateAllocation:
         assert all(v == -1 for v in results.values()), f"Expected all -1, got {results}"
 
     def test_confirm_write_releases_pages(self):
-        """confirm_write_for_keys with pages_to_release returns them to pool."""
+        """pages_to_release returns unconfirmed allocations to the pool."""
         state = GlobalMetadataState()
         state.initialize_rank(0, 3)
 
-        results = state.allocate_pages_for_keys(0, [("K", "")])
-        page = results["K"]
+        results = state.allocate_pages_for_keys(0, [("K", ""), ("failed", "")])
         free_after_alloc = state.rank_metadata[0].get_free_page_count()
 
-        state.confirm_write_for_keys(0, [("K", page)], pages_to_release=[page])
+        state.confirm_write_for_keys(
+            0, [("K", results["K"])], pages_to_release=[results["failed"]]
+        )
         free_after_release = state.rank_metadata[0].get_free_page_count()
 
         assert free_after_release == free_after_alloc + 1
+        assert state.batch_key_exists(["K", "failed"]) == [True, False]
