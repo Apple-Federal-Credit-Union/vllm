@@ -1220,7 +1220,8 @@ guide: |
   fronted by `vllm-router --vllm-pd-disaggregation`. Both pools disable FlashInfer
   autotune plus JIT and CuTeDSL warmup via `--kernel-config`, skip the DeepGEMM warmup
   (`VLLM_DEEP_GEMM_WARMUP=skip`), and cap `--max-num-seqs` at 32. On 8-GPU nodes the
-  same layout becomes TP8 per role.
+  same layout becomes TP8 per role. Set the same `VLLM_NIXL_SIDE_CHANNEL_KEY` on every
+  prefill and decode engine to authenticate the NIXL handshake.
 
   With **Speculative decoding** on, DSpark runs in both pools so the transferred KV
   stays compatible.
@@ -1501,6 +1502,7 @@ guide: |
   Both roles use TP1 with expert parallelism and these settings:
 
   ```bash
+  export VLLM_NIXL_SIDE_CHANNEL_KEY="<shared-nixl-key>"  # Same on every engine.
   export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1 NCCL_CUMEM_ENABLE=1
   export UCX_MEMTYPE_CACHE=n UCX_MEMTYPE_REG_WHOLE=n UCX_RNDV_PIPELINE_ERROR_HANDLING=y
   export VLLM_ENGINE_READY_TIMEOUT_S=7200 VLLM_RPC_TIMEOUT=600000

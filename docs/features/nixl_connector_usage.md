@@ -65,6 +65,12 @@ vllm serve <MODEL> \
 
 ## Basic Usage (on the same host)
 
+Every prefiller and decoder must share the same `VLLM_NIXL_SIDE_CHANNEL_KEY` (see [Environment Variables](#environment-variables)). Generate one and export it in the shell that launches both instances:
+
+```bash
+export VLLM_NIXL_SIDE_CHANNEL_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+```
+
 ### Producer (Prefiller) Configuration
 
 Start a prefiller instance that produces KV caches
@@ -121,6 +127,12 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
     - Default: "localhost"
     - Set when prefiller and decoder are on different machines
     - Connection info is passed via KVTransferParams from prefiller to decoder for handshake
+
+- `VLLM_NIXL_SIDE_CHANNEL_KEY`: Shared secret that authenticates and encrypts the NIXL handshake
+    - Default: unset. **Required for both prefiller and decoder instances**: without it an instance does not serve handshakes and cannot start one
+    - Must be identical on every instance that exchanges KV cache, and at least 32 characters long. Generate it with `python3 -c 'import secrets; print(secrets.token_hex(32))'`
+    - The handshake hands out the NIXL agent metadata and KV cache addresses needed to read or write this instance's KV cache, so only peers holding the key are answered. The handshake uses ZeroMQ CURVE, with keys derived from this value
+    - Treat it like any other credential: distribute it through your secret manager and do not log it
 
 - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
     - Default: 30
@@ -323,6 +335,8 @@ python benchmarks/multi_turn/benchmark_serving_multi_turn.py \
     We currently assume the router is able to detect such mismatch across turns. See [#43094](https://github.com/vllm-project/vllm/issues/43094). 
 
 ## Multi-Instance Setup
+
+Set the same `VLLM_NIXL_SIDE_CHANNEL_KEY` on every machine below.
 
 ### Multiple Prefiller Instances on Different Machines
 

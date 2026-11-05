@@ -20,6 +20,7 @@ The following options control internode communications in vLLM:
 
 - `--kv-ip`: The IP address for KV cache transfer communications (default: 127.0.0.1)
 - `--kv-port`: The port for KV cache transfer communications (default: 14579)
+- `VLLM_NIXL_SIDE_CHANNEL_KEY`: Shared secret for the `NixlConnector` handshake side channel. The handshake carries the NIXL agent metadata and KV cache addresses a peer needs to read or write this instance's KV cache, so the listener only answers peers that hold this key (ZeroMQ CURVE). It must be set to the same value on every prefill and decode instance; without it the listener does not start. Other KV connectors' side channels are not covered by this key.
 
 #### 3. **Data Parallel Configuration:**
 
