@@ -291,6 +291,8 @@ Certain API request parameters can have a large impact on resource consumption a
 
 To mitigate this, vLLM enforces a configurable upper bound on the `n` parameter via the `VLLM_MAX_N_SEQUENCES` environment variable (default: **16384**). Requests exceeding this limit are rejected before reaching the engine.
 
+Request bodies are bounded by `VLLM_HTTP_MAX_REQUEST_BODY_SIZE` (default: **32 MiB**; `0` removes the limit). The API server rejects a larger body with `413` before buffering it, whether its size is declared in `Content-Length` or it is streamed with chunked encoding.
+
 ### Recommendations
 
 - **Public-facing deployments:** Consider setting `VLLM_MAX_N_SEQUENCES` to a value appropriate for your workload (e.g., `64` or `128`) to limit the blast radius of a single request.

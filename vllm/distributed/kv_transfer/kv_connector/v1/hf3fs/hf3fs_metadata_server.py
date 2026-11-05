@@ -15,6 +15,8 @@ from fastapi.responses import ORJSONResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from vllm.entrypoints.launchers.utils.body_limit import limit_request_body
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -372,7 +374,7 @@ class Hf3fsMetadataServer:
         import uvicorn
 
         logger.info("Starting improved metadata server on http://%s:%s", host, port)
-        uvicorn.run(self.app, host=host, port=port)
+        uvicorn.run(limit_request_body(self.app), host=host, port=port)
 
 
 # --- Client implementation ---

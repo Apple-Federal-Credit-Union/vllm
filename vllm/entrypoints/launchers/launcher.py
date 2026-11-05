@@ -29,6 +29,7 @@ from vllm.utils.network_utils import find_process_using_port, is_valid_ipv6_addr
 from vllm.utils.system_utils import set_ulimit
 from vllm.version import __version__ as VLLM_VERSION
 
+from .utils.body_limit import limit_request_body
 from .utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
@@ -183,7 +184,8 @@ async def serve_http(
 ):
     """Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
     options.  Supports http header limits via h11_max_incomplete_event_size and
-    h11_max_header_count.
+    h11_max_header_count, and rejects request bodies larger than
+    VLLM_HTTP_MAX_REQUEST_BODY_SIZE.
     """
     logger.info("Available routes are:")
     # post endpoints
@@ -219,7 +221,7 @@ async def serve_http(
     if h11_max_header_count is None:
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
-    config = uvicorn.Config(app, **uvicorn_kwargs)
+    config = uvicorn.Config(limit_request_body(app), **uvicorn_kwargs)
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
     config.h11_max_header_count = h11_max_header_count
