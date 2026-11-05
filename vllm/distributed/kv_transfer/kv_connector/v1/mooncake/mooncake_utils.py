@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
+from vllm.entrypoints.launchers.utils.body_limit import limit_request_body
 from vllm.logger import init_logger
 
 WorkerAddr = str
@@ -76,7 +77,9 @@ class MooncakeBootstrapServer:
             family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
             self._socket = socket.create_server((self.host, self.port), family=family)
             self.port = self._socket.getsockname()[1]
-            config = uvicorn.Config(app=self.app, host=self.host, port=self.port)
+            config = uvicorn.Config(
+                app=limit_request_body(self.app), host=self.host, port=self.port
+            )
             server = self.server = uvicorn.Server(config=config)
             listener = self._socket
             self._startup_error = None

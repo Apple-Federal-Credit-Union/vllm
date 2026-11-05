@@ -1139,9 +1139,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
     ),
-    # Maximum request body size in bytes accepted by the HTTP API server; 0
-    # removes the limit. Only enforced by the Rust frontend; the Python
-    # frontend has no limit.
+    # Maximum request body size in bytes accepted by the HTTP API server
+    # (Python and Rust frontends); larger bodies are rejected with 413 before
+    # they are buffered. 0 removes the limit.
     "VLLM_HTTP_MAX_REQUEST_BODY_SIZE": lambda: int(
         os.environ.get("VLLM_HTTP_MAX_REQUEST_BODY_SIZE", str(32 * 1024 * 1024))
     ),
