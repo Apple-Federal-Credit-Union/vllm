@@ -9,8 +9,12 @@ from typing import Any
 class DataTransport(ABC):
     """Interface wrapping the NIXL data-plane for EC block transfers.
 
+    Producer side:
+      grant_blocks()     — expose some blocks to peers; returns what a peer needs
+      revoke_blocks()    — stop exposing blocks returned by grant_blocks()
+
     Peer lifecycle:
-      add_remote_peer()  — register a peer and store its dlist handle internally
+      add_remote_peer()  — register a peer's grant and store its dlist handle
       remove_remote_peer() — deregister and release the stored handle
       post_read()        — issue a READ using the stored handle for agent_name
 
@@ -19,18 +23,25 @@ class DataTransport(ABC):
     """
 
     @abstractmethod
-    def get_agent_metadata(self) -> bytes:
-        """Return this agent's serialized NIXL metadata blob."""
+    def grant_blocks(self, block_indices: list[int]) -> tuple[bytes, bytes]:
+        """Make block_indices readable by a peer.
+
+        Returns:
+            (agent_metadata, mem_descriptor) describing only block_indices, in
+            that order. Every call must be paired with revoke_blocks().
+
+        """
 
     @abstractmethod
-    def get_mem_descriptor(self) -> bytes:
-        """Return the msgpack-encoded block descriptor list for this agent."""
+    def revoke_blocks(self, block_indices: list[int]) -> None:
+        """Release one grant_blocks() call for block_indices."""
 
     @abstractmethod
     def add_remote_peer(self, metadata: bytes, mem_descriptor: bytes) -> str:
-        """Register a remote peer, prep its READ-source dlist, and return agent_name.
+        """Load a peer's grant, prep its READ-source dlist, and return agent_name.
 
-        The dlist handle is stored internally and used by post_read().
+        The dlist handle is stored internally and used by post_read(). A later
+        grant from the same peer replaces it.
         """
 
     @abstractmethod

@@ -25,6 +25,7 @@ Internal data classes:
 """
 
 import enum
+import hmac
 import logging
 import time
 import uuid
@@ -33,6 +34,7 @@ from typing import Any
 
 import msgspec
 
+from vllm import envs
 from vllm.distributed.ec_transfer.ec_connector.cpu.control.zmq import (
     ZmqClientConnection,
     ZmqClientTransport,
@@ -256,6 +258,8 @@ class ProducerSession:
         self._data = data
         self._cache = cache  # EmbeddingCache — single block owner
         self._compat_hash = compat_hash
+        token = envs.VLLM_EC_SIDE_CHANNEL_TOKEN
+        self._auth_token = token.encode() if token else None
 
         # Key: "{consumer_session_id}:{mm_hash}" — matches the NIXL notif_msg exactly,
         # so completion notification lookup is a direct dict pop with no parsing.
@@ -266,9 +270,13 @@ class ProducerSession:
 
     def close(self) -> None:
         for xfer in self._active_xfers.values():
-            self._cache.unpin(xfer.mm_hash)  # release any still-held pins
+            self._release(xfer)  # release any still-held pins
         self._active_xfers.clear()
         self._transport.close()
+
+    def _release(self, xfer: ProducerXfer) -> None:
+        self._data.revoke_blocks(xfer.block_indices)
+        self._cache.unpin(xfer.mm_hash)
 
     def poll_step(self) -> None:
         """Drain the transport without blocking and process what arrived."""
@@ -297,6 +305,13 @@ class ProducerSession:
                 "EC Connector: incompatible version for mm_hash=%s", req.mm_hash
             )
             return XferAck(mm_hash=req.mm_hash, status=XferStatus.NACK_VERSION)
+        if self._auth_token is None or not hmac.compare_digest(
+            req.auth_token.encode(), self._auth_token
+        ):
+            logger.warning(
+                "EC Connector: XferReq without a matching VLLM_EC_SIDE_CHANNEL_TOKEN"
+            )
+            return XferAck(mm_hash=req.mm_hash, status=XferStatus.NACK_UNAUTHORIZED)
         if req.compatibility_hash != self._compat_hash:
             logger.warning(
                 "EC Connector: incompatible compat hash for mm_hash=%s", req.mm_hash
@@ -323,12 +338,21 @@ class ProducerSession:
             )
             return XferAck(mm_hash=req.mm_hash, status=status)
         block_indices = list(entry.block_ids)
+        try:
+            agent_metadata, mem_descriptor = self._data.grant_blocks(block_indices)
+        except Exception:
+            logger.exception(
+                "EC Connector: failed to grant blocks for mm_hash=%s", req.mm_hash
+            )
+            self._cache.unpin(req.mm_hash)
+            return XferAck(mm_hash=req.mm_hash, status=XferStatus.NACK_INTERNAL)
         key = f"{req.session_id}:{req.mm_hash}"
-        if key in self._active_xfers:
+        previous = self._active_xfers.get(key)
+        if previous is not None:
             # This peer is re-requesting a grant it still holds, having timed
             # out waiting. Overwriting it drops the pin taken for it, which
             # neither a completion nor the sweep would ever release.
-            self._cache.unpin(req.mm_hash)
+            self._release(previous)
         self._active_xfers[key] = ProducerXfer(
             mm_hash=req.mm_hash,
             block_indices=block_indices,
@@ -344,9 +368,9 @@ class ProducerSession:
             mm_hash=req.mm_hash,
             status=XferStatus.OK,
             session_id=req.session_id,  # echo consumer's session_id back
-            src_block_indices=block_indices,
-            agent_metadata=self._data.get_agent_metadata(),
-            mem_descriptor=self._data.get_mem_descriptor(),
+            src_block_indices=list(range(len(block_indices))),
+            agent_metadata=agent_metadata,
+            mem_descriptor=mem_descriptor,
         )
 
     def _drain_notifs(self) -> None:
@@ -364,7 +388,7 @@ class ProducerSession:
                     continue
                 xfer = self._active_xfers.pop(key, None)
                 if xfer is not None:
-                    self._cache.unpin(xfer.mm_hash)
+                    self._release(xfer)
                     logger.debug(
                         "EC producer: NIXL READ completed mm_hash=%s key=%s",
                         xfer.mm_hash,
@@ -381,7 +405,7 @@ class ProducerSession:
                     xfer.mm_hash,
                     key,
                 )
-                self._cache.unpin(xfer.mm_hash)
+                self._release(xfer)
                 del self._active_xfers[key]
 
 
@@ -425,12 +449,12 @@ class ConsumerSession:
         self._transport = transport
         self._data = data
         self._compat_hash = compat_hash
+        self._auth_token = envs.VLLM_EC_SIDE_CHANNEL_TOKEN or ""
         self._session_id = str(
             uuid.uuid4()
         )  # stable identity for (session_id:mm_hash) keys
 
         self._nixl_agent_name: str | None = None
-        self._nixl_metadata_bytes: bytes | None = None
 
         self._xfers: dict[str, ConsumerXfer] = {}  # mm_hash → xfer
         self._quarantined: list[ConsumerXfer] = []  # DMA pending, to poll
@@ -466,6 +490,7 @@ class ConsumerSession:
                     mm_hash=mm_hash,
                     compatibility_hash=self._compat_hash,
                     session_id=self._session_id,
+                    auth_token=self._auth_token,
                 )
             )
         )
@@ -564,19 +589,26 @@ class ConsumerSession:
             self._tombstoned.add(ack.mm_hash)
 
     def _ensure_registered(self, metadata: bytes, mem_descriptor: bytes) -> str:
-        """Register or re-register the peer in DataTransport. Returns agent_name."""
-        if self._nixl_agent_name is not None and self._nixl_metadata_bytes == metadata:
-            return self._nixl_agent_name
-        if self._nixl_agent_name is not None:
+        """Load this grant into DataTransport. Returns agent_name.
+
+        Every grant carries metadata for its own blocks only, which NIXL merges
+        into the known peer. NIXL refuses the merge when the connection info
+        changed, which means the producer restarted, so the peer is re-added.
+        """
+        try:
+            agent_name = self._data.add_remote_peer(metadata, mem_descriptor)
+        except Exception:
+            if self._nixl_agent_name is None:
+                raise
             logger.info(
                 "EC Connector: producer %s:%d restarted; re-registering",
                 self._addr[0],
                 self._addr[1],
             )
             self._data.remove_remote_peer(self._nixl_agent_name)
-        agent_name = self._data.add_remote_peer(metadata, mem_descriptor)
+            self._nixl_agent_name = None
+            agent_name = self._data.add_remote_peer(metadata, mem_descriptor)
         self._nixl_agent_name = agent_name
-        self._nixl_metadata_bytes = metadata
         logger.debug(
             "EC Connector: registered peer %s:%d agent=%s",
             self._addr[0],

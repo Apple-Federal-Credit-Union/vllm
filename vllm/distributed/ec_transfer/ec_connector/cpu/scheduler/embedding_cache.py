@@ -60,8 +60,8 @@ class EmbeddingCache:
     def __init__(self, num_blocks: int) -> None:
         self._num_blocks = num_blocks
         self._lock = threading.Lock()
-        # Available block IDs, LIFO stack.
-        self._free_blocks: list[int] = list(range(num_blocks))
+        # Available block IDs, LIFO stack; a fresh cache hands out block 0 first.
+        self._free_blocks: list[int] = list(range(num_blocks - 1, -1, -1))
         # Key → live entry (all states: not-ready, ready, pinned).
         self._entries: dict[str, CacheEntry] = {}
         # Ready + unpinned entries in insertion order (FIFO eviction).

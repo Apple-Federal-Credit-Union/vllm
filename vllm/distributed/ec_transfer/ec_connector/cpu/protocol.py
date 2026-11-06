@@ -16,7 +16,7 @@ import msgspec
 
 # Bump when the wire format or tensor/block layout changes in a
 # backward-incompatible way. Peers reject mismatched versions.
-EC_CONNECTOR_VERSION: int = 2
+EC_CONNECTOR_VERSION: int = 3
 
 
 class XferStatus(enum.IntEnum):
@@ -28,6 +28,7 @@ class XferStatus(enum.IntEnum):
     NACK_VERSION = 3  # connector wire-version mismatch
     NACK_INTERNAL = 4  # producer hit an unexpected error
     NACK_NOT_READY = 5  # announced, but its GPU->mmap save has not landed yet
+    NACK_UNAUTHORIZED = 6  # auth_token does not match the producer's token
 
 
 # The producer expects a retryable condition to clear on its own, so the
@@ -51,6 +52,9 @@ class XferReq(  # type: ignore[call-arg]
     # (session_id, mm_hash), and the NIXL notif_msg carries the same pair.
     session_id: str = ""
     connector_version: int = EC_CONNECTOR_VERSION
+    # Shared secret from VLLM_EC_SIDE_CHANNEL_TOKEN. A producer without a
+    # token, or whose token differs, grants nothing.
+    auth_token: str = ""
 
 
 class XferAck(  # type: ignore[call-arg]
@@ -60,8 +64,9 @@ class XferAck(  # type: ignore[call-arg]
 ):
     """Producer → Consumer: response to an XferReq.
 
-    On status == OK: producer has pinned source blocks and returns their
-    indices plus fresh NIXL metadata for the consumer to register and READ.
+    On status == OK: producer has pinned the source blocks and returns NIXL
+    metadata and a memory descriptor covering only those blocks, for the
+    consumer to register and READ.
     On any NACK_*: optional fields are empty; consumer falls back to local encode.
     """
 
@@ -70,6 +75,7 @@ class XferAck(  # type: ignore[call-arg]
     # Consumer's session_id echoed back from XferReq. Together with mm_hash it
     # identifies the exact transfer; the consumer uses both to build notif_msg.
     session_id: str = ""
+    # Indices into mem_descriptor, in the order of the encoding's blocks.
     src_block_indices: list[int] = []
     agent_metadata: bytes = b""
     mem_descriptor: bytes = b""

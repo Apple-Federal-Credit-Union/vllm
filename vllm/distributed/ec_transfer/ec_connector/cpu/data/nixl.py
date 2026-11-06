@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NIXL-backed data-plane transport for ECCPUConnector."""
 
+from itertools import groupby
 from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.cpu.data.base import (
@@ -17,6 +18,19 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 _NIXL_DRAM = "DRAM"
+_NIXL_BACKENDS = ["UCX"]
+
+# (first block index, block count) of a contiguous run of blocks.
+_BlockRun = tuple[int, int]
+
+
+def _contiguous_runs(block_indices: list[int]) -> list[_BlockRun]:
+    runs: list[_BlockRun] = []
+    ordered = enumerate(sorted(set(block_indices)))
+    for _, group in groupby(ordered, lambda pair: pair[1] - pair[0]):
+        blocks = [block for _, block in group]
+        runs.append((blocks[0], len(blocks)))
+    return runs
 
 
 class NixlDataTransport(DataTransport):
@@ -25,6 +39,11 @@ class NixlDataTransport(DataTransport):
     Dlist handles (prepped xfer descriptor lists for remote peers) are stored
     internally keyed by agent_name. Callers never touch raw NIXL handles —
     post_read() resolves the handle from agent_name internally.
+
+    Peers never receive this agent's full metadata. grant_blocks() registers
+    the granted blocks as their own NIXL regions and hands out partial
+    metadata naming only those regions, so a peer's NIXL agent refuses to
+    address any other block of the region.
 
     NixlWrapper is not thread-safe, and neither is this class. Every call site
     runs on the scheduler thread, which serializes the transport by
@@ -47,10 +66,15 @@ class NixlDataTransport(DataTransport):
                 "install the `nixl` package or set a different ec_connector."
             )
         # agent_name → remote dlist handle (from add_remote_peer, used by post_read)
-        self._peer_handles: dict[str, int] = {}
+        self._peer_handles: dict[str, Any] = {}
         # None until the local region is registered, so deregister() is safe on
         # a transport whose registration failed part-way.
         self._reg_descs: Any = None
+        self._base_ptr = base_ptr
+        self._num_blocks = num_blocks
+        self._block_size_bytes = block_size_bytes
+        # Granted run → (outstanding grants, its registration descs).
+        self._granted_runs: dict[_BlockRun, tuple[int, Any]] = {}
 
         self._nixl = NixlWrapper(
             agent_name,
@@ -76,39 +100,112 @@ class NixlDataTransport(DataTransport):
         self._reg_descs = self._nixl.get_reg_descs(
             [(base_ptr, total_size_bytes, 0, "")], _NIXL_DRAM
         )
-        self._nixl.register_memory(self._reg_descs, backends=["UCX"])
+        self._nixl.register_memory(self._reg_descs, backends=_NIXL_BACKENDS)
         try:
             xfer_descs = self._nixl.get_xfer_descs(block_descs, _NIXL_DRAM)
             self._local_xfer_handle = self._nixl.prep_xfer_dlist(
                 "NIXL_INIT_AGENT", xfer_descs
             )
-            self._agent_metadata = self._nixl.get_agent_metadata()
-            self._mem_descriptor_bytes = serialize_mem_descriptor(block_descs)
         except Exception:
             self.deregister()
             raise
 
-    def get_agent_metadata(self) -> bytes:
-        return self._agent_metadata
+    def _run_reg_descs(self, runs: list[_BlockRun]) -> Any:
+        return self._nixl.get_reg_descs(
+            [
+                (
+                    self._base_ptr + first * self._block_size_bytes,
+                    count * self._block_size_bytes,
+                    0,
+                    "",
+                )
+                for first, count in runs
+            ],
+            _NIXL_DRAM,
+        )
 
-    def get_mem_descriptor(self) -> bytes:
-        return self._mem_descriptor_bytes
+    def grant_blocks(self, block_indices: list[int]) -> tuple[bytes, bytes]:
+        if not block_indices or not all(
+            0 <= i < self._num_blocks for i in block_indices
+        ):
+            raise ValueError(f"EC: cannot grant blocks {block_indices}")
+        runs = _contiguous_runs(block_indices)
+        retained: list[_BlockRun] = []
+        try:
+            for run in runs:
+                self._retain_run(run)
+                retained.append(run)
+            metadata = self._nixl.get_partial_agent_metadata(
+                self._run_reg_descs(runs),
+                inc_conn_info=True,
+                backends=_NIXL_BACKENDS,
+            )
+        except Exception:
+            for run in retained:
+                self._release_run(run)
+            raise
+        mem_descriptor = serialize_mem_descriptor(
+            [
+                (self._base_ptr + i * self._block_size_bytes, self._block_size_bytes, 0)
+                for i in block_indices
+            ]
+        )
+        return metadata, mem_descriptor
+
+    def revoke_blocks(self, block_indices: list[int]) -> None:
+        for run in _contiguous_runs(block_indices):
+            self._release_run(run)
+
+    def _retain_run(self, run: _BlockRun) -> None:
+        held = self._granted_runs.get(run)
+        if held is not None:
+            self._granted_runs[run] = (held[0] + 1, held[1])
+            return
+        reg_descs = self._run_reg_descs([run])
+        self._nixl.register_memory(reg_descs, backends=_NIXL_BACKENDS)
+        self._granted_runs[run] = (1, reg_descs)
+
+    def _release_run(self, run: _BlockRun) -> None:
+        held = self._granted_runs.get(run)
+        if held is None:
+            return
+        grants, reg_descs = held
+        if grants > 1:
+            self._granted_runs[run] = (grants - 1, reg_descs)
+            return
+        del self._granted_runs[run]
+        try:
+            self._nixl.deregister_memory(reg_descs, backends=_NIXL_BACKENDS)
+        except Exception:
+            logger.warning("EC: deregister of granted blocks failed", exc_info=True)
 
     def add_remote_peer(self, metadata: bytes, mem_descriptor: bytes) -> str:
-        """Register remote peer, prep its dlist, store handle internally.
+        """Load a peer's grant, prep its dlist, store the handle internally.
+
+        NIXL merges metadata for a peer it already knows, so the peer stays
+        registered across grants; only the dlist is replaced. A transfer built
+        from the replaced dlist keeps its own copy of the descriptors.
 
         Returns agent_name for use in post_read() and remove_remote_peer().
         """
         agent_name = self._nixl.add_remote_agent(metadata)
         remote_blocks = deserialize_mem_descriptor(mem_descriptor)
         remote_xfer_descs = self._nixl.get_xfer_descs(remote_blocks, _NIXL_DRAM)
-        self._peer_handles[agent_name] = self._nixl.prep_xfer_dlist(
-            agent_name, remote_xfer_descs
-        )
+        handle = self._nixl.prep_xfer_dlist(agent_name, remote_xfer_descs)
+        self._release_dlist(self._peer_handles.get(agent_name))
+        self._peer_handles[agent_name] = handle
         return agent_name
 
+    def _release_dlist(self, handle: Any) -> None:
+        if handle is None:
+            return
+        try:
+            self._nixl.release_dlist_handle(handle)
+        except Exception:
+            logger.warning("EC: release_dlist_handle failed", exc_info=True)
+
     def remove_remote_peer(self, agent_name: str) -> None:
-        self._peer_handles.pop(agent_name, None)
+        self._release_dlist(self._peer_handles.pop(agent_name, None))
         try:
             self._nixl.remove_remote_agent(agent_name)
         except Exception:
@@ -153,6 +250,12 @@ class NixlDataTransport(DataTransport):
             logger.warning("EC: release_xfer_handle failed", exc_info=True)
 
     def deregister(self) -> None:
+        for _, reg_descs in self._granted_runs.values():
+            try:
+                self._nixl.deregister_memory(reg_descs, backends=_NIXL_BACKENDS)
+            except Exception:
+                logger.warning("EC: deregister of granted blocks failed", exc_info=True)
+        self._granted_runs.clear()
         if self._reg_descs is None:
             return
         try:

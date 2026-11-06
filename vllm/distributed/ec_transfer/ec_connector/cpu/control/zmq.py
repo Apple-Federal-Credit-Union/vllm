@@ -5,14 +5,23 @@
 ZmqClientConnection  — one DEALER socket to a single producer peer.
 ZmqClientTransport   — pool of ZmqClientConnection objects (consumer side).
 ZmqServerTransport   — ROUTER socket (producer side).
+
+With VLLM_EC_SIDE_CHANNEL_TOKEN set, both sides use ZeroMQ CURVE with keys
+derived from it: a consumer only completes a handshake with a producer that
+holds the token, and the producer only with consumers that hold it.
 """
 
 import contextlib
+import hashlib
+import hmac
 from dataclasses import dataclass, field
 
 import zmq
+from zmq.auth.thread import ThreadAuthenticator
+from zmq.utils import z85
 from zmq.utils.monitor import recv_monitor_message
 
+from vllm import envs
 from vllm.distributed.ec_transfer.ec_connector.cpu.control.base import (
     ControlConnection,
 )
@@ -25,6 +34,49 @@ logger = init_logger(__name__)
 _HEARTBEAT_IVL_MS = 2000
 _HEARTBEAT_TIMEOUT_MS = 4000
 _HEARTBEAT_TTL_MS = 8000
+
+
+@dataclass(frozen=True)
+class SideChannelKeys:
+    """CURVE keypairs (Z85) derived from VLLM_EC_SIDE_CHANNEL_TOKEN."""
+
+    server_public: bytes
+    server_secret: bytes
+    client_public: bytes
+    client_secret: bytes
+
+
+def _derive_curve_keypair(token: bytes, label: bytes) -> tuple[bytes, bytes]:
+    secret = z85.encode(hmac.digest(token, label, hashlib.sha256))
+    return zmq.curve_public(secret), secret
+
+
+def side_channel_keys() -> SideChannelKeys | None:
+    """Derive the side-channel keys, or return None when no token is set."""
+    token = envs.VLLM_EC_SIDE_CHANNEL_TOKEN
+    if not token:
+        return None
+    if not zmq.has("curve"):
+        raise RuntimeError(
+            "VLLM_EC_SIDE_CHANNEL_TOKEN requires libzmq with CURVE support."
+        )
+    server_public, server_secret = _derive_curve_keypair(
+        token.encode(), b"vllm-ec-side-channel-server"
+    )
+    client_public, client_secret = _derive_curve_keypair(
+        token.encode(), b"vllm-ec-side-channel-client"
+    )
+    return SideChannelKeys(server_public, server_secret, client_public, client_secret)
+
+
+class _ClientKeyAllowlist:
+    """ZAP credentials provider admitting only the derived client key."""
+
+    def __init__(self, client_public: bytes) -> None:
+        self._client_public = client_public
+
+    def callback(self, domain: str, key: bytes) -> bool:
+        return hmac.compare_digest(key, self._client_public)
 
 
 # ── Client side ───────────────────────────────────────────────────────────────
@@ -91,6 +143,12 @@ class ZmqClientTransport:
     def __init__(self) -> None:
         self._ctx = zmq.Context()
         self._connections: dict[PeerAddr, ZmqClientConnection] = {}
+        keys = side_channel_keys()
+        if keys is not None:
+            # Context defaults, so every DEALER has them before it connects.
+            self._ctx.setsockopt(zmq.CURVE_SERVERKEY, keys.server_public)
+            self._ctx.setsockopt(zmq.CURVE_PUBLICKEY, keys.client_public)
+            self._ctx.setsockopt(zmq.CURVE_SECRETKEY, keys.client_secret)
 
     def connect(self, addr: PeerAddr) -> ZmqClientConnection:
         """Return the existing connection for addr, or create a new one."""
@@ -176,12 +234,30 @@ class ZmqServerTransport:
 
     def __init__(self, host: str, port: int) -> None:
         self._ctx = zmq.Context()
-        self._router = make_zmq_socket(
-            ctx=self._ctx,
-            path=make_zmq_path(scheme="tcp", host=host, port=port),
-            socket_type=zmq.ROUTER,
-            bind=True,
-        )
+        self._auth: ThreadAuthenticator | None = None
+        keys = side_channel_keys()
+        if keys is not None:
+            self._auth = ThreadAuthenticator(self._ctx)
+            self._auth.start()
+            self._auth.configure_curve_callback(
+                domain="*", credentials_provider=_ClientKeyAllowlist(keys.client_public)
+            )
+            # Set after the authenticator's own socket exists, so only the
+            # ROUTER becomes a CURVE server.
+            self._ctx.setsockopt(zmq.CURVE_SERVER, 1)
+            self._ctx.setsockopt(zmq.CURVE_SECRETKEY, keys.server_secret)
+        try:
+            self._router = make_zmq_socket(
+                ctx=self._ctx,
+                path=make_zmq_path(scheme="tcp", host=host, port=port),
+                socket_type=zmq.ROUTER,
+                bind=True,
+            )
+        except Exception:
+            if self._auth is not None:
+                self._auth.stop()
+            self._ctx.destroy(linger=0)
+            raise
         self._poller = zmq.Poller()
         self._poller.register(self._router, zmq.POLLIN)
 
@@ -227,6 +303,12 @@ class ZmqServerTransport:
             self._router.close(linger=0)
         except Exception:
             logger.debug("ec: router close failed", exc_info=True)
+        if self._auth is not None:
+            try:
+                self._auth.stop()
+            except Exception:
+                logger.debug("ec: zmq authenticator stop failed", exc_info=True)
+            self._auth = None
         try:
             self._ctx.destroy(linger=0)
         except Exception:

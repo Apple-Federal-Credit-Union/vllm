@@ -149,6 +149,19 @@ class ECCPUScheduler:
             )
         engine_id = self._ec_config.engine_id
         assert engine_id is not None
+        token = envs.VLLM_EC_SIDE_CHANNEL_TOKEN
+        if not token:
+            logger.warning(
+                "ec_enable_nixl is set but VLLM_EC_SIDE_CHANNEL_TOKEN is not: "
+                "producers refuse every read and consumers encode locally. "
+                "Set the same secret on every EC producer and consumer."
+            )
+        elif len(token) < 32:
+            logger.warning(
+                "VLLM_EC_SIDE_CHANNEL_TOKEN is shorter than 32 characters; use a "
+                "random value such as `python3 -c 'import secrets; "
+                "print(secrets.token_hex(32))'`."
+            )
         # How long a consumer waits for an XferAck. The producer answers from
         # its scheduler step, so its reply latency scales with the encoder's
         # batch size: a deployment whose steps run longer must raise this.

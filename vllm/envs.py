@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_P2P_IDLE_TIMEOUT_S: int = 300
     VLLM_EC_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
+    VLLM_EC_SIDE_CHANNEL_TOKEN: str | None = None
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
@@ -1785,6 +1786,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EC_SIDE_CHANNEL_PORT": lambda: int(
         os.getenv("VLLM_EC_SIDE_CHANNEL_PORT", "5601")
     ),
+    # Shared secret every EC producer and consumer must set to the same value.
+    # A producer answers an XferReq only when its token matches, and grants
+    # nothing while this is unset.
+    "VLLM_EC_SIDE_CHANNEL_TOKEN": lambda: (
+        os.getenv("VLLM_EC_SIDE_CHANNEL_TOKEN") or None
+    ),
     # Per-request timeout (seconds) when a prefiller worker registers with
     # the Mooncake bootstrap server.
     "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": lambda: float(
@@ -2416,6 +2423,7 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        "VLLM_EC_SIDE_CHANNEL_TOKEN",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

@@ -10,6 +10,7 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.data.base import (
     DataTransport,
 )
 from vllm.distributed.ec_transfer.ec_connector.cpu.utils import (
+    deserialize_mem_descriptor,
     serialize_mem_descriptor,
 )
 
@@ -99,14 +100,29 @@ def test_nixl_data_transport_raises_if_nixl_unavailable():
 # ── public accessors ──────────────────────────────────────────────────────────
 
 
-def test_get_agent_metadata_returns_nixl_blob():
-    assert _make_transport().get_agent_metadata() == b"agent-meta"
+def test_grant_blocks_describes_only_the_granted_blocks():
+    nixl = _make_nixl_mock()
+    nixl.get_partial_agent_metadata.return_value = b"partial-meta"
+    t = _make_transport(nixl)
+
+    metadata, mem_desc = t.grant_blocks([2, 3])
+
+    assert metadata == b"partial-meta"
+    assert deserialize_mem_descriptor(mem_desc) == [(128, 64, 0), (192, 64, 0)]
+    nixl.get_agent_metadata.assert_not_called()
+    nixl.get_reg_descs.assert_called_with([(128, 128, 0, "")], "DRAM")
 
 
-def test_get_mem_descriptor_roundtrips_block_descs():
+def test_revoke_blocks_deregisters_after_the_last_grant():
     t = _make_transport()
-    raw = t.get_mem_descriptor()
-    assert isinstance(raw, bytes) and len(raw) > 0
+    t.grant_blocks([1])
+    t.grant_blocks([1])
+    t._nixl.deregister_memory.reset_mock()
+
+    t.revoke_blocks([1])
+    t._nixl.deregister_memory.assert_not_called()
+    t.revoke_blocks([1])
+    t._nixl.deregister_memory.assert_called_once()
 
 
 # ── add_remote_peer ───────────────────────────────────────────────────────────
