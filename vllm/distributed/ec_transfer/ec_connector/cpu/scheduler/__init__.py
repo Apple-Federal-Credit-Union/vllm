@@ -588,13 +588,16 @@ class ECCPUScheduler:
         mm_hash = feature.identifier
 
         if self._is_producer and self._cache.get(mm_hash) is None:
-            shape = (
-                feature.mm_position.get_num_embeds(),
-                get_encoder_output_width(self._vllm_config, feature.modality),
-            )
-            entry = self._cache.alloc(mm_hash, self._num_blocks(shape), shape)
-            if entry is not None:
-                self._pending_saves[mm_hash] = list(entry.block_ids)
+            try:
+                width = get_encoder_output_width(self._vllm_config, feature.modality)
+            except ValueError as error:
+                # Raising here would take down the engine core.
+                logger.warning_once("EC producer: not offloading encodings: %s", error)
+            else:
+                shape = (feature.mm_position.get_num_embeds(), width)
+                entry = self._cache.alloc(mm_hash, self._num_blocks(shape), shape)
+                if entry is not None:
+                    self._pending_saves[mm_hash] = list(entry.block_ids)
 
         if self._is_consumer and mm_hash not in self._pending_loads:
             entry = self._cache.get(mm_hash)
