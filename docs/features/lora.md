@@ -468,6 +468,13 @@ vllm serve model --enable-lora --max-lora-rank 64
 vllm serve model --enable-lora --max-lora-rank 256
 ```
 
+### Per-module rank and alpha (`rank_pattern` / `alpha_pattern`)
+
+vLLM applies the `rank_pattern` and `alpha_pattern` overrides from `adapter_config.json` the same way PEFT does: each key is a regular expression matched against the end of the module name. vLLM rejects an adapter whose keys:
+
+- are longer than 512 characters or contain `{` or `}` (for example `\d{2}` counted repeats), or
+- take more than 0.1 s to match a single module name, or more than 2 s in total to compile and match for the whole adapter.
+
 ### Restricting LoRA to Specific Modules
 
 The `--lora-target-modules` parameter allows you to restrict which model modules have LoRA applied at deployment time. This is useful for performance tuning when you only need LoRA on specific layers:
