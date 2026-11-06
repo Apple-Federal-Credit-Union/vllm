@@ -836,7 +836,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to each other when their startup handshake runs over TCP (multi-node data
     # parallel, external or hybrid load balancing, and elastic EP). Set the
     # same value on every node. When every engine is started by one vLLM
-    # process tree, a random secret is generated if this is unset.
+    # process tree and elastic EP is disabled, a random secret is generated
+    # if this is unset. Elastic EP scale-up ranks are separate processes and
+    # must be given this value explicitly.
     "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET": lambda: os.environ.get(
         "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET", None
     ),

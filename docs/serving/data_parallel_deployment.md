@@ -31,7 +31,7 @@ By contrast, the admission control limits `--max-num-queued-reqs` and `--max-num
 Running a single data parallel deployment across multiple nodes requires a different `vllm serve` to be run on each node, specifying which DP ranks should run on that node. In this case, there will still be a single HTTP entrypoint - the API server(s) will run only on one node, but it doesn't necessarily need to be co-located with the DP ranks.
 
 !!! important
-    When DP ranks are started by separate `vllm serve` commands (multiple nodes, `--headless`, hybrid or external load balancing), set `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET` to the same value for every command, for example one generated with `openssl rand -hex 32`. Engines use it to authenticate their startup handshake with the rank 0 front-end, which refuses to start without it. When a single command starts every rank, a secret is generated automatically.
+    When DP ranks are started by separate `vllm serve` commands (multiple nodes, `--headless`, hybrid or external load balancing, or elastic EP scale-up), set `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET` to the same value for every command, for example one generated with `openssl rand -hex 32`. Engines use it to authenticate their startup handshake with the rank 0 front-end, which refuses to start without it. When a single command starts every rank and `--enable-elastic-ep` is off, a secret is generated automatically. Elastic EP adds ranks as later commands, so set the variable before the first start.
 
 This will run DP=4, TP=2 on a single 8-GPU node:
 

@@ -167,6 +167,23 @@ def test_infer_multi_port_external_lb_start_rank_uses_node_rank():
     assert infer_multi_port_external_lb_start_rank(args) == 4
 
 
+def test_single_node_elastic_ep_does_not_autogenerate_handshake_secret(monkeypatch):
+    """Scale-up ranks are separate commands and must be given the secret."""
+    monkeypatch.delenv("VLLM_DATA_PARALLEL_HANDSHAKE_SECRET", raising=False)
+    args = _make_unit_args(
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        node_rank=0,
+        enable_elastic_ep=True,
+    )
+    supervisor = DPSupervisor(args)
+
+    with pytest.raises(ValueError, match="VLLM_DATA_PARALLEL_HANDSHAKE_SECRET"):
+        supervisor._start_children()
+
+    assert os.environ.get("VLLM_DATA_PARALLEL_HANDSHAKE_SECRET") is None
+
+
 def test_build_multi_port_external_lb_child_args_sets_external_rank_server():
     args = _make_unit_args(data_parallel_start_rank=8, api_server_count=None)
     child_args = _build_vllm_dp_server_args(args, local_rank=2)

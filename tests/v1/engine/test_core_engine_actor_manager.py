@@ -198,6 +198,34 @@ def test_coordination_store_held_only_by_the_online_dp_master(
         assert client.get("probe") == b"1"
 
 
+def test_single_node_elastic_ep_does_not_autogenerate_handshake_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-local elastic EP still handshakes over TCP, and later ranks are
+    separate commands that cannot inherit a secret written only to this env."""
+    monkeypatch.delenv("VLLM_DATA_PARALLEL_HANDSHAKE_SECRET", raising=False)
+    vllm_config = _make_vllm_config_ray_dp_multinode()
+    parallel_config = vllm_config.parallel_config
+    parallel_config.data_parallel_backend = "mp"
+    parallel_config.data_parallel_size = 2
+    parallel_config.data_parallel_size_local = 2
+    parallel_config.data_parallel_rank = 0
+    parallel_config.enable_elastic_ep = True
+
+    with (
+        pytest.raises(ValueError, match="VLLM_DATA_PARALLEL_HANDSHAKE_SECRET"),
+        launch_core_engines(
+            vllm_config,
+            executor_class=_DummyExecutor,
+            log_stats=False,
+            addresses=_make_addresses(),
+        ),
+    ):
+        pass
+
+    assert os.environ.get("VLLM_DATA_PARALLEL_HANDSHAKE_SECRET") is None
+
+
 def _make_cpu_placement_group():
     pg = ray.util.placement_group(
         [{"CPU": 0.001}, {"CPU": 1.0}],

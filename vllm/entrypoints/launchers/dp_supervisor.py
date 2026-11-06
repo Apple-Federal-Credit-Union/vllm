@@ -400,8 +400,13 @@ class DPSupervisor:
     def _start_children(self) -> None:
         """Launch vLLM DP Servers on separate GPUs."""
         logger.info("Launching vLLM DP Servers")
+        # Elastic EP scale-up ranks are separate commands, so they cannot
+        # inherit a secret generated into this process environment.
         ensure_handshake_secret(
-            generate=self.args.data_parallel_size_local == self.args.data_parallel_size
+            generate=(
+                not getattr(self.args, "enable_elastic_ep", False)
+                and self.args.data_parallel_size_local == self.args.data_parallel_size
+            )
         )
         context = multiprocessing.get_context("spawn")
         for local_rank in range(self.args.data_parallel_size_local):

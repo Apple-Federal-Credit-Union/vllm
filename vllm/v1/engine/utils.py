@@ -1342,8 +1342,13 @@ def launch_core_engines(
         handshake_local_only = False
 
     if not handshake_local_only and parallel_config.data_parallel_backend != "ray":
+        # Elastic EP scale-up ranks are separate commands, so they cannot
+        # inherit a secret generated into this process environment.
+        ranks_inherit_secret = offline_mode or (
+            dp_rank == 0 and local_engine_count == dp_size
+        )
         ensure_handshake_secret(
-            generate=offline_mode or (dp_rank == 0 and local_engine_count == dp_size)
+            generate=ranks_inherit_secret and not parallel_config.enable_elastic_ep
         )
 
     # Create a single tensor IPC queue for sharing multimodal tensors between

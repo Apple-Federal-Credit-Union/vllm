@@ -25,7 +25,7 @@ The following options control internode communications in vLLM:
 
 - `data_parallel_master_ip`: IP of the data parallel master (default: 127.0.0.1)
 - `data_parallel_master_port`: Port of the data parallel master (default: 29500)
-- `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET`: Shared secret for the engine startup handshake on `data_parallel_rpc_port` (default: 29550). When the handshake runs over TCP, the rank 0 front-end only accepts ZMQ CURVE connections whose key is derived from this secret, and only answers handshake messages that carry it. Set the same value on every node. It is generated automatically when one command starts every rank. The Rust frontend's own handshake listener for the engines it manages (`vllm-rs`) still uses the NULL mechanism and does not check the secret, because its ZMQ library has no CURVE support.
+- `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET`: Shared secret for the engine startup handshake on `data_parallel_rpc_port` (default: 29550). When the handshake runs over TCP, the rank 0 front-end only accepts ZMQ CURVE connections whose key is derived from this secret, and only answers handshake messages that carry it. Set the same value on every node, including elastic EP scale-up commands. It is generated automatically when one command starts every rank and elastic expert parallelism is disabled. The Rust frontend's own handshake listener for the engines it manages (`vllm-rs`) still uses the NULL mechanism and does not check the secret, because its ZMQ library has no CURVE support.
 
 ### Notes on PyTorch Distributed
 
