@@ -149,7 +149,7 @@ firewall configuration instructions.
 
 ### Overview
 
-The `--api-key` flag (or `VLLM_API_KEY` environment variable) provides authentication for vLLM's HTTP server, but **only for endpoints under the `/v1`, `/v2`, `/inference`, and `/cohere` path prefixes**. Many other sensitive endpoints are exposed on the same HTTP server without any authentication enforcement.
+The `--api-key` flag (or `VLLM_API_KEY` environment variable) provides authentication for vLLM's HTTP server, but **only for endpoints under the `/v1`, `/v2`, `/inference`, and `/cohere` path prefixes, and for the development endpoints enabled by `VLLM_SERVER_DEV_MODE=1`**. Many other sensitive endpoints are exposed on the same HTTP server without any authentication enforcement.
 
 **Important:** Do not rely exclusively on `--api-key` for securing access to vLLM. Additional security measures are required for production deployments.
 
@@ -185,6 +185,20 @@ When `--api-key` is configured, the following endpoints require Bearer token aut
 - `/cohere/v2/chat/render` - Render Cohere Chat v2 requests (requires `VLLM_ENABLE_COHERE_API=1` and either `--enable-scale-out` or `--tokens-only`)
 - `/v2/embed` - Cohere Embed API
 - `/v2/rerank` - Cohere Rerank API
+
+**Development endpoints (only when `VLLM_SERVER_DEV_MODE=1`):**
+
+These endpoints are **only available when the environment variable `VLLM_SERVER_DEV_MODE` is set to `1`**. They are intended for development and debugging purposes and should never be enabled in production. Without `--api-key` they are unauthenticated:
+
+- `/server_info` - Get detailed server configuration (credential fields such as `hf_token` are omitted)
+- `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
+- `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
+- `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
+- `/sleep` - Put engine to sleep (causes denial of service)
+- `/release_kv_cache_memory` - Release KV cache memory (causes denial of service)
+- `/wake_up` - Wake engine from sleep
+- `/is_sleeping` - Check if engine is sleeping
+- `/collective_rpc` - Execute arbitrary RPC methods on the engine (extremely dangerous)
 
 ### Unprotected Endpoints (No API Key Required)
 
@@ -231,19 +245,6 @@ This endpoint is **only available when the `--enable-tokenizer-info-endpoint` fl
 
 - `/tokenizer_info` - Get comprehensive tokenizer information including chat templates and configuration
 
-**Development endpoints (only when `VLLM_SERVER_DEV_MODE=1`):**
-
-These endpoints are **only available when the environment variable `VLLM_SERVER_DEV_MODE` is set to `1`**. They are intended for development and debugging purposes and should never be enabled in production:
-
-- `/server_info` - Get detailed server configuration
-- `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
-- `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
-- `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
-- `/sleep` - Put engine to sleep (causes denial of service)
-- `/wake_up` - Wake engine from sleep
-- `/is_sleeping` - Check if engine is sleeping
-- `/collective_rpc` - Execute arbitrary RPC methods on the engine (extremely dangerous)
-
 **Profiler endpoints (only when profiling is enabled via `--profiler-config`):**
 
 These endpoints are only available when profiling is enabled and should only be used for local development:
@@ -261,7 +262,7 @@ An attacker who can reach the vLLM HTTP server can:
 2. **Cause denial of service** by calling `/pause`, `/scale_elastic_ep`, or `/abort_requests` without a token
 3. **Access operational controls** to manipulate server state (e.g., pausing generation, updating model weights via `/update_weights`)
 4. **If `--enable-tokenizer-info-endpoint` is set:** Access sensitive tokenizer configuration including chat templates, which may reveal prompt engineering strategies or other implementation details
-5. **If `VLLM_SERVER_DEV_MODE=1` is set:** Execute arbitrary RPC commands via `/collective_rpc`, reset caches, put the engine to sleep, and access detailed server configuration
+5. **If `VLLM_SERVER_DEV_MODE=1` is set without `--api-key`:** Execute arbitrary RPC commands via `/collective_rpc`, reset caches, put the engine to sleep, and access detailed server configuration
 
 ### Recommended Security Practices
 

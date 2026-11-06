@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from vllm import envs
+from vllm.entrypoints.serve import get_vllm_dev_api_paths
 from vllm.logger import init_logger
 from vllm.tasks import SupportedTask
 
@@ -31,9 +32,13 @@ def init_entrypoints_middleware(
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
-        from .authenticate import AuthenticationMiddleware
+        from .authenticate import GUARDED_PREFIX, AuthenticationMiddleware
 
-        app.add_middleware(AuthenticationMiddleware, tokens=tokens)
+        app.add_middleware(
+            AuthenticationMiddleware,
+            tokens=tokens,
+            guarded_prefixes=GUARDED_PREFIX + get_vllm_dev_api_paths(),
+        )
 
     if args.enable_request_id_headers:
         from .x_request_id import XRequestIdMiddleware
