@@ -587,7 +587,9 @@ class ECCPUScheduler:
                 width = get_encoder_output_width(self._vllm_config, feature.modality)
             except ValueError as error:
                 # Raising here would take down the engine core.
-                logger.warning_once("EC producer: not offloading encodings: %s", error)
+                logger.warning_once(
+                    "EC producer: not offloading encodings: %s", str(error)
+                )
             else:
                 shape = (feature.mm_position.get_num_embeds(), width)
                 entry = self._cache.alloc(mm_hash, self._num_blocks(shape), shape)
