@@ -335,7 +335,14 @@ class ECCPUScheduler:
             return True
         if remote is None:
             return True
-        addr = self._trusted_producer(remote)
+        host = remote.get("peer_host")
+        port = remote.get("peer_port")
+        # The configured tuple is what gets dialed, never the request's values.
+        addr = (
+            self._producer_addrs.get((host, port))
+            if type(host) is str and type(port) is int
+            else None
+        )
         if addr is None:
             logger.warning(
                 "EC consumer: mm_hash=%s names a producer not in "
@@ -446,18 +453,6 @@ class ECCPUScheduler:
         self._unrecoverable = set()
         return failed
 
-    def _trusted_producer(self, remote: dict[str, Any]) -> tuple[str, int] | None:
-        """Return the configured address an announcement names, if any.
-
-        The returned tuple is the one parsed from ``ec_nixl_producer_addrs``,
-        so the address dialed is the address that was checked.
-        """
-        host = remote.get("peer_host")
-        port = remote.get("peer_port")
-        if type(host) is not str or type(port) is not int:
-            return None
-        return self._producer_addrs.get((host, port))
-
     def _start_xfer(
         self,
         mm_hash: str,
@@ -467,7 +462,7 @@ class ECCPUScheduler:
     ) -> bool:
         """Allocate a not-ready cache entry and start a NIXL READ into it.
 
-        `addr` must come from `_trusted_producer`.
+        `addr` must be an entry of `ec_nixl_producer_addrs`.
 
         Returns True if the transfer was started. Returns False when the
         cache cannot accommodate the encoding; admission will retry it.
