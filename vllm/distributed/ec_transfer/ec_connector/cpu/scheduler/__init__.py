@@ -47,6 +47,48 @@ class _RemoteUnavailable(Exception):
     """An item cannot be fetched within its request's remote wait budget."""
 
 
+def _parse_producer_addrs(raw: Any) -> dict[tuple[str, int], tuple[str, int]]:
+    """Parse ``ec_nixl_producer_addrs`` into the producers a consumer may dial.
+
+    Args:
+        raw: A list of ``host:port`` strings (``[v6addr]:port`` for IPv6), or
+            one comma-separated string of them.
+
+    Returns:
+        Each address mapped to itself, so a lookup yields this config's tuple.
+
+    Raises:
+        ValueError: An entry is not ``host:port`` with a port in 1-65535.
+
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        raw = [item for item in raw.split(",") if item.strip()]
+    if not isinstance(raw, list | tuple):
+        raise ValueError(
+            "ec_nixl_producer_addrs must be a list of host:port strings, "
+            f"got {type(raw).__name__}"
+        )
+    addrs: dict[tuple[str, int], tuple[str, int]] = {}
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(f"ec_nixl_producer_addrs entry {item!r} is not a string")
+        host, sep, port = item.strip().rpartition(":")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        if (
+            not sep
+            or not host
+            or not (port.isascii() and port.isdigit())
+            or not 0 < int(port) < 65536
+        ):
+            raise ValueError(f"ec_nixl_producer_addrs entry {item!r} is not host:port")
+        addr = (host, int(port))
+        addrs[addr] = addr
+    return addrs
+
+
 class ECCPUScheduler:
     """Scheduler delegate for the ECCPUConnector."""
 
@@ -111,6 +153,15 @@ class ECCPUScheduler:
         self._unrecoverable: set[str] = set()
         self._peer_host: str | None = None
         self._peer_port: int | None = None
+        # `peer_host`/`peer_port` arrive on the request, so a consumer reads
+        # only from producers the operator listed.
+        self._producer_addrs = (
+            _parse_producer_addrs(
+                ec_config.get_from_extra_config("ec_nixl_producer_addrs", None)
+            )
+            if self._is_consumer
+            else {}
+        )
         dtype = vllm_config.model_config.dtype
         assert isinstance(dtype, torch.dtype)
         self._dtype = dtype
@@ -186,6 +237,11 @@ class ECCPUScheduler:
                 compat_hash=self._compat_hash,
             )
         if self._is_consumer:
+            if not self._producer_addrs:
+                logger.warning(
+                    "EC consumer: ec_nixl_producer_addrs is empty, so no remote "
+                    "encoding will be read."
+                )
             self._transport = ZmqClientTransport()
 
     def has_cache_item(self, identifier: str) -> bool:
@@ -279,6 +335,14 @@ class ECCPUScheduler:
             return True
         if remote is None:
             return True
+        addr = self._trusted_producer(remote)
+        if addr is None:
+            logger.warning(
+                "EC consumer: mm_hash=%s names a producer not in "
+                "ec_nixl_producer_addrs; not reading it",
+                mm_hash,
+            )
+            raise _RemoteUnavailable("the announced producer is not trusted")
         since = self._deferred_since.setdefault((request.request_id, mm_hash), now)
         if now - since > _ADMIT_DEFER_TIMEOUT_S:
             raise _RemoteUnavailable(f"the remote wait exceeded {now - since:.0f}s")
@@ -317,7 +381,7 @@ class ECCPUScheduler:
             raise _RemoteUnavailable("the announced size was wrong")
 
         try:
-            started = self._start_xfer(mm_hash, remote, size, (shape[0], shape[1]))
+            started = self._start_xfer(mm_hash, addr, size, (shape[0], shape[1]))
         except Exception as error:
             logger.exception(
                 "EC consumer: failed to start NIXL xfer mm_hash=%s", mm_hash
@@ -382,14 +446,28 @@ class ECCPUScheduler:
         self._unrecoverable = set()
         return failed
 
+    def _trusted_producer(self, remote: dict[str, Any]) -> tuple[str, int] | None:
+        """Return the configured address an announcement names, if any.
+
+        The returned tuple is the one parsed from ``ec_nixl_producer_addrs``,
+        so the address dialed is the address that was checked.
+        """
+        host = remote.get("peer_host")
+        port = remote.get("peer_port")
+        if type(host) is not str or type(port) is not int:
+            return None
+        return self._producer_addrs.get((host, port))
+
     def _start_xfer(
         self,
         mm_hash: str,
-        info: "dict[str, Any]",
+        addr: tuple[str, int],
         size_bytes: int,
         shape: tuple[int, int],
     ) -> bool:
         """Allocate a not-ready cache entry and start a NIXL READ into it.
+
+        `addr` must come from `_trusted_producer`.
 
         Returns True if the transfer was started. Returns False when the
         cache cannot accommodate the encoding; admission will retry it.
@@ -410,7 +488,6 @@ class ECCPUScheduler:
             )
             return False
         indices = list(entry.block_ids)
-        addr = (info["peer_host"], int(info["peer_port"]))
         if addr not in self._sessions:
             zmq_conn = self._transport.connect(addr)
             assert self._compat_hash is not None

@@ -43,15 +43,21 @@ vllm serve <model> --ec-transfer-config '{
 
 `ec_role="ec_producer"` alone already enables mm_encoder_only on the multimodal config, so vllm_config.is_mm_encoder_only is True (skips the language model, sampler, and pooler); add `--mm-encoder-only` only if you need encoder-only execution independent of `ec_transfer_config`.
 
-Consumer — pulls encodings named in a request's `ec_transfer_params` before falling back to local encoding:
+Consumer — pulls encodings named in a request's `ec_transfer_params` from the producers listed in `ec_nixl_producer_addrs` before falling back to local encoding:
 
 ```bash
 vllm serve <model> --ec-transfer-config '{
   "ec_connector": "ECCPUConnector",
   "ec_role": "ec_consumer",
-  "ec_connector_extra_config": {"ec_enable_nixl": true, "ec_cpu_bytes": 1073741824}
+  "ec_connector_extra_config": {
+    "ec_enable_nixl": true,
+    "ec_cpu_bytes": 1073741824,
+    "ec_nixl_producer_addrs": ["10.0.0.1:5601"]
+  }
 }'
 ```
+
+Each entry is a producer's `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`, written exactly as that producer announces it (`[v6addr]:port` for IPv6). `ec_transfer_params` reaches the consumer from the API request, so a `peer_host`/`peer_port` pair not on this list is never contacted: the item is encoded locally if the request still carries its media, and the request fails otherwise. With the list empty, no remote encoding is read.
 
 ### Orchestration flow
 
@@ -95,6 +101,7 @@ EC transfer is configured via `--ec-transfer-config` (CLI) or the `ec_transfer_c
 | Key | Type | Required | Description |
 | --- | --- | --- | --- |
 | `ec_enable_nixl` | `bool` | No (default `false`) | Enables NIXL P2P transfer in addition to local CPU offload. Omitted or `false` imports no NIXL/ZMQ. Extra config is not type coerced, so a string value is parsed: `"true"`, `"1"`, `"yes"` enable it, anything else does not. |
+| `ec_nixl_producer_addrs` | `list[str]` | No (default empty) | Consumer only. `host:port` side-channel addresses of the producers this consumer may read from; a comma-separated string is also accepted. A request naming any other `peer_host`/`peer_port` is not read remotely. Empty means no remote reads. |
 | `consumer_ack_timeout_s` | `float` | No (default `2.0`) | How long a consumer waits for an `XferAck` before giving up on a read. The producer answers `XferReq`s from its own scheduler step, so its reply latency scales with the encoder's `--max-num-batched-tokens`: a loaded encoder whose steps run longer than this makes consumers abandon reads the producer is about to grant. Raise it for large encoder batches. |
 | `ec_cpu_bytes` | `int` | Yes | Total size, in bytes, of the shared CPU mmap region. `ECCPUConnector` raises `ValueError` if unset. Block count = `ec_cpu_bytes // block_size_bytes`, where each block holds one LLM input-embedding vector. Entries allocate enough blocks for their modality-specific output shape, including visual DeepStack features. |
 
