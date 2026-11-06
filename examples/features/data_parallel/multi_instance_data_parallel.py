@@ -10,8 +10,9 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.loggers import AggregatedLoggingStatLogger
 
 """
-To run this example, run the following commands simultaneously with
-different CUDA_VISIBLE_DEVICES:
+To run this example, export the same VLLM_DATA_PARALLEL_HANDSHAKE_SECRET
+for both commands, then run them simultaneously with different
+CUDA_VISIBLE_DEVICES:
     python examples/features/data_parallel/multi_instance_data_parallel.py
 
     vllm serve ibm-research/PowerMoE-3b -dp 2 -dpr 1 \

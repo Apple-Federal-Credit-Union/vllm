@@ -756,6 +756,10 @@ class RemoteOpenAIServer(RemoteVLLMServer):
         # the current process might initialize cuda,
         # to be safe, we should use spawn method
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Data parallel ranks launched as separate servers must share a secret.
+        env.setdefault(
+            "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET", "placeholder-test-dp-handshake"
+        )
         if env_dict is not None:
             env.update(env_dict)
         _sanitize_pythonpath_env(env)

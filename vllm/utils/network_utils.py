@@ -355,12 +355,30 @@ def make_zmq_socket(
     linger: int | None = None,
     router_handover: bool = False,
     listener: socket.socket | None = None,
+    curve_secret_key: bytes | None = None,
+    curve_server_key: bytes | None = None,
 ) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics.
 
     When supplied, ``listener`` is detached and its fd moves to libzmq.
+    ``curve_secret_key`` makes the socket a CURVE server with that Z85 secret
+    key. ``curve_server_key`` makes it a CURVE client of the server with that
+    Z85 public key.
     """
+    if curve_secret_key is not None and curve_server_key is not None:
+        raise ValueError("A ZMQ socket cannot be both a CURVE server and client")
     socket = ctx.socket(socket_type)
+
+    if curve_secret_key is not None:
+        socket.setsockopt(zmq.CURVE_SECRETKEY, curve_secret_key)
+        socket.setsockopt(zmq.CURVE_PUBLICKEY, zmq.curve_public(curve_secret_key))
+        socket.setsockopt(zmq.CURVE_SERVER, 1)
+    elif curve_server_key is not None:
+        client_public_key, client_secret_key = zmq.curve_keypair()
+        socket.setsockopt(zmq.CURVE_SERVERKEY, curve_server_key)
+        socket.setsockopt(zmq.CURVE_PUBLICKEY, client_public_key)
+        socket.setsockopt(zmq.CURVE_SECRETKEY, client_secret_key)
+
     buf_size = _get_zmq_socket_buffer_size()
 
     if bind is None:
@@ -456,6 +474,7 @@ def zmq_socket_ctx(
     linger: int = 0,
     identity: bytes | None = None,
     router_handover: bool = False,
+    curve_secret_key: bytes | None = None,
 ) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket."""
     ctx = zmq.Context()  # type: ignore[attr-defined]
@@ -467,6 +486,7 @@ def zmq_socket_ctx(
             bind=bind,
             identity=identity,
             router_handover=router_handover,
+            curve_secret_key=curve_secret_key,
         )
     except KeyboardInterrupt:
         logger.debug("Got Keyboard Interrupt.")

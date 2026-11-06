@@ -162,6 +162,10 @@ def test_coordination_store_held_only_by_the_online_dp_master(
     parallel_config = vllm_config.parallel_config
     for name, value in overrides.items():
         setattr(parallel_config, name, value)
+    # Multi-node engines need a shared secret for the TCP startup handshake.
+    monkeypatch.setenv(
+        "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET", "placeholder-dp-handshake-secret"
+    )
     # A fresh port per case so a lingering handshake socket cannot fail the next.
     parallel_config.data_parallel_rpc_port = get_open_port()
     parallel_config._coord_store_port = 0

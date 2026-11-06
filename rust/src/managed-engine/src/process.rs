@@ -79,6 +79,9 @@ impl ManagedEngineConfig {
             .arg(self.data_parallel_size.to_string())
             .args(&self.python_args);
         command.envs(Self::rust_frontend_envs());
+        // zmq.rs only implements the NULL mechanism, so managed engines must
+        // not switch their startup handshake to CURVE.
+        command.env_remove("VLLM_DATA_PARALLEL_HANDSHAKE_SECRET");
         command
     }
 }
@@ -269,6 +272,10 @@ mod tests {
         let envs = command.get_envs().collect::<Vec<_>>();
         expect![[r#"
             [
+                (
+                    "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET",
+                    None,
+                ),
                 (
                     "VLLM_USE_RUST_FRONTEND",
                     Some(

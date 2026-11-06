@@ -29,7 +29,10 @@ from vllm.utils.system_utils import (
     kill_process_tree,
     set_process_title,
 )
-from vllm.v1.engine.utils import get_engine_process_shutdown_timeout
+from vllm.v1.engine.utils import (
+    ensure_handshake_secret,
+    get_engine_process_shutdown_timeout,
+)
 
 from .launcher import NoSignalServer
 from .utils.server_utils import get_uvicorn_log_config
@@ -397,6 +400,9 @@ class DPSupervisor:
     def _start_children(self) -> None:
         """Launch vLLM DP Servers on separate GPUs."""
         logger.info("Launching vLLM DP Servers")
+        ensure_handshake_secret(
+            generate=self.args.data_parallel_size_local == self.args.data_parallel_size
+        )
         context = multiprocessing.get_context("spawn")
         for local_rank in range(self.args.data_parallel_size_local):
             child_args = _build_vllm_dp_server_args(self.args, local_rank)
