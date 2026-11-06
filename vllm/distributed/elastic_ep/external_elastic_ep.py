@@ -4,6 +4,8 @@
 import asyncio
 import contextlib
 import enum
+import hmac
+import secrets
 import uuid
 from dataclasses import dataclass
 from threading import Event, Thread
@@ -13,6 +15,7 @@ import msgspec
 import msgspec.msgpack
 import zmq
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
@@ -66,6 +69,11 @@ class ExternalElasticEPScaleUpHandshakeServer:
     front-end and DP coordinator ZMQ addresses, the new DP master address/ports,
     target DP size, target expert redundancy, and the coordination store port
     used for EEP reconfiguration.
+
+    Peers are untrusted: a message is only honored when it carries
+    ``handshake_secret`` and names an expected ``dp_rank`` in its body. The
+    ZMQ identity is only used to route the reply. Anything else is dropped
+    without stopping the listener.
     """
 
     def __init__(
@@ -77,8 +85,12 @@ class ExternalElasticEPScaleUpHandshakeServer:
         bootstrap: ReconfigureDistributedRequest,
         num_redundant_experts: int,
         elastic_ep_max_dp_size: int,
+        handshake_secret: bytes,
     ) -> None:
+        if not handshake_secret:
+            raise ValueError("External EEP handshake secret must not be empty.")
         self.handshake_address = handshake_address
+        self._handshake_secret = handshake_secret
         self.expected_new_ranks = set(expected_new_ranks)
         self.addresses = addresses
         self.bootstrap = bootstrap
@@ -115,6 +127,51 @@ class ExternalElasticEPScaleUpHandshakeServer:
         if self._error is not None:
             raise self._error
 
+    def _authenticate(self, frames: list[bytes]) -> tuple[str, int] | None:
+        """Return ``(status, dp_rank)`` for an authenticated message."""
+        if len(frames) != 2:
+            return None
+        try:
+            message = msgspec.msgpack.decode(frames[1])
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(message, dict):
+            return None
+        presented = message.get("handshake_secret")
+        if not isinstance(presented, bytes) or not hmac.compare_digest(
+            presented, self._handshake_secret
+        ):
+            return None
+        status = message.get("status")
+        dp_rank = message.get("dp_rank")
+        if (
+            status not in ("HELLO", "READY")
+            or type(dp_rank) is not int
+            or dp_rank not in self.expected_new_ranks
+        ):
+            return None
+        return status, dp_rank
+
+    def _hello_reply(self) -> bytes:
+        b = self.bootstrap
+        parallel_config: dict[str, int | str | list[int]] = {
+            "data_parallel_master_ip": b.new_data_parallel_master_ip,
+            "data_parallel_master_port": b.new_data_parallel_master_port,
+            "_data_parallel_master_port_list": b.new_data_parallel_master_port_list,
+            "data_parallel_size": b.new_data_parallel_size,
+            "_coord_store_port": b.coord_store_port,
+        }
+        return msgspec.msgpack.encode(
+            ExternalElasticEPScaleUpHandshakeMetadata(
+                engine_metadata=EngineHandshakeMetadata(
+                    addresses=self.addresses,
+                    parallel_config=parallel_config,
+                ),
+                num_redundant_experts=self.num_redundant_experts,
+                elastic_ep_max_dp_size=self.elastic_ep_max_dp_size,
+            )
+        )
+
     def _run(self) -> None:
         pending_ready_ranks = self.expected_new_ranks.copy()
         try:
@@ -141,49 +198,26 @@ class ExternalElasticEPScaleUpHandshakeServer:
                     if handshake_socket not in events:
                         continue
 
-                    engine_identity, payload = handshake_socket.recv_multipart()
-                    engine_rank = int.from_bytes(engine_identity, "little")
-                    if engine_rank not in self.expected_new_ranks:
-                        raise RuntimeError(
-                            "Received scale-up handshake from unexpected "
-                            f"dp rank {engine_rank}"
+                    frames = handshake_socket.recv_multipart()
+                    authenticated = self._authenticate(frames)
+                    if authenticated is None:
+                        logger.warning_once(
+                            "Dropped unauthenticated external EEP scale-up "
+                            "handshake message. New ranks must be launched "
+                            "with the same VLLM_ELASTIC_EP_HANDSHAKE_SECRET "
+                            "as DP rank 0."
                         )
+                        continue
 
-                    message = msgspec.msgpack.decode(payload)
-                    status = message["status"]
+                    status, dp_rank = authenticated
+                    if dp_rank not in pending_ready_ranks:
+                        continue
                     if status == "HELLO":
-                        b = self.bootstrap
-                        parallel_config: dict[str, int | str | list[int]] = {
-                            "data_parallel_master_ip": b.new_data_parallel_master_ip,
-                            "data_parallel_master_port": (
-                                b.new_data_parallel_master_port
-                            ),
-                            "_data_parallel_master_port_list": (
-                                b.new_data_parallel_master_port_list
-                            ),
-                            "data_parallel_size": b.new_data_parallel_size,
-                            "_coord_store_port": b.coord_store_port,
-                        }
-                        init_message = msgspec.msgpack.encode(
-                            ExternalElasticEPScaleUpHandshakeMetadata(
-                                engine_metadata=EngineHandshakeMetadata(
-                                    addresses=self.addresses,
-                                    parallel_config=parallel_config,
-                                ),
-                                num_redundant_experts=self.num_redundant_experts,
-                                elastic_ep_max_dp_size=self.elastic_ep_max_dp_size,
-                            )
-                        )
                         handshake_socket.send_multipart(
-                            (engine_identity, init_message), copy=False
+                            (frames[0], self._hello_reply()), copy=False
                         )
-                    elif status == "READY":
-                        pending_ready_ranks.discard(engine_rank)
                     else:
-                        raise RuntimeError(
-                            f"Unexpected handshake status {status} from dp rank "
-                            f"{engine_rank}"
-                        )
+                        pending_ready_ranks.discard(dp_rank)
         except Exception as e:
             self._error = e
             self.started_event.set()
@@ -214,6 +248,7 @@ class ExternalElasticEPScaleCoordinator:
         self.reconfig_store_ref: Any | None = None
         self.active_epoch: str | None = None
         self.prepared_scale: _PreparedExternalElasticEPScale | None = None
+        self.handshake_secret: bytes | None = None
 
     @staticmethod
     def key(*parts: str | int) -> str:
@@ -439,6 +474,11 @@ class ExternalElasticEPScaleCoordinator:
             coord_store_port=coord_store_port,
         )
 
+        self.handshake_secret = None
+        if new_data_parallel_size > cur_data_parallel_size:
+            self.handshake_secret = self._new_handshake_secret()
+            store.set(self.key(epoch, "handshake_secret"), self.handshake_secret)
+
         bootstrap_key = self.key(epoch, "bootstrap")
         bootstrap_payload = msgspec.msgpack.encode(bootstrap)
         stores = [store]
@@ -451,6 +491,17 @@ class ExternalElasticEPScaleCoordinator:
             target_store.set(current_epoch_key, epoch.encode())
         return epoch, bootstrap
 
+    @staticmethod
+    def _new_handshake_secret() -> bytes:
+        if configured := envs.VLLM_ELASTIC_EP_HANDSHAKE_SECRET:
+            return configured.encode()
+        logger.warning(
+            "VLLM_ELASTIC_EP_HANDSHAKE_SECRET is not set on DP rank 0, so new "
+            "ranks cannot authenticate and this scale-up will not complete. "
+            "Set the same value on DP rank 0 and on the new ranks."
+        )
+        return secrets.token_bytes(32)
+
     def _start_scale_up_handshake_server(
         self,
         bootstrap: ReconfigureDistributedRequest,
@@ -458,6 +509,10 @@ class ExternalElasticEPScaleCoordinator:
         num_redundant_experts: int,
         elastic_ep_max_dp_size: int,
     ) -> ExternalElasticEPScaleUpHandshakeServer:
+        if self.handshake_secret is None:
+            raise RuntimeError(
+                "External Elastic EP scale-up handshake secret was not prepared."
+            )
         handshake_server = ExternalElasticEPScaleUpHandshakeServer(
             handshake_address=get_engine_client_zmq_addr(
                 False,
@@ -474,6 +529,7 @@ class ExternalElasticEPScaleCoordinator:
             bootstrap=bootstrap,
             num_redundant_experts=num_redundant_experts,
             elastic_ep_max_dp_size=elastic_ep_max_dp_size,
+            handshake_secret=self.handshake_secret,
         )
         handshake_server.start()
         return handshake_server

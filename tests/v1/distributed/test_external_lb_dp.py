@@ -186,6 +186,7 @@ class ExternalLBServerManager:
 
         env_dict = {
             "VLLM_SERVER_DEV_MODE": "1",
+            "VLLM_ELASTIC_EP_HANDSHAKE_SECRET": "placeholder-handshake-secret",
             current_platform.device_control_env_var: ",".join(
                 str(current_platform.device_id_to_physical_device_id(i))
                 for i in range(rank * self.tp_size, (rank + 1) * self.tp_size)
