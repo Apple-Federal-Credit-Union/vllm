@@ -55,7 +55,10 @@ def servers():
         "--no-enable-prefix-caching",
     ]
 
-    def config(role):
+    producer_port = get_open_port()
+    nack_port = get_open_port()
+
+    def config(role, **extra):
         return json.dumps(
             {
                 "ec_connector": "ECCPUConnector",
@@ -63,9 +66,18 @@ def servers():
                 "ec_connector_extra_config": {
                     "ec_enable_nixl": True,
                     "ec_cpu_bytes": 64 << 20,
+                    **extra,
                 },
             }
         )
+
+    consumer_config = config(
+        "ec_consumer",
+        ec_nixl_producer_addrs=[
+            f"127.0.0.1:{producer_port}",
+            f"127.0.0.1:{nack_port}",
+        ],
+    )
 
     with (
         RemoteOpenAIServer(
@@ -80,17 +92,16 @@ def servers():
             env_dict={
                 "CUDA_VISIBLE_DEVICES": devices[0],
                 "VLLM_EC_SIDE_CHANNEL_HOST": "127.0.0.1",
-                "VLLM_EC_SIDE_CHANNEL_PORT": str(get_open_port()),
+                "VLLM_EC_SIDE_CHANNEL_PORT": str(producer_port),
             },
         ) as encoder,
         RemoteOpenAIServer(
             MODEL,
-            common
-            + ["--enable-mm-embeds", "--ec-transfer-config", config("ec_consumer")],
+            common + ["--enable-mm-embeds", "--ec-transfer-config", consumer_config],
             env_dict={"CUDA_VISIBLE_DEVICES": devices[1]},
         ) as consumer,
     ):
-        yield encoder, consumer
+        yield encoder, consumer, nack_port
 
 
 async def _post(session, server, body):
@@ -150,20 +161,20 @@ async def _encode(session, encoder):
 @pytest.mark.parametrize("local_image", [False, True], ids=["metadata-only", "pixels"])
 async def test_missing_remote_encoding_is_request_scoped(servers, local_image):
     """A terminal NACK must preserve local fallback and subsequent serving."""
-    encoder, consumer = servers
+    encoder, consumer, nack_port = servers
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         original, rewritten, mm_hash = await _encode(session, encoder)
         request = original if local_image else rewritten
 
-        # Keep the real encoder's shape/metadata; replace only the control peer.
-        # The socket stays bound until completion, so no port or timing race is
-        # needed to make the consumer receive NACK_MISSING.
+        # Keep the real encoder's shape/metadata; replace only the control peer
+        # with another producer the consumer lists. The socket stays bound until
+        # completion, so no timing race is needed to deliver NACK_MISSING.
         with zmq.asyncio.Context() as ctx, ctx.socket(zmq.ROUTER) as router:
             router.setsockopt(zmq.LINGER, 0)
-            port = router.bind_to_random_port("tcp://127.0.0.1")
+            router.bind(f"tcp://127.0.0.1:{nack_port}")
             request["ec_transfer_params"][mm_hash].update(
-                peer_host="127.0.0.1", peer_port=port
+                peer_host="127.0.0.1", peer_port=nack_port
             )
 
             async def reject_read():

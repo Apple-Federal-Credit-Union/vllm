@@ -43,15 +43,21 @@ vllm serve <model> --ec-transfer-config '{
 
 `ec_role="ec_producer"` alone already enables mm_encoder_only on the multimodal config, so vllm_config.is_mm_encoder_only is True (skips the language model, sampler, and pooler); add `--mm-encoder-only` only if you need encoder-only execution independent of `ec_transfer_config`.
 
-Consumer — pulls encodings named in a request's `ec_transfer_params` before falling back to local encoding:
+Consumer — pulls encodings named in a request's `ec_transfer_params` from the producers listed in `ec_nixl_producer_addrs` before falling back to local encoding:
 
 ```bash
 vllm serve <model> --ec-transfer-config '{
   "ec_connector": "ECCPUConnector",
   "ec_role": "ec_consumer",
-  "ec_connector_extra_config": {"ec_enable_nixl": true, "ec_cpu_bytes": 1073741824}
+  "ec_connector_extra_config": {
+    "ec_enable_nixl": true,
+    "ec_cpu_bytes": 1073741824,
+    "ec_nixl_producer_addrs": ["10.0.0.1:5601"]
+  }
 }'
 ```
+
+Each entry is a producer's `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`, written exactly as that producer announces it (`[v6addr]:port` for IPv6). `ec_transfer_params` reaches the consumer from the API request, so a `peer_host`/`peer_port` pair not on this list is never contacted: the item is encoded locally if the request still carries its media, and the request fails otherwise. With the list empty, no remote encoding is read.
 
 ### Orchestration flow
 
@@ -65,13 +71,15 @@ vllm serve <model> --ec-transfer-config '{
 
    The two halves are published together or not at all. An `mm_hash` the producer cannot serve — never saved because the region was full, or evicted since — is reported with empty `metadata` and no address, so an orchestrator leaves the media on the request and the consumer encodes it locally.
 2. The orchestrator issues a follow-up request with the same `mm_hash` to a consumer instance, passing the producer's `ec_transfer_params` through `SamplingParams.extra_args["ec_transfer_params"]`.
-3. On the consumer, `ECCPUScheduler.ensure_cache_available()` reads `request.ec_transfer_params`. For each `mm_hash` not already cached locally, it opens a ZMQ session to `(peer_host, peer_port)`, sends an `XferReq`, and on an `OK` `XferAck` issues a NIXL READ that pulls the blocks straight from the producer's mmap into its own. The request is deferred until the READ completes.
+3. On the consumer, `ECCPUScheduler.ensure_cache_available()` reads `request.ec_transfer_params`. For each `mm_hash` not already cached locally whose `(peer_host, peer_port)` is listed in `ec_nixl_producer_addrs`, it opens a ZMQ session to that producer, sends an `XferReq`, and on an `OK` `XferAck` whose `shape` and block count match the announcement issues a NIXL READ that pulls the blocks straight from the producer's mmap into its own. The request is deferred until the READ completes.
 4. A `NACK_NOT_READY` means the producer announced the encoding but its GPU→mmap save has not landed yet. The consumer releases the in-flight entry without recording a failure and re-requests the read on a later step, so a save that lands a few steps late costs latency rather than a recompute.
 5. On any other NACK (`NACK_MISSING`, `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_INTERNAL`), ack timeout, read timeout, or peer disconnect, the consumer discards the in-flight entry and falls back to local encoding for that `mm_hash` — a P2P failure never blocks the request indefinitely.
 
 ### Protocol
 
-- **Control plane**: ZMQ. The producer binds a `ROUTER` socket on `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`; each consumer opens one `DEALER` connection per producer peer, with ZMQ heartbeating (2s interval, 4s timeout, 8s TTL) to detect a dead peer. `XferReq`/`XferAck` are `msgspec` msgpack structs, versioned by `EC_CONNECTOR_VERSION` (currently `1`) — a version mismatch is NACKed.
+- **Control plane**: ZMQ. The producer binds a `ROUTER` socket on `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`; each consumer opens one `DEALER` connection per producer peer, with ZMQ heartbeating (2s interval, 4s timeout, 8s TTL) to detect a dead peer. `XferReq`/`XferAck` are `msgspec` msgpack structs, versioned by `EC_CONNECTOR_VERSION` (currently `3`) — a version mismatch is NACKed.
+- **Trusted producers**: a consumer dials only the addresses in `ec_nixl_producer_addrs`. The control plane is not authenticated or encrypted, so keep producers and consumers on an isolated network (see [Inter-Node Communication](../usage/security.md#inter-node-communication)).
+- **Layout check**: an `OK` `XferAck` carries the `shape` the producer saved. The consumer reads only when it matches the shape it allocated for and the block counts agree; otherwise the read fails like a terminal NACK.
 - **Compatibility check**: every `XferReq` carries a SHA-256 hash over `(vllm_version, model, dtype, block_size_bytes)`; the producer NACKs (`NACK_INCOMPAT`) any peer whose hash differs.
 - **Ack statuses**: `OK`, `NACK_MISSING` (the producer no longer holds the encoding), `NACK_NOT_READY` (held, but its save has not landed), `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_INTERNAL`. Only `NACK_NOT_READY` is retryable — `RETRYABLE_NACKS` in `cpu/protocol.py` is what both ends consult, so the classification lives with the wire vocabulary rather than at each call site.
 - **Data plane**: NIXL, `UCX` backend, consumer-initiated `READ` — the consumer pulls bytes directly out of the producer's registered mmap region; the producer never pushes.
@@ -95,6 +103,7 @@ EC transfer is configured via `--ec-transfer-config` (CLI) or the `ec_transfer_c
 | Key | Type | Required | Description |
 | --- | --- | --- | --- |
 | `ec_enable_nixl` | `bool` | No (default `false`) | Enables NIXL P2P transfer in addition to local CPU offload. Omitted or `false` imports no NIXL/ZMQ. Extra config is not type coerced, so a string value is parsed: `"true"`, `"1"`, `"yes"` enable it, anything else does not. |
+| `ec_nixl_producer_addrs` | `list[str]` | No (default empty) | Consumer only. `host:port` side-channel addresses of the producers this consumer may read from; a comma-separated string is also accepted. A request naming any other `peer_host`/`peer_port` is not read remotely. Empty means no remote reads. |
 | `consumer_ack_timeout_s` | `float` | No (default `2.0`) | How long a consumer waits for an `XferAck` before giving up on a read. The producer answers `XferReq`s from its own scheduler step, so its reply latency scales with the encoder's `--max-num-batched-tokens`: a loaded encoder whose steps run longer than this makes consumers abandon reads the producer is about to grant. Raise it for large encoder batches. |
 | `ec_cpu_bytes` | `int` | Yes | Total size, in bytes, of the shared CPU mmap region. `ECCPUConnector` raises `ValueError` if unset. Block count = `ec_cpu_bytes // block_size_bytes`, where each block holds one LLM input-embedding vector. Entries allocate enough blocks for their modality-specific output shape, including visual DeepStack features. |
 

@@ -61,7 +61,7 @@ class _FakeSession:
         self.started = []
         self._results = _FakeResults()
 
-    def start_xfer(self, mm_hash, block_indices, deadline):
+    def start_xfer(self, mm_hash, block_indices, shape, deadline):
         self.started.append(mm_hash)
 
     def poll(self, messages, now):
@@ -102,9 +102,11 @@ def _consumer_sched(monkeypatch):
     # ec_enable_nixl defaults to False, so this builds gate-off; the fields
     # below flip on the NIXL consumer state directly.
     # No measured widths: a consumer takes each shape from the announcement.
-    s = ECCPUScheduler(
-        create_ec_vllm_config(ec_role="ec_consumer", encoder_output_widths={})
-    )
+    cfg = create_ec_vllm_config(ec_role="ec_consumer", encoder_output_widths={})
+    cfg.ec_transfer_config.ec_connector_extra_config = {
+        "ec_nixl_producer_addrs": ["h:1"]
+    }
+    s = ECCPUScheduler(cfg)
     # Turn on NIXL consumer state without constructing real transports.
     s._nixl_enabled = True
     s._transport = _FakeTransport()
@@ -330,6 +332,67 @@ def test_invalid_announcement_fails_the_request(monkeypatch, fields):
     assert "h1" not in s._in_flight
     assert s._cache.get("h1") is None
     s.shutdown()
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        {"peer_host": "other", "peer_port": 1},
+        {"peer_host": "h", "peer_port": 2},
+        {"peer_host": "h", "peer_port": "1"},
+        {"peer_host": "h", "peer_port": True},
+        {"peer_host": "h", "peer_port": 1.0},
+        {"peer_host": None, "peer_port": 1},
+    ],
+    ids=["host", "port", "text-port", "bool-port", "float-port", "null-host"],
+)
+def test_unlisted_producer_is_never_read(monkeypatch, peer):
+    """Only an ec_nixl_producer_addrs entry may be dialed for a request."""
+    s = _consumer_sched(monkeypatch)
+    started: list = []
+    monkeypatch.setattr(s, "_start_xfer", lambda *args: started.append(args))
+    announced = {**_params("h1", 1)["h1"], **peer}
+    req = _Request([_Feature("h1", 1)], params={"h1": announced})
+    assert s.ensure_cache_available(req, 0) is False
+    assert s.take_unavailable_requests() == {"r1"}
+    assert started == []
+    assert s._cache.get("h1") is None
+    s.shutdown()
+
+
+def test_listed_producer_dials_the_configured_address(monkeypatch):
+    s = _consumer_sched(monkeypatch)
+    started: list = []
+    monkeypatch.setattr(s, "_start_xfer", lambda *args: started.append(args))
+    req = _Request([_Feature("h1", 1)], params=_params("h1", 1))
+    assert s.ensure_cache_available(req, 0) is False
+    ((mm_hash, addr, _, _),) = started
+    assert mm_hash == "h1"
+    assert addr == ("h", 1)
+    assert addr is next(iter(s._producer_addrs))
+    s.shutdown()
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, set()),
+        ([], set()),
+        (["10.0.0.1:5601"], {("10.0.0.1", 5601)}),
+        ("a:1, b:2", {("a", 1), ("b", 2)}),
+        (["[::1]:5601"], {("::1", 5601)}),
+    ],
+)
+def test_producer_addrs_parse(raw, expected):
+    assert set(sched_mod._parse_producer_addrs(raw)) == expected
+
+
+@pytest.mark.parametrize(
+    "raw", [["host"], ["host:"], [":1"], ["h:0"], ["h:65536"], ["h:x"], [("h", 1)], 5]
+)
+def test_producer_addrs_reject_malformed(raw):
+    with pytest.raises(ValueError, match="ec_nixl_producer_addrs"):
+        sched_mod._parse_producer_addrs(raw)
 
 
 def test_deferral_budget_is_per_request(monkeypatch):
