@@ -10,6 +10,7 @@ import numpy as np
 import pybase64 as base64
 import pytest
 import soundfile as sf
+import torch
 
 import vllm.envs as envs
 from vllm.multimodal.media import AudioMediaIO
@@ -381,6 +382,85 @@ def test_torchcodec_max_duration_rejected(dummy_audio_bytes):
     with pytest.raises(ValueError, match="exceeds maximum allowed duration"):
         load_audio_torchcodec(
             BytesIO(dummy_audio_bytes), sr=None, max_duration_s=0.0001
+        )
+
+
+def _load_torchcodec_frames(frames, metadata, **kwargs):
+    """Drive `load_audio_torchcodec` from already-decoded PCM frames."""
+
+    class _Decoder:
+        def __init__(self, *args, **kwargs):
+            self.metadata = metadata
+            self._decoder = object()
+
+    pending = list(frames)
+
+    def get_next_frame(_decoder):
+        if not pending:
+            raise IndexError
+        return pending.pop(0), 0.0, None
+
+    with (
+        patch.object(audio_module, "AudioDecoder", _Decoder),
+        patch.object(audio_module, "torchcodec_core") as core,
+    ):
+        core.get_next_frame.side_effect = get_next_frame
+        return load_audio_torchcodec(BytesIO(b"audio"), sr=None, **kwargs)
+
+
+def test_torchcodec_vorbis_padding_not_counted_in_duration_limit():
+    """FFmpeg < 5.0 tail padding is trimmed and must not trip the duration cap.
+
+    The container duration is the true length, so the metadata pre-check
+    admits the clip. The untrimmed PCM is one Vorbis block longer.
+    """
+    sample_rate = 8000
+    true_samples = sample_rate
+    padding = audio_module._VORBIS_MAX_BLOCK_SAMPLES
+    metadata = type(
+        "_Metadata",
+        (),
+        {
+            "codec": "vorbis",
+            "sample_rate": sample_rate,
+            "duration_seconds": true_samples / sample_rate,
+            "num_channels": 1,
+        },
+    )()
+    audio, sr = _load_torchcodec_frames(
+        [torch.ones(1, true_samples + padding)],
+        metadata,
+        max_duration_s=true_samples / sample_rate,
+    )
+    assert sr == sample_rate
+    assert audio.shape[-1] == true_samples
+
+
+def test_torchcodec_vorbis_duration_limit_rejects_past_padding():
+    """Slack for one Vorbis block must not admit audio that trim does not drop.
+
+    Metadata claims 0.1s so the pre-check passes. The PCM is over the cap but
+    within the padding slack, and too far past the claimed duration to trim.
+    """
+    sample_rate = 8000
+    metadata = type(
+        "_Metadata",
+        (),
+        {
+            "codec": "vorbis",
+            "sample_rate": sample_rate,
+            "duration_seconds": 0.1,
+            "num_channels": 1,
+        },
+    )()
+    # One block past the claimed duration, still inside the decode slack.
+    claimed_samples = round(0.1 * sample_rate)
+    samples = claimed_samples + audio_module._VORBIS_MAX_BLOCK_SAMPLES + 1
+    with pytest.raises(ValueError, match="exceeds maximum allowed duration"):
+        _load_torchcodec_frames(
+            [torch.ones(1, samples)],
+            metadata,
+            max_duration_s=1.0,
         )
 
 

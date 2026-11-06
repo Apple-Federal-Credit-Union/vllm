@@ -81,6 +81,31 @@ _TORCHCODEC_UNAVAILABLE_MSG = (
 _VORBIS_MAX_BLOCK_SAMPLES = 8192
 
 
+def _vorbis_tail_padding_samples(metadata, sample_rate: int | None) -> int:
+    """Largest trailing pad FFmpeg < 5.0 may append to a Vorbis stream."""
+    if metadata.codec != "vorbis" or metadata.duration_seconds is None:
+        return 0
+    out_sr = sample_rate if sample_rate is not None else metadata.sample_rate
+    native_sr = metadata.sample_rate or out_sr
+    if not out_sr or not native_sr:
+        return 0
+    return cdiv(_VORBIS_MAX_BLOCK_SAMPLES * out_sr, native_sr)
+
+
+def _reject_over_duration(
+    max_duration_s: float,
+    num_samples: int,
+    sample_rate: float,
+) -> None:
+    raise ValueError(
+        f"Audio exceeds maximum allowed duration of "
+        f"{max_duration_s}s (decoded {num_samples} "
+        f"samples at {sample_rate}Hz). Set "
+        f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
+        f"increase this limit."
+    )
+
+
 def load_audio_pyav(
     path: BytesIO | Path | str,
     *,
@@ -260,6 +285,7 @@ def decode_torchcodec_audio(
     *,
     max_duration_s: float | None = None,
     max_decode_bytes: int | None = None,
+    duration_sample_slack: int = 0,
 ) -> tuple[torch.Tensor, int]:
     """Decode every sample of a fresh torchcodec decoder, one frame at a time.
 
@@ -274,6 +300,9 @@ def decode_torchcodec_audio(
         max_duration_s: Reject audio longer than this many seconds.
         max_decode_bytes: Reject audio once its decoded PCM exceeds this
             many bytes.
+        duration_sample_slack: Extra samples permitted beyond
+            ``max_duration_s`` while decoding. Callers that trim trailing
+            padding must enforce the limit again on the trimmed waveform.
 
     Returns:
         ``(samples, sample_rate)`` where *samples* is a float32
@@ -283,7 +312,11 @@ def decode_torchcodec_audio(
     out_sr = sample_rate if sample_rate is not None else decoder.metadata.sample_rate
     if not out_sr:
         raise ValueError("Invalid audio data: the stream has no sample rate.")
-    max_samples = int(out_sr * max_duration_s) if max_duration_s is not None else None
+    max_samples = (
+        int(out_sr * max_duration_s) + duration_sample_slack
+        if max_duration_s is not None
+        else None
+    )
 
     frames: list[torch.Tensor] = []
     num_samples = 0
@@ -317,14 +350,12 @@ def decode_torchcodec_audio(
                 continue
 
         num_samples += frame.shape[-1]
-        if max_samples is not None and num_samples > max_samples:
-            raise ValueError(
-                f"Audio exceeds maximum allowed duration of "
-                f"{max_duration_s}s (decoded {num_samples} "
-                f"samples at {out_sr}Hz). Set "
-                f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
-                f"increase this limit."
-            )
+        if (
+            max_duration_s is not None
+            and max_samples is not None
+            and num_samples > max_samples
+        ):
+            _reject_over_duration(max_duration_s, num_samples, out_sr)
         frames.append(frame)
 
     if not frames:
@@ -430,24 +461,29 @@ def load_audio_torchcodec(
                 f"increase this limit."
             )
 
-    # Authoritative limits, enforced while decoding: the metadata estimates
-    # above can be bypassed by a container that lies about its length.
+    # Metadata above can only reject: a container may lie about its length.
+    # FFmpeg < 5.0 leaves up to one Vorbis block of tail padding, trimmed
+    # below, so the in-loop cap allows that pad. The trimmed length is what
+    # must fit in `max_duration_s`.
+    tail_padding = _vorbis_tail_padding_samples(metadata, sample_rate)
     data, out_sr = decode_torchcodec_audio(
         decoder,
         sample_rate,
         max_duration_s=max_duration_s,
         max_decode_bytes=max_decode_bytes,
+        duration_sample_slack=tail_padding,
     )
 
     # FFmpeg < 5.0 misses Ogg end_trimming, leaving up to one Vorbis block of
     # padding at the tail; we need to trim for valid audio length.
-    if metadata.codec == "vorbis" and metadata.duration_seconds is not None:
+    if tail_padding and metadata.duration_seconds is not None:
         expected_samples = round(metadata.duration_seconds * out_sr)
         padding = data.shape[-1] - expected_samples
-        native_sr = metadata.sample_rate or out_sr
-        max_padding = cdiv(_VORBIS_MAX_BLOCK_SAMPLES * out_sr, native_sr)
-        if 0 < padding <= max_padding:
+        if 0 < padding <= tail_padding:
             data = data[..., :expected_samples]
+
+    if max_duration_s is not None and data.shape[-1] > int(out_sr * max_duration_s):
+        _reject_over_duration(max_duration_s, int(data.shape[-1]), out_sr)
 
     audio = data.numpy()  # (num_channels, num_samples), float32
     if audio.size == 0:
