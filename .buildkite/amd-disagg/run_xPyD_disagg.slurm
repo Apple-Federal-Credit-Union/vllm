@@ -505,6 +505,7 @@ run_node_container() {
         "${IONIC_MOUNTS[@]}" \
         --ulimit memlock=-1:-1 \
         -e HF_TOKEN \
+        -e VLLM_DATA_PARALLEL_HANDSHAKE_SECRET \
 	-e HOME=/workspace \
         -e USER="$(id -un)" \
         -e LOGNAME="$(id -un)" \

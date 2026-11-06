@@ -75,6 +75,10 @@ export ROUTER_TYPE ROUTER_PORT VLLM_ROUTER_IMAGE
 export SKIP_IONIC_MOUNTS
 # Bake a different repo.radeon.com ionic userspace channel into the run image.
 export AINIC_SWAP_CHANNEL
+# DP ranks on every node must share one engine handshake secret, so generate it
+# once here rather than in the per-node job body.
+VLLM_DATA_PARALLEL_HANDSHAKE_SECRET="${VLLM_DATA_PARALLEL_HANDSHAKE_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
+export VLLM_DATA_PARALLEL_HANDSHAKE_SECRET
 
 # Model selection.
 [[ -n "${MODEL_NAME:-}" ]] && export MODEL_NAME

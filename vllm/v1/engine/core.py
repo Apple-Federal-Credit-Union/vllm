@@ -89,6 +89,8 @@ from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
     SignalCallback,
+    get_handshake_auth_fields,
+    get_handshake_curve_server_key,
     get_physical_gpu_ids_for_local_dp_rank,
 )
 from vllm.v1.executor import Executor
@@ -1366,6 +1368,7 @@ class EngineCoreProc(EngineCore):
             identity=identity,
             linger=5000,
             bind=False,
+            curve_server_key=get_handshake_curve_server_key(handshake_address),
         ) as handshake_socket:
             # Register engine with front-end.
             addresses = self.startup_handshake(
@@ -1394,6 +1397,7 @@ class EngineCoreProc(EngineCore):
                 ready_msg["num_redundant_experts"] = (
                     vllm_config.parallel_config.eplb_config.num_redundant_experts
                 )
+            ready_msg.update(get_handshake_auth_fields(handshake_socket))
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
@@ -1411,6 +1415,7 @@ class EngineCoreProc(EngineCore):
                     "status": "HELLO",
                     "local": local_client,
                     "headless": headless,
+                    **get_handshake_auth_fields(handshake_socket),
                 }
             )
         )
@@ -1421,7 +1426,8 @@ class EngineCoreProc(EngineCore):
             raise RuntimeError(
                 "Did not receive response from front-end "
                 f"process within {HANDSHAKE_TIMEOUT_MINS} "
-                f"minutes"
+                "minutes. If the front-end runs on another node, check that "
+                "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET is the same on both."
             )
         init_bytes = handshake_socket.recv()
         num_redundant_experts: int | None = None

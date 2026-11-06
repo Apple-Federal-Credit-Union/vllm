@@ -24,7 +24,11 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_tcp_uri
-from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
+from vllm.v1.engine.utils import (
+    CoreEngineProcManager,
+    ensure_handshake_secret,
+    launch_core_engines,
+)
 from vllm.v1.executor import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
@@ -235,6 +239,8 @@ def run_headless(args: argparse.Namespace):
     host = parallel_config.data_parallel_master_ip
     port = parallel_config.data_parallel_rpc_port
     handshake_address = get_tcp_uri(host, port)
+    if not envs.VLLM_USE_RUST_FRONTEND:
+        ensure_handshake_secret(generate=False)
 
     logger.info(
         "Launching %d data parallel engine(s) in headless mode, "

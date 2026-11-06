@@ -20,7 +20,12 @@ from vllm.v1.engine import (
     ReconfigureDistributedRequest,
     ReconfigureRankType,
 )
-from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
+from vllm.v1.engine.utils import (
+    EngineHandshakeMetadata,
+    EngineZmqAddresses,
+    get_handshake_curve_secret_key,
+    recv_handshake_message,
+)
 from vllm.v1.utils import get_engine_client_zmq_addr
 
 if TYPE_CHECKING:
@@ -77,9 +82,14 @@ class ExternalElasticEPScaleUpHandshakeServer:
         bootstrap: ReconfigureDistributedRequest,
         num_redundant_experts: int,
         elastic_ep_max_dp_size: int,
+        curve_secret_key: bytes | None = None,
     ) -> None:
         self.handshake_address = handshake_address
         self.expected_new_ranks = set(expected_new_ranks)
+        self._expected_identities = {
+            rank.to_bytes(2, "little") for rank in expected_new_ranks
+        }
+        self.curve_secret_key = curve_secret_key
         self.addresses = addresses
         self.bootstrap = bootstrap
         self.num_redundant_experts = num_redundant_experts
@@ -117,6 +127,7 @@ class ExternalElasticEPScaleUpHandshakeServer:
 
     def _run(self) -> None:
         pending_ready_ranks = self.expected_new_ranks.copy()
+        hello_ranks: set[int] = set()
         try:
             with (
                 zmq.Context() as ctx,
@@ -126,7 +137,10 @@ class ExternalElasticEPScaleUpHandshakeServer:
                     zmq.ROUTER,
                     bind=True,
                     linger=0,
-                    router_handover=True,
+                    # Only a peer that passed CURVE may take over an identity;
+                    # otherwise a reply could be routed to an impostor.
+                    router_handover=self.curve_secret_key is not None,
+                    curve_secret_key=self.curve_secret_key,
                 ) as handshake_socket,
             ):
                 self.started_event.set()
@@ -141,17 +155,20 @@ class ExternalElasticEPScaleUpHandshakeServer:
                     if handshake_socket not in events:
                         continue
 
-                    engine_identity, payload = handshake_socket.recv_multipart()
-                    engine_rank = int.from_bytes(engine_identity, "little")
-                    if engine_rank not in self.expected_new_ranks:
-                        raise RuntimeError(
-                            "Received scale-up handshake from unexpected "
-                            f"dp rank {engine_rank}"
+                    received = recv_handshake_message(
+                        handshake_socket, self._expected_identities
+                    )
+                    if received is None:
+                        logger.warning(
+                            "Ignoring an invalid or unauthenticated message on "
+                            "the scale-up handshake socket."
                         )
-
-                    message = msgspec.msgpack.decode(payload)
+                        continue
+                    engine_identity, message = received
+                    engine_rank = int.from_bytes(engine_identity, "little")
                     status = message["status"]
                     if status == "HELLO":
+                        hello_ranks.add(engine_rank)
                         b = self.bootstrap
                         parallel_config: dict[str, int | str | list[int]] = {
                             "data_parallel_master_ip": b.new_data_parallel_master_ip,
@@ -177,12 +194,14 @@ class ExternalElasticEPScaleUpHandshakeServer:
                         handshake_socket.send_multipart(
                             (engine_identity, init_message), copy=False
                         )
-                    elif status == "READY":
+                    elif status == "READY" and engine_rank in hello_ranks:
                         pending_ready_ranks.discard(engine_rank)
                     else:
-                        raise RuntimeError(
-                            f"Unexpected handshake status {status} from dp rank "
-                            f"{engine_rank}"
+                        logger.warning(
+                            "Ignoring unexpected scale-up handshake %s message "
+                            "from dp rank %d.",
+                            status,
+                            engine_rank,
                         )
         except Exception as e:
             self._error = e
@@ -458,12 +477,13 @@ class ExternalElasticEPScaleCoordinator:
         num_redundant_experts: int,
         elastic_ep_max_dp_size: int,
     ) -> ExternalElasticEPScaleUpHandshakeServer:
+        handshake_address = get_engine_client_zmq_addr(
+            False,
+            bootstrap.new_data_parallel_master_ip,
+            self.client.vllm_config.parallel_config.data_parallel_rpc_port,
+        )
         handshake_server = ExternalElasticEPScaleUpHandshakeServer(
-            handshake_address=get_engine_client_zmq_addr(
-                False,
-                bootstrap.new_data_parallel_master_ip,
-                self.client.vllm_config.parallel_config.data_parallel_rpc_port,
-            ),
+            handshake_address=handshake_address,
             expected_new_ranks=list(
                 range(
                     cur_data_parallel_size,
@@ -474,6 +494,7 @@ class ExternalElasticEPScaleCoordinator:
             bootstrap=bootstrap,
             num_redundant_experts=num_redundant_experts,
             elastic_ep_max_dp_size=elastic_ep_max_dp_size,
+            curve_secret_key=get_handshake_curve_secret_key(handshake_address),
         )
         handshake_server.start()
         return handshake_server

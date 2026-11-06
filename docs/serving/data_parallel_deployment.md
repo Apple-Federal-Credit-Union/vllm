@@ -30,6 +30,9 @@ By contrast, the admission control limits `--max-num-queued-reqs` and `--max-num
 
 Running a single data parallel deployment across multiple nodes requires a different `vllm serve` to be run on each node, specifying which DP ranks should run on that node. In this case, there will still be a single HTTP entrypoint - the API server(s) will run only on one node, but it doesn't necessarily need to be co-located with the DP ranks.
 
+!!! important
+    When DP ranks are started by separate `vllm serve` commands (multiple nodes, `--headless`, hybrid or external load balancing), set `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET` to the same value for every command, for example one generated with `openssl rand -hex 32`. Engines use it to authenticate their startup handshake with the rank 0 front-end, which refuses to start without it. When a single command starts every rank, a secret is generated automatically.
+
 This will run DP=4, TP=2 on a single 8-GPU node:
 
 ```bash
@@ -103,6 +106,8 @@ In this case, it's more convenient to treat each DP rank like a separate vLLM de
 This can already be done trivially for non-MoE models, since each deployed server is fully independent. In that case, launch independent vLLM instances without any `--data-parallel-*` arguments; external DP CLI options are only supported for MoE deployments.
 
 We support an equivalent topology for MoE DP+EP which can be configured via the following CLI arguments.
+
+As with the other multi-command deployments above, every rank needs the same `VLLM_DATA_PARALLEL_HANDSHAKE_SECRET`.
 
 If DP ranks are co-located (same node / ip address), a default RPC port is used, but a different HTTP server port must be specified for each rank:
 

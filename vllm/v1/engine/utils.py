@@ -2,19 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import hmac
 import os
+import secrets
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Container, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import zmq
+from zmq.utils import z85
 
 from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
@@ -144,6 +147,114 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
+
+
+HANDSHAKE_SECRET_FIELD = "handshake_secret"
+_HANDSHAKE_CURVE_KEY_LABEL = b"vllm data parallel handshake CURVE server key"
+
+
+def _handshake_secret() -> str | None:
+    return envs.VLLM_DATA_PARALLEL_HANDSHAKE_SECRET or None
+
+
+def _is_tcp_socket(sock: zmq.Socket) -> bool:
+    return sock.getsockopt(zmq.LAST_ENDPOINT).startswith(b"tcp://")
+
+
+def ensure_handshake_secret(generate: bool) -> None:
+    """Make sure the peers of a TCP engine handshake can authenticate.
+
+    Args:
+        generate: Whether every peer of the handshake is started by this
+            process tree, which then inherits a generated secret.
+
+    Raises:
+        ValueError: If no secret is set and one cannot be generated.
+
+    """
+    if _handshake_secret() is not None:
+        return
+    if not generate:
+        raise ValueError(
+            "VLLM_DATA_PARALLEL_HANDSHAKE_SECRET must be set to the same value "
+            "on every node when data parallel engines handshake with the "
+            "front-end over TCP."
+        )
+    os.environ["VLLM_DATA_PARALLEL_HANDSHAKE_SECRET"] = secrets.token_urlsafe(32)
+
+
+def _derive_handshake_curve_secret_key(secret: str) -> bytes:
+    if not zmq.has("curve"):
+        raise RuntimeError(
+            "libzmq was built without CURVE support, which data parallel "
+            "engine handshakes over TCP require."
+        )
+    return z85.encode(
+        hmac.digest(secret.encode(), _HANDSHAKE_CURVE_KEY_LABEL, "sha256")
+    )
+
+
+def get_handshake_curve_secret_key(address: str) -> bytes | None:
+    """Return the CURVE secret key for a handshake ROUTER bound at ``address``.
+
+    Over TCP, CURVE keeps peers without the handshake secret from connecting
+    and claiming an engine identity.
+    """
+    if not address.startswith("tcp://"):
+        return None
+    ensure_handshake_secret(generate=False)
+    secret = _handshake_secret()
+    assert secret is not None
+    return _derive_handshake_curve_secret_key(secret)
+
+
+def get_handshake_curve_server_key(address: str) -> bytes | None:
+    """Return the CURVE public key of the handshake ROUTER at ``address``."""
+    secret = _handshake_secret()
+    if not address.startswith("tcp://") or secret is None:
+        return None
+    return zmq.curve_public(_derive_handshake_curve_secret_key(secret))
+
+
+def get_handshake_auth_fields(handshake_socket: zmq.Socket) -> dict[str, str]:
+    """Fields an engine adds to its handshake messages to authenticate."""
+    secret = _handshake_secret()
+    if secret is None or not _is_tcp_socket(handshake_socket):
+        return {}
+    return {HANDSHAKE_SECRET_FIELD: secret}
+
+
+def recv_handshake_message(
+    handshake_socket: zmq.Socket,
+    identities: Container[bytes],
+) -> tuple[bytes, dict[str, Any]] | None:
+    """Receive one message from a handshake ROUTER.
+
+    Returns the identity and decoded message, or ``None`` unless the message
+    has exactly one payload frame, comes from one of ``identities``, and is a
+    handshake map. On a TCP socket the map must also carry the current
+    handshake secret.
+    """
+    frames = handshake_socket.recv_multipart()
+    if len(frames) != 2 or frames[0] not in identities:
+        return None
+    identity, payload = frames
+    try:
+        message = msgspec.msgpack.decode(payload)
+    except msgspec.DecodeError:
+        return None
+    if not isinstance(message, dict) or not isinstance(message.get("status"), str):
+        return None
+    if _is_tcp_socket(handshake_socket):
+        secret = _handshake_secret()
+        presented = message.get(HANDSHAKE_SECRET_FIELD)
+        if (
+            secret is None
+            or not isinstance(presented, str)
+            or not hmac.compare_digest(presented.encode(), secret.encode())
+        ):
+            return None
+    return identity, message
 
 
 def _make_control_bundle(node_ip: str) -> dict[str, float]:
@@ -1220,6 +1331,21 @@ def launch_core_engines(
 
     offline_mode = local_start_index is not None
 
+    # Whether the started engines will handshake only with co-located
+    # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
+    # their co-located frontend and also the rank 0 front-end, and hence this
+    # will be False.
+    handshake_local_only = offline_mode or local_engine_count == dp_size
+
+    # NOTE(yongji): handling scaling from intra-node to inter-node
+    if parallel_config.enable_elastic_ep:
+        handshake_local_only = False
+
+    if not handshake_local_only and parallel_config.data_parallel_backend != "ray":
+        ensure_handshake_secret(
+            generate=offline_mode or (dp_rank == 0 and local_engine_count == dp_size)
+        )
+
     # Create a single tensor IPC queue for sharing multimodal tensors between
     # API servers and engine core. Returns a single queue since we only support
     # DP=1 for this data flow.
@@ -1335,16 +1461,6 @@ def launch_core_engines(
             for i in range(dp_rank, dp_rank + local_engine_count)
         ]
 
-    # Whether the started engines will handshake only with co-located
-    # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
-    # their co-located frontend and also the rank 0 front-end, and hence this
-    # will be False.
-    handshake_local_only = offline_mode or local_engine_count == dp_size
-
-    # NOTE(yongji): handling scaling from intra-node to inter-node
-    if parallel_config.enable_elastic_ep:
-        handshake_local_only = False
-
     handshake_address = get_engine_client_zmq_addr(
         handshake_local_only,
         host,
@@ -1360,7 +1476,10 @@ def launch_core_engines(
         client_handshake_address = None
 
     with zmq_socket_ctx(
-        local_handshake_address, zmq.ROUTER, bind=True
+        local_handshake_address,
+        zmq.ROUTER,
+        bind=True,
+        curve_secret_key=get_handshake_curve_secret_key(local_handshake_address),
     ) as handshake_socket:
         # Start local engines.
         if local_engine_count:
@@ -1413,6 +1532,7 @@ def wait_for_engine_startup(
     remote_count = len(core_engines) - local_count
     # [local, remote] counts
     conn_pending, start_pending = [local_count, remote_count], [0, 0]
+    engines_by_identity = {engine.identity: engine for engine in core_engines}
     poller = zmq.Poller()
     poller.register(handshake_socket, zmq.POLLIN)
 
@@ -1482,15 +1602,17 @@ def wait_for_engine_startup(
             )
 
         # Receive HELLO and READY messages from the input socket.
-        eng_identity, ready_msg_bytes = handshake_socket.recv_multipart()
-        eng_index = int.from_bytes(eng_identity, "little")
-        engine = next((e for e in core_engines if e.identity == eng_identity), None)
-        if engine is None:
-            raise RuntimeError(
-                f"Message from engine with unexpected data parallel rank: {eng_index}"
+        received = recv_handshake_message(handshake_socket, engines_by_identity)
+        if received is None:
+            logger.warning(
+                "Ignoring an invalid or unauthenticated message on the engine "
+                "handshake socket."
             )
-        msg = msgspec.msgpack.decode(ready_msg_bytes)
-        status, local, headless = msg["status"], msg["local"], msg["headless"]
+            continue
+        eng_identity, msg = received
+        engine = engines_by_identity[eng_identity]
+        eng_index = int.from_bytes(eng_identity, "little")
+        status, local, headless = msg["status"], msg.get("local"), msg.get("headless")
         if local != engine.local:
             raise RuntimeError(
                 f"{status} message from "
@@ -1582,11 +1704,14 @@ def wait_for_engine_startup(
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
         else:
-            raise RuntimeError(
-                f"Unexpected {status} message for "
-                f"{'local' if local else 'remote'} engine "
-                f"{eng_index} in {engine.state} state."
+            logger.warning(
+                "Ignoring unexpected %s message for %s engine %d in %s state.",
+                status,
+                "local" if local else "remote",
+                eng_index,
+                engine.state,
             )
+            continue
 
         logger.debug(
             "%s from %s core engine process %s.",
