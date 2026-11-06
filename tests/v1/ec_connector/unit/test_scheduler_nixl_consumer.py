@@ -61,7 +61,7 @@ class _FakeSession:
         self.started = []
         self._results = _FakeResults()
 
-    def start_xfer(self, mm_hash, block_indices, deadline):
+    def start_xfer(self, mm_hash, block_indices, shape, deadline):
         self.started.append(mm_hash)
 
     def poll(self, messages, now):

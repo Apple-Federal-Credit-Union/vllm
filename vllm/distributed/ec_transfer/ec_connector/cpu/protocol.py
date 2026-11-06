@@ -16,7 +16,7 @@ import msgspec
 
 # Bump when the wire format or tensor/block layout changes in a
 # backward-incompatible way. Peers reject mismatched versions.
-EC_CONNECTOR_VERSION: int = 2
+EC_CONNECTOR_VERSION: int = 3
 
 
 class XferStatus(enum.IntEnum):
@@ -71,6 +71,8 @@ class XferAck(  # type: ignore[call-arg]
     # identifies the exact transfer; the consumer uses both to build notif_msg.
     session_id: str = ""
     src_block_indices: list[int] = []
+    # Encoder output shape the source blocks hold, as the producer saved it.
+    shape: list[int] = []
     agent_metadata: bytes = b""
     mem_descriptor: bytes = b""
 

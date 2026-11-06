@@ -44,6 +44,7 @@ def _ok_ack(
         status=XferStatus.OK,
         session_id=session_id,
         src_block_indices=src_indices or [0, 1],
+        shape=[2, 4],
         agent_metadata=b"meta",
         mem_descriptor=b"desc",
     )
@@ -57,6 +58,7 @@ def _xfer(
     return ConsumerXfer(
         mm_hash="h1",
         block_indices=[10, 11],
+        shape=(2, 4),
         addr=("host", 1234),
         deadline=deadline if deadline is not None else time.monotonic() + 60,
         data=data or _make_data(),
@@ -122,6 +124,15 @@ def test_producer_session_grant_pins_ready_entry_and_returns_blocks():
     assert entry is not None
     assert not entry.evictable  # pinned by the grant
     assert list(ack.src_block_indices) == list(entry.block_ids)
+
+
+def test_producer_session_grant_reports_saved_shape():
+    cache = EmbeddingCache(num_blocks=8)
+    cache.alloc("h1", 2, (2, 4))
+    cache.mark_ready("h1")
+    ack = _make_producer_session(cache)._grant_or_nack(_xfer_req(mm_hash="h1"))
+    assert ack.status == XferStatus.OK
+    assert ack.shape == [2, 4]
 
 
 def test_producer_session_grant_nacks_missing_entry():
@@ -243,6 +254,22 @@ def test_consumer_xfer_handle_ack_resets_deadline():
     x = _xfer(deadline=original)
     x.handle_ack(_ok_ack(), agent_name="agent-1")
     assert x.deadline > original
+
+
+@pytest.mark.parametrize(
+    "shape, src_indices",
+    [([2, 3], [5, 6]), ([], [5, 6]), ([2, 4], [5]), ([2, 4], [5, 6, 7])],
+    ids=["width", "no-shape", "fewer-blocks", "more-blocks"],
+)
+def test_consumer_xfer_rejects_ack_for_another_layout(shape, src_indices):
+    """The announced shape is the caller's; only the producer's may be read."""
+    data = _make_data()
+    x = _xfer(data)
+    ack = _ok_ack(src_indices=src_indices)
+    ack.shape = shape
+    assert x.handle_ack(ack, agent_name="agent-1") is False
+    assert x.transfer_handle is None
+    data.post_read.assert_not_called()
 
 
 def test_consumer_xfer_handle_ack_nack_returns_false():
@@ -399,7 +426,7 @@ def test_consumer_session_start_xfer_sends_req_with_session_id():
     import msgspec
 
     s = _make_consumer_session()
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() + 10)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() + 10)
     raw = s._zmq.send.call_args[0][0]
     req = msgspec.msgpack.decode(raw, type=XferReq)
     assert req.mm_hash == "h1"
@@ -411,13 +438,14 @@ def test_consumer_session_poll_done_goes_to_completed():
 
     data = _make_data(xfer_state="PROC")
     s = _make_consumer_session(data)
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() + 10)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() + 10)
 
     ack = XferAck(
         mm_hash="h1",
         status=XferStatus.OK,
         session_id=s._session_id,
         src_block_indices=[5, 6],
+        shape=[2, 4],
         agent_metadata=b"meta",
         mem_descriptor=b"desc",
     )
@@ -436,7 +464,7 @@ def test_consumer_session_poll_nack_goes_to_tombstoned():
     import msgspec
 
     s = _make_consumer_session()
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() + 10)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() + 10)
     nack = XferAck(mm_hash="h1", status=XferStatus.NACK_MISSING)
     s.poll([msgspec.msgpack.encode(nack)], time.monotonic())
     results = s.take_results()
@@ -450,7 +478,7 @@ def test_consumer_session_poll_not_ready_nack_goes_to_retryable():
     import msgspec
 
     s = _make_consumer_session()
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() + 10)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() + 10)
     nack = XferAck(mm_hash="h1", status=XferStatus.NACK_NOT_READY)
     s.poll([msgspec.msgpack.encode(nack)], time.monotonic())
     results = s.take_results()
@@ -462,7 +490,7 @@ def test_consumer_session_poll_not_ready_nack_goes_to_retryable():
 def test_consumer_session_ack_timeout_reports_retry_once():
     """A delayed producer ACK is retryable, and its result is drained once."""
     s = _make_consumer_session()
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() - 1)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() - 1)
     s.poll([], time.monotonic())
     r1 = s.take_results()
     assert "h1" in r1.retryable
@@ -473,7 +501,7 @@ def test_consumer_session_ack_timeout_reports_retry_once():
 
 def test_consumer_session_on_peer_down_cancels_waiting_ack():
     s = _make_consumer_session()
-    s.start_xfer("h1", [0, 1], deadline=time.monotonic() + 60)
+    s.start_xfer("h1", [0, 1], (2, 4), deadline=time.monotonic() + 60)
     s.on_peer_down()
     results = s.take_results()
     assert "h1" in results.retryable

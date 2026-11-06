@@ -110,6 +110,8 @@ class ConsumerXfer:
 
     mm_hash: str
     block_indices: list[int]
+    # Shape the local entry was allocated for; the producer must confirm it.
+    shape: tuple[int, int]
     addr: PeerAddr
     deadline: float
     data: DataTransport
@@ -119,8 +121,27 @@ class ConsumerXfer:
     _quarantined: bool = field(default=False, init=False)
 
     def handle_ack(self, ack: XferAck, agent_name: str) -> bool:
-        """Issue the NIXL READ on an OK XferAck. Returns False on any NACK."""
+        """Issue the NIXL READ on an OK XferAck.
+
+        Returns False on any NACK, or when the producer's encoding does not
+        match the shape and block count this xfer allocated.
+        """
         if ack.status != XferStatus.OK:
+            return False
+        if tuple(ack.shape) != self.shape or len(ack.src_block_indices) != len(
+            self.block_indices
+        ):
+            logger.warning(
+                "EC Connector: mm_hash=%s from %s:%d holds shape %s in %d blocks; "
+                "expected shape %s in %d blocks",
+                self.mm_hash,
+                self.addr[0],
+                self.addr[1],
+                list(ack.shape),
+                len(ack.src_block_indices),
+                list(self.shape),
+                len(self.block_indices),
+            )
             return False
         # notif_msg encodes both session_id and mm_hash so the producer can
         # do a direct (session_id, mm_hash) → ProducerXfer lookup on completion.
@@ -345,6 +366,7 @@ class ProducerSession:
             status=XferStatus.OK,
             session_id=req.session_id,  # echo consumer's session_id back
             src_block_indices=block_indices,
+            shape=list(entry.shape) if entry.shape is not None else [],
             agent_metadata=self._data.get_agent_metadata(),
             mem_descriptor=self._data.get_mem_descriptor(),
         )
@@ -449,12 +471,17 @@ class ConsumerSession:
         return self._addr
 
     def start_xfer(
-        self, mm_hash: str, block_indices: list[int], deadline: float
+        self,
+        mm_hash: str,
+        block_indices: list[int],
+        shape: tuple[int, int],
+        deadline: float,
     ) -> None:
         """Create a ConsumerXfer and send the XferReq over the connection."""
         xfer = ConsumerXfer(
             mm_hash=mm_hash,
             block_indices=block_indices,
+            shape=shape,
             addr=self._addr,
             deadline=deadline,
             data=self._data,

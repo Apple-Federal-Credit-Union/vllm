@@ -500,7 +500,7 @@ class ECCPUScheduler:
             )
         deadline = time.monotonic() + self._ack_timeout_s
         try:
-            self._sessions[addr].start_xfer(mm_hash, indices, deadline)
+            self._sessions[addr].start_xfer(mm_hash, indices, shape, deadline)
         except Exception:
             self._cache.discard(mm_hash)
             raise
