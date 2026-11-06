@@ -31,6 +31,8 @@ vllm serve <model> --ec-transfer-config '{
 
 ## Usage With P2P NIXL
 
+Every producer and consumer must set `VLLM_EC_SIDE_CHANNEL_TOKEN` to the same secret (see [Environment Variables](#environment-variables)); a producer refuses every read without it.
+
 Producer — offloads to its CPU tier and serves reads from consumers:
 
 ```bash
@@ -67,14 +69,16 @@ vllm serve <model> --ec-transfer-config '{
 2. The orchestrator issues a follow-up request with the same `mm_hash` to a consumer instance, passing the producer's `ec_transfer_params` through `SamplingParams.extra_args["ec_transfer_params"]`.
 3. On the consumer, `ECCPUScheduler.ensure_cache_available()` reads `request.ec_transfer_params`. For each `mm_hash` not already cached locally, it opens a ZMQ session to `(peer_host, peer_port)`, sends an `XferReq`, and on an `OK` `XferAck` issues a NIXL READ that pulls the blocks straight from the producer's mmap into its own. The request is deferred until the READ completes.
 4. A `NACK_NOT_READY` means the producer announced the encoding but its GPU→mmap save has not landed yet. The consumer releases the in-flight entry without recording a failure and re-requests the read on a later step, so a save that lands a few steps late costs latency rather than a recompute.
-5. On any other NACK (`NACK_MISSING`, `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_INTERNAL`), ack timeout, read timeout, or peer disconnect, the consumer discards the in-flight entry and falls back to local encoding for that `mm_hash` — a P2P failure never blocks the request indefinitely.
+5. On any other NACK (`NACK_MISSING`, `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_UNAUTHORIZED`, `NACK_INTERNAL`), ack timeout, read timeout, or peer disconnect, the consumer discards the in-flight entry and falls back to local encoding for that `mm_hash` — a P2P failure never blocks the request indefinitely.
 
 ### Protocol
 
-- **Control plane**: ZMQ. The producer binds a `ROUTER` socket on `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`; each consumer opens one `DEALER` connection per producer peer, with ZMQ heartbeating (2s interval, 4s timeout, 8s TTL) to detect a dead peer. `XferReq`/`XferAck` are `msgspec` msgpack structs, versioned by `EC_CONNECTOR_VERSION` (currently `1`) — a version mismatch is NACKed.
+- **Control plane**: ZMQ. The producer binds a `ROUTER` socket on `VLLM_EC_SIDE_CHANNEL_HOST:VLLM_EC_SIDE_CHANNEL_PORT`; each consumer opens one `DEALER` connection per producer peer, with ZMQ heartbeating (2s interval, 4s timeout, 8s TTL) to detect a dead peer. `XferReq`/`XferAck` are `msgspec` msgpack structs, versioned by `EC_CONNECTOR_VERSION` (currently `3`) — a version mismatch is NACKed.
+- **Authentication**: with `VLLM_EC_SIDE_CHANNEL_TOKEN` set, the side channel uses ZeroMQ CURVE with keys derived from it, so a consumer only completes a handshake with a producer that holds the token (a `peer_host` named by a request cannot collect it) and the producer only with consumers that hold it. Every `XferReq` also carries the token in `auth_token`; the producer NACKs (`NACK_UNAUTHORIZED`) any request whose token does not match its own, and every request when it has no token, before looking up the encoding. The NIXL data plane is not encrypted, so keep producers and consumers on an isolated network.
 - **Compatibility check**: every `XferReq` carries a SHA-256 hash over `(vllm_version, model, dtype, block_size_bytes)`; the producer NACKs (`NACK_INCOMPAT`) any peer whose hash differs.
-- **Ack statuses**: `OK`, `NACK_MISSING` (the producer no longer holds the encoding), `NACK_NOT_READY` (held, but its save has not landed), `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_INTERNAL`. Only `NACK_NOT_READY` is retryable — `RETRYABLE_NACKS` in `cpu/protocol.py` is what both ends consult, so the classification lives with the wire vocabulary rather than at each call site.
-- **Data plane**: NIXL, `UCX` backend, consumer-initiated `READ` — the consumer pulls bytes directly out of the producer's registered mmap region; the producer never pushes.
+- **Ack statuses**: `OK`, `NACK_MISSING` (the producer no longer holds the encoding), `NACK_NOT_READY` (held, but its save has not landed), `NACK_INCOMPAT`, `NACK_VERSION`, `NACK_UNAUTHORIZED`, `NACK_INTERNAL`. Only `NACK_NOT_READY` is retryable — `RETRYABLE_NACKS` in `cpu/protocol.py` is what both ends consult, so the classification lives with the wire vocabulary rather than at each call site.
+- **Data plane**: NIXL, `UCX` backend, consumer-initiated `READ` — the consumer pulls bytes directly out of the producer's mmap region; the producer never pushes.
+- **Grant scope**: an `OK` `XferAck` carries NIXL agent metadata and a memory descriptor for the granted encoding's blocks only. The producer registers those blocks with NIXL for the life of the grant, so a consumer's NIXL agent refuses to address any other block of the region. NIXL does not stop a peer that bypasses its descriptor checks or keeps a grant's metadata after the grant ends, so every holder of the token is a trusted NIXL peer.
 - **Producer restart recovery**: the `XferAck` carries the producer's NIXL agent metadata, so a consumer can recover a READ against a restarted producer without a fresh handshake round-trip.
 - **Timeouts**: consumer XferAck wait 2s; NIXL read 20s (then quarantined — not evicted — for up to 60s to let an unabortable DMA settle); the producer releases an unclaimed pinned grant after a 30s pin lease.
 
@@ -104,8 +108,9 @@ EC transfer is configured via `--ec-transfer-config` (CLI) or the `ec_transfer_c
 | --- | --- | --- |
 | `VLLM_EC_SIDE_CHANNEL_HOST` | `localhost` | Host the producer's ZMQ `ROUTER` socket binds to. Set to a routable address (e.g. the pod IP) for multi-instance/multi-node P2P — the default only works when producer and consumer share a host. |
 | `VLLM_EC_SIDE_CHANNEL_PORT` | `5601` | Port for the same ZMQ `ROUTER` socket. |
+| `VLLM_EC_SIDE_CHANNEL_TOKEN` | unset | Shared secret that authenticates producers and consumers to each other. Set the same random value of at least 32 characters on every producer and consumer, e.g. `python3 -c 'import secrets; print(secrets.token_hex(32))'`. While unset, producers refuse every read and consumers fall back to local encoding. |
 
-Both are read only when `ec_enable_nixl=True` on a producer (`ec_role="ec_producer"` or `"ec_both"`).
+The host and port are read only when `ec_enable_nixl=True` on a producer (`ec_role="ec_producer"` or `"ec_both"`); the token is read by producers and consumers.
 
 ## Limitations
 

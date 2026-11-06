@@ -88,10 +88,20 @@ def test_producer_xfer_expired_after_deadline():
 
 # ── ProducerSession ───────────────────────────────────────────────────────────
 
+_TOKEN = "placeholder"
+
+
+@pytest.fixture(autouse=True)
+def _side_channel_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_EC_SIDE_CHANNEL_TOKEN", _TOKEN)
+
 
 def _xfer_req(mm_hash: str = "h1", session_id: str = "sess-1") -> XferReq:
     return XferReq(
-        mm_hash=mm_hash, compatibility_hash="hash-abc", session_id=session_id
+        mm_hash=mm_hash,
+        compatibility_hash="hash-abc",
+        session_id=session_id,
+        auth_token=_TOKEN,
     )
 
 
@@ -99,8 +109,7 @@ def _make_producer_session(
     cache: EmbeddingCache | None = None, data: MagicMock | None = None
 ) -> ProducerSession:
     data = data or _make_data()
-    data.get_agent_metadata.return_value = b"meta"
-    data.get_mem_descriptor.return_value = b"desc"
+    data.grant_blocks.return_value = (b"meta", b"desc")
     return ProducerSession(
         transport=MagicMock(),
         data=data,
@@ -113,7 +122,8 @@ def test_producer_session_grant_pins_ready_entry_and_returns_blocks():
     cache = EmbeddingCache(num_blocks=8)
     cache.alloc("h1", 2)
     cache.mark_ready("h1")
-    s = _make_producer_session(cache)
+    data = _make_data()
+    s = _make_producer_session(cache, data)
 
     ack = s._grant_or_nack(_xfer_req(mm_hash="h1"))
 
@@ -121,7 +131,9 @@ def test_producer_session_grant_pins_ready_entry_and_returns_blocks():
     entry = cache.get("h1")
     assert entry is not None
     assert not entry.evictable  # pinned by the grant
-    assert list(ack.src_block_indices) == list(entry.block_ids)
+    data.grant_blocks.assert_called_once_with(list(entry.block_ids))
+    assert (ack.agent_metadata, ack.mem_descriptor) == (b"meta", b"desc")
+    assert list(ack.src_block_indices) == [0, 1]  # positions in mem_descriptor
 
 
 def test_producer_session_grant_nacks_missing_entry():
@@ -150,6 +162,7 @@ def test_producer_session_grant_nacks_version_mismatch():
         compatibility_hash="hash-abc",
         session_id="sess-1",
         connector_version=-1,
+        auth_token=_TOKEN,
     )
 
     ack = s._grant_or_nack(req)
@@ -165,7 +178,12 @@ def test_producer_session_grant_nacks_compat_hash_mismatch():
     cache.alloc("h1", 2)
     cache.mark_ready("h1")
     s = _make_producer_session(cache)
-    req = XferReq(mm_hash="h1", compatibility_hash="wrong-hash", session_id="sess-1")
+    req = XferReq(
+        mm_hash="h1",
+        compatibility_hash="wrong-hash",
+        session_id="sess-1",
+        auth_token=_TOKEN,
+    )
 
     ack = s._grant_or_nack(req)
 
@@ -190,6 +208,7 @@ def test_producer_session_notif_unpins_via_cache():
     s._drain_notifs()
 
     assert entry.evictable  # unpinned via cache
+    data.revoke_blocks.assert_called_once_with(list(entry.block_ids))
     assert s._active_xfers == {}
 
 

@@ -41,6 +41,7 @@ def servers():
     if not current_platform.is_cuda() or current_platform.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1").split(",")
+    token = {"VLLM_EC_SIDE_CHANNEL_TOKEN": "placeholder"}
     common = [
         "--host",
         "127.0.0.1",
@@ -81,13 +82,14 @@ def servers():
                 "CUDA_VISIBLE_DEVICES": devices[0],
                 "VLLM_EC_SIDE_CHANNEL_HOST": "127.0.0.1",
                 "VLLM_EC_SIDE_CHANNEL_PORT": str(get_open_port()),
+                **token,
             },
         ) as encoder,
         RemoteOpenAIServer(
             MODEL,
             common
             + ["--enable-mm-embeds", "--ec-transfer-config", config("ec_consumer")],
-            env_dict={"CUDA_VISIBLE_DEVICES": devices[1]},
+            env_dict={"CUDA_VISIBLE_DEVICES": devices[1], **token},
         ) as consumer,
     ):
         yield encoder, consumer
