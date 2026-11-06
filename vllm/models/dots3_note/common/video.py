@@ -15,6 +15,9 @@ from typing import Literal
 import numpy as np
 from PIL import Image
 
+import vllm.envs as envs
+from vllm.multimodal.media.audio import decode_torchcodec_audio
+
 _ALIGN = 28
 _MIN_FRAMES = 4
 _PF_FLOOR = 128
@@ -172,12 +175,15 @@ def _decode_audio(
             sample_rate=sample_rate,
             num_channels=1,
         )
-        samples = decoder.get_all_samples()
+        waveform, _ = decode_torchcodec_audio(
+            decoder,
+            sample_rate,
+            max_decode_bytes=envs.VLLM_MAX_AUDIO_DECODE_BYTES,
+        )
     except Exception:
         return None, 0.0
 
-    waveform = samples.data
-    if waveform is None or waveform.numel() == 0:
+    if waveform.numel() == 0:
         return None, 0.0
     if waveform.ndim == 2:
         waveform = waveform.mean(dim=0) if waveform.shape[0] > 1 else waveform[0]
