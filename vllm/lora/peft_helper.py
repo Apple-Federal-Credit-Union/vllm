@@ -6,6 +6,7 @@
 import json
 import math
 import os
+import time
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Literal
 
@@ -15,6 +16,14 @@ from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# `rank_pattern` / `alpha_pattern` keys are regexes from the adapter config.
+# `{}` repeats are expanded at compile time and matching can backtrack
+# exponentially, so keys are restricted and the time spent compiling and
+# matching them is bounded per adapter.
+_MAX_PATTERN_KEY_LEN = 512
+_PATTERN_MATCH_TIMEOUT_S = 0.1
+_PATTERN_TIME_BUDGET_S = 2.0
 
 
 @dataclass
@@ -110,6 +119,11 @@ class PEFTHelper:
                     f"LoRA rank for `{key}` in `rank_pattern` must be a positive "
                     f"integer, got {rank}."
                 )
+        self._pattern_time_left = _PATTERN_TIME_BUDGET_S
+        self._rank_regexes = self._compile_patterns("rank_pattern", self.rank_pattern)
+        self._alpha_regexes = self._compile_patterns(
+            "alpha_pattern", self.alpha_pattern
+        )
         if self.use_rslora:
             logger.info_once("Loading LoRA weights trained with rsLoRA.")
         self.vllm_lora_scaling_factor = self._scaling(self.r, self.lora_alpha)
@@ -120,11 +134,50 @@ class PEFTHelper:
         return alpha / rank
 
     @staticmethod
-    def _match_pattern(pattern: dict, name: str):
-        # Same rule as PEFT's `get_pattern_key`: a key matches if it is a suffix
-        # of the module name starting at a "." boundary; the first match wins.
+    def _pattern_time_error() -> ValueError:
+        return ValueError(
+            "`rank_pattern` / `alpha_pattern` keys took too long to match. Each "
+            f"match may take at most {_PATTERN_MATCH_TIMEOUT_S}s and all keys of "
+            f"an adapter at most {_PATTERN_TIME_BUDGET_S}s in total."
+        )
+
+    def _charge_pattern_time(self, start: float) -> None:
+        self._pattern_time_left -= time.perf_counter() - start
+        if self._pattern_time_left <= 0:
+            raise self._pattern_time_error()
+
+    def _compile_patterns(
+        self, field_name: str, pattern: dict
+    ) -> list[tuple[re.Pattern, float]]:
+        compiled = []
         for key, value in pattern.items():
-            if re.match(rf"(.*\.)?({key})$", name):
+            if len(key) > _MAX_PATTERN_KEY_LEN or "{" in key or "}" in key:
+                raise ValueError(
+                    f"`{field_name}` keys must be at most {_MAX_PATTERN_KEY_LEN}"
+                    " characters long and must not contain '{' or '}'."
+                )
+            start = time.perf_counter()
+            # Same rule as PEFT's `get_pattern_key`: a key matches if it is a
+            # suffix of the module name starting at a "." boundary.
+            try:
+                regex = re.compile(rf"(.*\.)?({key})$")
+            except (re.error, RecursionError) as e:
+                raise ValueError(f"Invalid `{field_name}` key: {e}") from None
+            self._charge_pattern_time(start)
+            compiled.append((regex, value))
+        return compiled
+
+    def _match_pattern(self, patterns: list[tuple[re.Pattern, float]], name: str):
+        # The first matching key wins.
+        for regex, value in patterns:
+            start = time.perf_counter()
+            timeout = min(_PATTERN_MATCH_TIMEOUT_S, self._pattern_time_left)
+            try:
+                matched = regex.match(name, timeout=timeout)
+            except TimeoutError:
+                raise self._pattern_time_error() from None
+            self._charge_pattern_time(start)
+            if matched:
                 return value
         return None
 
@@ -144,10 +197,10 @@ class PEFTHelper:
             module_name = module_name.removesuffix(".base_layer") + ".gate_up_proj"
         elif module_name.endswith(".experts"):
             module_name += ".down_proj"
-        rank = self._match_pattern(self.rank_pattern, module_name)
+        rank = self._match_pattern(self._rank_regexes, module_name)
         if rank is None:
             rank = self.r
-        alpha = self._match_pattern(self.alpha_pattern, module_name)
+        alpha = self._match_pattern(self._alpha_regexes, module_name)
         if alpha is None:
             alpha = self.lora_alpha
         return rank, self._scaling(rank, alpha)
