@@ -26,6 +26,10 @@ The following options control internode communications in vLLM:
 - `data_parallel_master_ip`: IP of the data parallel master (default: 127.0.0.1)
 - `data_parallel_master_port`: Port of the data parallel master (default: 29500)
 
+#### 4. **Elastic EP Scale-Up (External Load Balancing):**
+
+- `VLLM_ELASTIC_EP_HANDSHAKE_SECRET`: Shared secret that new ranks must present to DP rank 0 to receive join metadata during a scale-up. Set the same value on DP rank 0 and on every rank launched with `VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=1`; without it, new ranks cannot join.
+
 ### Notes on PyTorch Distributed
 
 vLLM uses PyTorch's distributed features for some internode communication. For

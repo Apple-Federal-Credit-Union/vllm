@@ -329,6 +329,7 @@ if TYPE_CHECKING:
     This allows any model name to be accepted in the 'model' field of requests,
     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
+    VLLM_ELASTIC_EP_HANDSHAKE_SECRET: str | None = None
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
@@ -2233,6 +2234,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", "0"))
     ),
+    # Shared secret that authenticates new ranks joining an external-LB
+    # elastic EP scale-up. Set the same value on DP rank 0 and on every rank
+    # launched with VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=1; without it, new ranks
+    # cannot join.
+    "VLLM_ELASTIC_EP_HANDSHAKE_SECRET": lambda: os.getenv(
+        "VLLM_ELASTIC_EP_HANDSHAKE_SECRET", None
+    ),
     # Whether to wait for all requests to drain before sending the
     # scaling command in elastic EP.
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
@@ -2409,6 +2417,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RAY_BUNDLE_INDICES",
         "VLLM_CHAT_TEMPLATE_FUEL",
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
+        "VLLM_ELASTIC_EP_HANDSHAKE_SECRET",
         "VLLM_FORCE_AOT_LOAD",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",

@@ -1394,8 +1394,41 @@ class EngineCoreProc(EngineCore):
                 ready_msg["num_redundant_experts"] = (
                     vllm_config.parallel_config.eplb_config.num_redundant_experts
                 )
+            ready_msg.update(
+                EngineCoreProc._external_scale_up_handshake_auth(
+                    parallel_config_to_update
+                )
+            )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
+
+    @staticmethod
+    def _is_external_scale_up_handshake(
+        parallel_config: ParallelConfig | None,
+    ) -> bool:
+        return (
+            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            and parallel_config is not None
+            and parallel_config.data_parallel_external_lb
+        )
+
+    @staticmethod
+    def _external_scale_up_handshake_auth(
+        parallel_config: ParallelConfig | None,
+    ) -> dict[str, Any]:
+        if not EngineCoreProc._is_external_scale_up_handshake(parallel_config):
+            return {}
+        assert parallel_config is not None
+        secret = envs.VLLM_ELASTIC_EP_HANDSHAKE_SECRET
+        if not secret:
+            raise RuntimeError(
+                "External Elastic EP scale-up launch requires "
+                "VLLM_ELASTIC_EP_HANDSHAKE_SECRET to match DP rank 0."
+            )
+        return {
+            "dp_rank": parallel_config.data_parallel_rank,
+            "handshake_secret": secret.encode(),
+        }
 
     @staticmethod
     def startup_handshake(
@@ -1411,6 +1444,7 @@ class EngineCoreProc(EngineCore):
                     "status": "HELLO",
                     "local": local_client,
                     "headless": headless,
+                    **EngineCoreProc._external_scale_up_handshake_auth(parallel_config),
                 }
             )
         )
@@ -1425,11 +1459,8 @@ class EngineCoreProc(EngineCore):
             )
         init_bytes = handshake_socket.recv()
         num_redundant_experts: int | None = None
-        if (
-            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
-            and parallel_config is not None
-            and parallel_config.data_parallel_external_lb
-        ):
+        if EngineCoreProc._is_external_scale_up_handshake(parallel_config):
+            assert parallel_config is not None
             from vllm.distributed.elastic_ep.external_elastic_ep import (
                 ExternalElasticEPScaleUpHandshakeMetadata,
             )
