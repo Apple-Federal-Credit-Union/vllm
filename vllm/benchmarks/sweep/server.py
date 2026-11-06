@@ -95,6 +95,14 @@ class ServerProcess:
 
         return f"http://{host}:{port}"
 
+    def _get_vllm_api_key(self) -> str | None:
+        server_cmd = self.server_cmd
+
+        if "--api-key" in server_cmd:
+            return server_cmd[server_cmd.index("--api-key") + 1]
+
+        return os.environ.get("VLLM_API_KEY")
+
     def is_server_ready(self) -> bool:
         server_address = self._get_vllm_server_address()
         try:
@@ -126,8 +134,11 @@ class ServerProcess:
             server_address = self._get_vllm_server_address()
             print(f"Resetting caches at {server_address}")
 
+            api_key = self._get_vllm_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+
             for endpoint in self.VLLM_RESET_CACHE_ENDPOINTS:
-                res = requests.post(server_address + endpoint)
+                res = requests.post(server_address + endpoint, headers=headers)
                 res.raise_for_status()
         elif server_cmd[0].endswith("infinity_emb"):
             if "--vector-disk-cache" in server_cmd:

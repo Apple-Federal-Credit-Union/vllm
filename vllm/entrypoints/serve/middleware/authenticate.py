@@ -19,13 +19,20 @@ class AuthenticationMiddleware:
     -----
     There are two cases in which authentication is skipped:
         1. The HTTP method is OPTIONS.
-        2. The request path doesn't start with GUARDED_PREFIX (e.g. /health).
+        2. The request path doesn't start with any of `guarded_prefixes`
+           (`GUARDED_PREFIX` by default, e.g. /health is not guarded).
 
     """
 
-    def __init__(self, app: ASGIApp, tokens: list[str]) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        tokens: list[str],
+        guarded_prefixes: tuple[str, ...] = GUARDED_PREFIX,
+    ) -> None:
         self.app = app
         self.api_tokens = [hashlib.sha256(t.encode("utf-8")).digest() for t in tokens]
+        self.guarded_prefixes = guarded_prefixes
 
     def verify_token(self, headers: Headers) -> bool:
         authorization_header_value = headers.get("Authorization")
@@ -56,7 +63,9 @@ class AuthenticationMiddleware:
         url_path = scope["path"].removeprefix(root_path)
         headers = Headers(scope=scope)
         # Type narrow to satisfy mypy.
-        if url_path.startswith(GUARDED_PREFIX) and not self.verify_token(headers):
+        if url_path.startswith(self.guarded_prefixes) and not self.verify_token(
+            headers
+        ):
             response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
             return response(scope, receive, send)
         return self.app(scope, receive, send)

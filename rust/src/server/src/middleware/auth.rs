@@ -15,6 +15,19 @@ use crate::state::{ApiKeyHash, AppState, hash_api_key};
 
 const GUARDED_PREFIXES: &[&str] = &["/v1", "/v2", "/inference"];
 
+/// Development routes that Python `vllm.entrypoints.serve.dev` also guards.
+const GUARDED_DEV_PATHS: &[&str] = &[
+    "/reset_prefix_cache",
+    "/reset_mm_cache",
+    "/reset_encoder_cache",
+    "/collective_rpc",
+    "/server_info",
+    "/sleep",
+    "/release_kv_cache_memory",
+    "/wake_up",
+    "/is_sleeping",
+];
+
 /// Authenticate guarded HTTP routes with an OpenAI-compatible bearer token.
 ///
 /// Mirrors Python `AuthenticationMiddleware`: OPTIONS requests and non-guarded
@@ -40,7 +53,10 @@ pub async fn authenticate_api_key(
 }
 
 fn requires_auth(path: &str) -> bool {
-    GUARDED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+    GUARDED_PREFIXES
+        .iter()
+        .chain(GUARDED_DEV_PATHS)
+        .any(|prefix| path.starts_with(prefix))
 }
 
 fn verify_token(authorization: Option<&HeaderValue>, api_key_hashes: &[ApiKeyHash]) -> bool {
