@@ -6,8 +6,11 @@ import itertools
 import json
 import logging
 import math
+import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import types
 from types import SimpleNamespace
@@ -5162,6 +5165,32 @@ def test_store_worker_close_swallows_store_errors():
     worker.close()
 
     assert worker.store is None
+
+
+def test_store_worker_close_removes_lookup_socket_dir(monkeypatch):
+    """Rank 0's random lookup directory is removed on worker shutdown."""
+    base = tempfile.mkdtemp(prefix="mc-lu-")
+    server = None
+    try:
+        monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", base)
+        server = worker.LookupKeyServer(MagicMock(), _make_vllm_config())
+        ipc_dir = server._ipc_dir
+        ipc_path = server._ipc_path
+        assert os.path.isdir(ipc_dir)
+        assert os.path.exists(ipc_path)
+
+        store_worker = _make_bare_worker()
+        store_worker.lookup_server = server
+        store_worker.close()
+        store_worker.close()
+
+        assert store_worker.lookup_server is None
+        assert not os.path.exists(ipc_path)
+        assert not os.path.isdir(ipc_dir)
+    finally:
+        if server is not None:
+            server.close()
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_blob_block_hashes_wire_roundtrip():

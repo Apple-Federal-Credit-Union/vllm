@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -738,14 +739,38 @@ def test_scheduler_reset_store_handles_rpc_exception():
     assert sched.reset_store() is False
 
 
+@contextlib.contextmanager
+def _lookup_credentials(vllm_config, *, present: bool):
+    """Install or clear in-process lookup credentials for one client."""
+    key = worker.get_zmq_rpc_path_lookup(vllm_config)
+    previous = worker._LOCAL_LOOKUP_CREDENTIALS.get(key)
+    if present:
+        worker._LOCAL_LOOKUP_CREDENTIALS[key] = protocol.LookupKeyCredentials(
+            "ipc://mooncake-lookup-test",
+            b"t" * protocol.AUTH_TOKEN_SIZE,
+        )
+    else:
+        worker._LOCAL_LOOKUP_CREDENTIALS.pop(key, None)
+    try:
+        yield
+    finally:
+        if previous is None:
+            worker._LOCAL_LOOKUP_CREDENTIALS.pop(key, None)
+        else:
+            worker._LOCAL_LOOKUP_CREDENTIALS[key] = previous
+
+
 def test_lookup_key_client_lookup_prepends_typed_tag():
     """LookupKeyClient.lookup() puts LOOKUP_MSG tag at frame 0."""
     vllm_config = _make_vllm_config()
 
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
+    with (
+        _lookup_credentials(vllm_config, present=True),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
         client = worker.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
@@ -766,10 +791,13 @@ def test_lookup_key_client_reset_uses_typed_protocol():
     """LookupKeyClient.reset() sends RESET_MSG and parses RESP_OK / RESP_ERR."""
     vllm_config = _make_vllm_config()
 
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
+    with (
+        _lookup_credentials(vllm_config, present=True),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
         client = worker.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
@@ -811,10 +839,13 @@ def test_lookup_key_client_non_block_lookup_async():
     Future resolves."""
     vllm_config = _make_vllm_config()
 
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
+    with (
+        _lookup_credentials(vllm_config, present=True),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
         client = worker.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
@@ -835,10 +866,13 @@ def test_lookup_key_client_discard_clears_state():
     """discard() drops a completed lookup Future so it is not served stale."""
     vllm_config = _make_vllm_config()
 
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
+    with (
+        _lookup_credentials(vllm_config, present=True),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
         client = worker.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
@@ -862,6 +896,56 @@ def test_lookup_key_client_discard_clears_state():
     gate.clear()
     assert client.lookup("req2", 128, [], non_block=True) is None
     gate.set()  # release the executor so the worker thread can drain
+
+
+def test_lookup_key_client_missing_credentials_rejects_without_blocking():
+    """No credentials must not send on the placeholder IPC path.
+
+    That path has no server. A blocking recv would occupy the client's only
+    thread, so later lookups and reset could never run.
+    """
+    vllm_config = _make_vllm_config()
+
+    with (
+        _lookup_credentials(vllm_config, present=False),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
+        client = worker.LookupKeyClient(vllm_config)
+        fake_socket = mock_make_socket.return_value
+
+        def _block(*args, **kwargs):
+            raise AssertionError("lookup socket should not be used")
+
+        fake_socket.send_multipart.side_effect = _block
+        fake_socket.recv.side_effect = _block
+
+        started = time.monotonic()
+        result = client.lookup("req-missing", 128, [])
+        assert result is not None
+        assert result.hit_length == 0
+        assert time.monotonic() - started < 1
+        assert client.reset() is False
+        fake_socket.send_multipart.assert_not_called()
+        fake_socket.recv.assert_not_called()
+
+        token = b"k" * protocol.AUTH_TOKEN_SIZE
+        fake_socket.send_multipart.side_effect = None
+        fake_socket.recv.side_effect = None
+        fake_socket.recv.return_value = (9).to_bytes(4, "big")
+        client.set_credentials(
+            protocol.LookupKeyCredentials("ipc://mooncake-lookup-test", token)
+        )
+        recovered = client.lookup("req-recovered", 128, [])
+
+    assert recovered is not None
+    assert recovered.hit_length == 9
+    sent = fake_socket.send_multipart.call_args[0][0]
+    assert sent[0] == protocol.LOOKUP_MSG
+    assert sent[1] == token
+    client.close()
 
 
 def test_get_num_new_matched_tokens_async_defers_then_reports():

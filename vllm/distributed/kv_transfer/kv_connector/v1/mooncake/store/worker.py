@@ -2284,13 +2284,21 @@ class MooncakeStoreWorker:
         """Release the MooncakeDistributedStore handle on teardown.
 
         Closing the store frees its TransferEngine, the registered RDMA
-        buffers, and the connection to the master server. Idempotent so it is
-        safe to call from both the explicit shutdown path and ``__del__``.
+        buffers, and the connection to the master server. Rank 0 also removes
+        its private lookup socket directory. Idempotent so it is safe to call
+        from both the explicit shutdown path and ``__del__``.
         """
         store = getattr(self, "store", None)
         if store is None:
             return
         self.store = None
+        lookup_server = getattr(self, "lookup_server", None)
+        self.lookup_server = None
+        if lookup_server is not None:
+            try:
+                lookup_server.close()
+            except Exception as e:
+                logger.warning("Error closing Mooncake lookup server: %s", e)
         deadline = time.monotonic() + 5.0
         for thread in (self.kv_send_thread, *self.kv_recv_threads):
             if thread is None:
@@ -2348,6 +2356,9 @@ class LookupKeyServer:
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
         )
+        # Idle recv must time out so close() can join this thread. Closing
+        # the socket from another thread does not interrupt it.
+        self.socket.setsockopt(zmq.RCVTIMEO, 100)  # type: ignore[attr-defined]
         os.chmod(self._ipc_path, 0o600)
         bound_dir_stat = os.lstat(self._ipc_dir)
         bound_stat = os.lstat(self._ipc_path)
@@ -2380,6 +2391,8 @@ class LookupKeyServer:
                 try:
                     frames = self.socket.recv_multipart(copy=False)
                     self.socket.send(self._handle_request(frames))
+                except zmq.Again:  # type: ignore[attr-defined]
+                    continue
                 except zmq.ZMQError:  # type: ignore[attr-defined]
                     if self.running:
                         logger.exception("LookupKeyServer socket failed.")
@@ -2441,8 +2454,15 @@ class LookupKeyServer:
             return RESP_ERR
 
     def close(self):
+        if not self.running and not self.thread.is_alive():
+            return
         self.running = False
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            logger.warning("Mooncake lookup server thread did not exit before close.")
         self.socket.close(linger=0)
+        if not self.thread.is_alive():
+            self.ctx.destroy(linger=0)
         if _LOCAL_LOOKUP_CREDENTIALS.get(self._local_key) is self.credentials:
             del _LOCAL_LOOKUP_CREDENTIALS[self._local_key]
         with contextlib.suppress(FileNotFoundError):
@@ -2503,16 +2523,23 @@ class LookupKeyClient:
         self.socket.close(linger=0)
         self.socket = self._connect()
 
-    def _request(self, msg_type: bytes, *payload: bytes) -> bytes:
-        if self._credentials is None:
+    def _request(self, msg_type: bytes, *payload: bytes) -> bytes | None:
+        """Send one admin request.
+
+        Returns None when credentials are missing. The placeholder endpoint
+        has no peer, and a blocking recv would wedge this client's only
+        thread.
+        """
+        credentials = self._credentials
+        if credentials is None:
             logger.warning_once(
                 "Mooncake lookup client has not received credentials for worker "
                 "rank 0's LookupKeyServer; its requests cannot be served."
             )
-            auth_token = b""
-        else:
-            auth_token = self._credentials.auth_token
-        self.socket.send_multipart((msg_type, auth_token, *payload), copy=False)
+            return None
+        self.socket.send_multipart(
+            (msg_type, credentials.auth_token, *payload), copy=False
+        )
         return self.socket.recv()
 
     def _lookup(
@@ -2525,6 +2552,8 @@ class LookupKeyClient:
             hash_len.to_bytes(LOOKUP_HASH_LEN_SIZE, byteorder="big"),
             b"".join(block_hashes),
         )
+        if resp is None:
+            return MooncakeLookupResult(0)
         return decode_lookup_response(resp)
 
     def lookup(
@@ -2562,9 +2591,11 @@ class LookupKeyClient:
         Ordering assumption: caller MUST ensure no in-flight Mooncake
         lookups or transfers when invoking reset. In RL workflows this
         holds naturally at the step boundary after weight updates and
-        rollout drain. Returns True on ACK, False on NACK.
+        rollout drain. Returns True on ACK, False on NACK or when this
+        client has no server credentials.
         """
-        return bytes(self._request(RESET_MSG)) == RESP_OK
+        resp = self._request(RESET_MSG)
+        return resp is not None and bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
         return self.executor.submit(self._reset).result()
