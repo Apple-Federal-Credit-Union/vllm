@@ -782,19 +782,27 @@ def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
 _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
 
 
+def _request_chat_template_uses_pow(chat_template: str) -> bool:
+    parsed_content = _parse_chat_template(chat_template)
+    return next(parsed_content.find_all(jinja2.nodes.Pow), None) is not None
+
+
 def validate_request_chat_template(chat_template: object) -> None:
     """Refuse a request-supplied template that the render timeout cannot stop.
 
     Integer ``**`` runs as a single native call that holds the GIL, so a large
-    exponent stalls the whole process and cannot be interrupted.
+    exponent stalls the whole process and cannot be interrupted. Parsing runs
+    under that same timeout. Jinja's parser is recursive, so a nested template
+    raises ``RecursionError`` rather than ``jinja2.TemplateError``, and a large
+    template would otherwise block the serving thread before the watchdog runs.
     """
     if not isinstance(chat_template, str):
         raise VLLMValidationError("chat_template must be a string.")
     try:
-        parsed_content = _parse_chat_template(chat_template)
-    except jinja2.TemplateError as e:
+        uses_pow = render_with_timeout(_request_chat_template_uses_pow, chat_template)
+    except Exception as e:
         raise VLLMValidationError(str(e)) from e
-    if next(parsed_content.find_all(jinja2.nodes.Pow), None) is not None:
+    if uses_pow:
         raise VLLMValidationError(
             "Request-supplied chat templates may not use the '**' operator."
         )
