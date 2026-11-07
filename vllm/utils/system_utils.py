@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import hashlib
 import logging
 import multiprocessing
 import os
@@ -105,6 +106,32 @@ def unique_filepath(fn: Callable[[int], Path]) -> Path:
         if not p.exists():
             return p
         i += 1
+
+
+# Leaves room for a suffix such as ".safetensors.lock" under NAME_MAX (255).
+_MAX_PATH_COMPONENT_BYTES = 200
+
+
+def path_component_from_id(identifier: str) -> str:
+    """Map an untrusted id to a single file name that is safe to join.
+
+    Returns ``identifier`` unchanged when it is already one plain path
+    component, otherwise its SHA-256 hex digest. The result never contains a
+    separator, is never ``.``/``..`` or absolute, so ``os.path.join(root,
+    result)`` always names a direct child of ``root``. The mapping is
+    deterministic, so processes deriving a path from the same id agree on it.
+    """
+    encoded = identifier.encode("utf-8", "surrogatepass")
+    if (
+        0 < len(encoded) <= _MAX_PATH_COMPONENT_BYTES
+        and identifier not in (os.curdir, os.pardir)
+        and "/" not in identifier
+        and os.sep not in identifier
+        and (os.altsep is None or os.altsep not in identifier)
+        and "\0" not in identifier
+    ):
+        return identifier
+    return hashlib.sha256(encoded).hexdigest()
 
 
 # Process management utilities

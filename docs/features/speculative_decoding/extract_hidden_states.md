@@ -67,7 +67,7 @@ Both offline and online modes support per-request options via `kv_transfer_param
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `hidden_states_path` | Auto-generated | Custom file path for saving hidden states. If not set, files are saved to `<shared_storage_path>/<request_id>.safetensors`. Requires `allow_custom_save_path` to be enabled in the server config. |
+| `hidden_states_path` | Auto-generated | Custom file path for saving hidden states. If not set, files are saved to `<shared_storage_path>/<request_id>.safetensors`, with the request id replaced by its SHA-256 hex digest if it is not a single plain file name (e.g. it contains `/`). Requires `allow_custom_save_path` to be enabled in the server config. |
 | `include_output_tokens` | `False` | When `True`, save hidden states for both prompt and generated output tokens. When `False`, only prompt token hidden states are saved. |
 
 ### Offline usage

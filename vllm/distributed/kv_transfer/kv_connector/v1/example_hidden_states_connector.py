@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.utils.system_utils import path_component_from_id
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -495,7 +496,8 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         # pre-create lock files before the client receives the output path.
         for new_req in scheduler_output.scheduled_new_reqs:
             default_path = os.path.join(
-                self._storage_path, f"{new_req.req_id}.safetensors"
+                self._storage_path,
+                f"{path_component_from_id(new_req.req_id)}.safetensors",
             )
             kv_params = (
                 new_req.sampling_params.extra_args.get("kv_transfer_params")

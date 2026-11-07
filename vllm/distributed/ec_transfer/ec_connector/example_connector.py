@@ -18,6 +18,7 @@ from vllm.distributed.ec_transfer.ec_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.utils.system_utils import path_component_from_id
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -214,7 +215,7 @@ class ECExampleConnector(ECConnectorBase):
         If `create_folder` is True (default) the directory is created
         recursively the first time it is needed.
         """
-        foldername = os.path.join(self._storage_path, mm_hash)
+        foldername = os.path.join(self._storage_path, path_component_from_id(mm_hash))
         if create_folder:
             os.makedirs(foldername, exist_ok=True)
         return foldername
