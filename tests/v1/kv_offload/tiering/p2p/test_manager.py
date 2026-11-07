@@ -1295,10 +1295,11 @@ class TestBidirectionalManager:
                 mgr._local_id = f"127.0.0.1:{port}"
                 mgr._data = _FakeData(mgr._local_id)
                 managers.append(mgr)
-                monitors.append(
-                    mgr._control._router.get_monitor_socket(zmq.EVENT_DISCONNECTED)  # type: ignore[attr-defined]
-                )
             mgr_a, mgr_b = managers
+            # Only B's ROUTER holds a TCP connection: A's outbound DEALER.
+            monitors.append(
+                mgr_b._control._router.get_monitor_socket(zmq.EVENT_DISCONNECTED)  # type: ignore[attr-defined]
+            )
             peer_a, peer_b = mgr_a._local_id, mgr_b._local_id
             port_b = int(peer_b.rsplit(":", 1)[1])
 

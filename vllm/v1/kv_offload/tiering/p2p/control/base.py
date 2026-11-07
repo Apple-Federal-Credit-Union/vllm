@@ -44,6 +44,8 @@ Implementor contracts
 - Messages may arrive from unknown peers (new inbound connections).
   The transport creates a ControlConnection and returns it from poll()
   with the first message(s) already in its recv() buffer.
+- An inbound connection's peer_id is asserted by the peer. Replies travel
+  over the connection the peer opened; peer_id is never dialed.
 """
 
 from __future__ import annotations

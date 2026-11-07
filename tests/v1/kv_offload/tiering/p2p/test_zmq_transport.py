@@ -220,7 +220,7 @@ class TestZmqTransportConnectivity:
             # Pruning is synchronous within poll().
             transport_a.poll()
             assert len(transport_a._connections) == 0
-            assert new_conns[0]._sockets.dealer.closed
+            assert new_conns[0]._closed
         finally:
             transport_a.close()
             transport_b.close()

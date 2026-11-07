@@ -82,12 +82,11 @@ class _Sockets:
     monitor: zmq.Socket
 
 
-class ZmqConnection(ControlConnection):
-    """Bidirectional message channel to a single remote peer."""
+class _BaseZmqConnection(ControlConnection):
+    """Inbox and liveness shared by outbound and accepted connections."""
 
-    def __init__(self, peer_id: str, sockets: _Sockets) -> None:
+    def __init__(self, peer_id: str) -> None:
         super().__init__(peer_id)
-        self._sockets = sockets
         # _dead: the peer is gone. _closed: the sockets have been released.
         # Distinct, so mark_dead() cannot turn close() into a no-op and leak
         # the DEALER and its monitor socket.
@@ -108,11 +107,14 @@ class ZmqConnection(ControlConnection):
             )
         data = msgspec.msgpack.encode(msg)
         try:
-            self._sockets.dealer.send(data, zmq.NOBLOCK)
+            self._send_bytes(data)
         except zmq.Again as exc:
             raise ConnectionError(
                 f"ZmqConnection: send queue to {self.peer_id} is full"
             ) from exc
+
+    def _send_bytes(self, data: bytes) -> None:
+        raise NotImplementedError
 
     def recv(self) -> Sequence[dict]:
         """Drain and return all buffered incoming messages."""
@@ -132,8 +134,10 @@ class ZmqConnection(ControlConnection):
         self._closed = True
         self._dead = True
         logger.info("ZmqConnection: closing connection to %s", self.peer_id)
-        self._sockets.monitor.close()
-        self._sockets.dealer.close()
+        self._release()
+
+    def _release(self) -> None:
+        return None
 
     def enqueue(self, msg: dict) -> None:
         """Buffer an incoming message."""
@@ -147,25 +151,76 @@ class ZmqConnection(ControlConnection):
         """
         self._dead = True
 
+
+class ZmqConnection(_BaseZmqConnection):
+    """Outbound channel: a DEALER dialed to the peer's ROUTER."""
+
+    def __init__(self, peer_id: str, sockets: _Sockets) -> None:
+        super().__init__(peer_id)
+        self._sockets = sockets
+
+    def _send_bytes(self, data: bytes) -> None:
+        self._sockets.dealer.send(data, zmq.NOBLOCK)
+
+    def _release(self) -> None:
+        self._sockets.monitor.close()
+        self._sockets.dealer.close()
+
+    @property
+    def dealer_socket(self) -> zmq.Socket:
+        """DEALER the peer replies on (used by ZmqTransport)."""
+        return self._sockets.dealer
+
     @property
     def monitor_socket(self) -> zmq.Socket:
         """Monitor socket for disconnect detection (used by ZmqTransport)."""
         return self._sockets.monitor
 
 
+class _AcceptedConnection(_BaseZmqConnection):
+    """Inbound channel: replies go back over the ROUTER connection it came on.
+
+    The routing id is chosen by the peer, so it is only a label. It is never
+    parsed or dialed.
+    """
+
+    def __init__(
+        self, peer_id: str, router: zmq.Socket, routing_id: bytes, fd: int
+    ) -> None:
+        super().__init__(peer_id)
+        self._router = router
+        self._routing_id = routing_id
+        # fd of the TCP connection the ROUTER binds the routing id to.
+        self.fd = fd
+
+    def _send_bytes(self, data: bytes) -> None:
+        try:
+            self._router.send_multipart([self._routing_id, data], zmq.NOBLOCK)
+        except zmq.ZMQError as exc:
+            if exc.errno != zmq.EHOSTUNREACH:
+                raise
+            self.mark_dead()
+            raise ConnectionError(
+                f"ZmqConnection: peer {self.peer_id} is no longer connected"
+            ) from exc
+
+
 class ZmqTransport(ControlTransport):
     """ZMQ implementation of ControlTransport.
 
     Manages a ROUTER socket for accepting connections and DEALER sockets
-    for outbound connections. Message-content agnostic.
+    for outbound connections. Inbound peers are answered over the ROUTER
+    connection they opened; only connect() dials an address. Message-content
+    agnostic.
     """
 
     def __init__(self, local_id: str, host: str, port: int) -> None:
         self._local_id = local_id
         self._closed = False
 
-        self._connections: dict[str, ZmqConnection] = {}
-        self._pending_inbound: list[tuple[str, dict]] = []
+        self._connections: dict[str, _BaseZmqConnection] = {}
+        # (peer_id, routing_id, source fd, message) from the ROUTER.
+        self._pending_inbound: list[tuple[str, bytes, int, dict]] = []
         # Monotonic suffix for inproc monitor endpoints — see
         # _open_connection() for why peer_id alone is not enough.
         self._monitor_seq = 0
@@ -173,9 +228,19 @@ class ZmqTransport(ControlTransport):
         self._zmq_ctx = zmq.Context()
         self._router: zmq.Socket = self._zmq_ctx.socket(zmq.ROUTER)
         _apply_heartbeat(self._router)
+        self._router.setsockopt(zmq.SNDHWM, _SNDHWM)
+        # Fail sends to a routing id with no live connection instead of
+        # silently dropping them, so the owning session is marked dead.
+        self._router.setsockopt(zmq.ROUTER_MANDATORY, 1)
         bind_addr = _tcp_addr(host, port)
         self._router.bind(bind_addr)
         logger.info("ZmqTransport %s: ROUTER bound on %s", self._local_id, bind_addr)
+        # Reports the fd of each dropped inbound TCP connection; matched
+        # against _AcceptedConnection.fd to retire the peer's connection.
+        router_monitor_addr = "inproc://p2p-router-monitor"
+        self._router.monitor(router_monitor_addr, zmq.EVENT_DISCONNECTED)
+        self._router_monitor: zmq.Socket = self._zmq_ctx.socket(zmq.PAIR)
+        self._router_monitor.connect(router_monitor_addr)
 
     # ------------------------------------------------------------------
     # ZmqConnection lifecycle
@@ -204,13 +269,14 @@ class ZmqTransport(ControlTransport):
             self._local_id,
             peer_id,
         )
-        return self._open_connection(peer_id, direction="outbound")
+        return self._open_connection(peer_id)
 
     def poll(self) -> Sequence[ControlConnection]:
         """Process all pending I/O. Returns newly accepted connections.
 
         - Receives messages (buffered in each connection's inbox)
-        - Creates connections for new inbound peers (connect msg in inbox)
+        - Creates connections for new inbound peers (connect msg in inbox);
+          these reply over the ROUTER and never dial the peer's routing id
         - Checks monitors for disconnections
         - Removes and closes dead connections
         """
@@ -224,12 +290,16 @@ class ZmqTransport(ControlTransport):
         self._sweep_dead_connections()
 
         self._recv_router()
+        self._recv_dealers()
+        # After _recv_router(): a dropped connection's DISCONNECTED event is
+        # emitted before its fd can carry a new connection's messages, so
+        # every event older than the messages just read is visible here.
         self._check_monitors()
         self._sweep_dead_connections()
 
         # Create connections for new inbound peers
         new_connections: list[ControlConnection] | None = None
-        for sender_id, msg in self._pending_inbound:
+        for sender_id, routing_id, fd, msg in self._pending_inbound:
             conn = self._connections.get(sender_id)
             if conn is None:
                 logger.info(
@@ -237,10 +307,13 @@ class ZmqTransport(ControlTransport):
                     self._local_id,
                     sender_id,
                 )
-                conn = self._open_connection(sender_id, direction="inbound")
+                conn = _AcceptedConnection(sender_id, self._router, routing_id, fd)
+                self._connections[sender_id] = conn
                 if new_connections is None:
                     new_connections = []
                 new_connections.append(conn)
+            elif isinstance(conn, _AcceptedConnection):
+                conn.fd = fd
             conn.enqueue(msg)
         self._pending_inbound.clear()
 
@@ -257,6 +330,7 @@ class ZmqTransport(ControlTransport):
             conn.close()
         self._connections.clear()
 
+        self._router_monitor.close(linger=0)
         self._router.setsockopt(zmq.LINGER, 0)
         self._router.close()
         self._zmq_ctx.destroy(linger=0)
@@ -265,17 +339,14 @@ class ZmqTransport(ControlTransport):
     # Internal
     # ------------------------------------------------------------------
 
-    def _open_connection(
-        self, peer_id: str, direction: str = "outbound"
-    ) -> ZmqConnection:
+    def _open_connection(self, peer_id: str) -> ZmqConnection:
         """Create a DEALER socket + monitor and register the connection."""
         host, port_str = peer_id.rsplit(":", 1)
         dealer_addr = _tcp_addr(host, port_str)
 
         logger.debug(
-            "ZmqTransport %s: creating DEALER for %s peer %s -> %s",
+            "ZmqTransport %s: creating DEALER for peer %s -> %s",
             self._local_id,
-            direction,
             peer_id,
             dealer_addr,
         )
@@ -306,9 +377,9 @@ class ZmqTransport(ControlTransport):
         conn = ZmqConnection(peer_id, sockets)
         self._connections[peer_id] = conn
         logger.info(
-            "ZmqTransport %s: %s connection established to %s (active connections: %d)",
+            "ZmqTransport %s: outbound connection established to %s "
+            "(active connections: %d)",
             self._local_id,
-            direction,
             peer_id,
             len(self._connections),
         )
@@ -319,11 +390,23 @@ class ZmqTransport(ControlTransport):
         for pid in [p for p, c in self._connections.items() if not c.alive]:
             self._connections.pop(pid).close()
 
+    def _decode(self, sender_id: str, data: bytes) -> dict | None:
+        try:
+            return msgspec.msgpack.decode(data)
+        except Exception as exc:
+            logger.warning(
+                "ZmqTransport %s: failed to decode message from %s: %s",
+                self._local_id,
+                sender_id,
+                exc,
+            )
+            return None
+
     def _recv_router(self) -> None:
         """Non-blocking: receive all pending messages from ROUTER."""
         while True:
             try:
-                frames = self._router.recv_multipart(zmq.NOBLOCK)
+                frames = self._router.recv_multipart(zmq.NOBLOCK, copy=False)
             except zmq.Again:
                 break
             except zmq.ZMQError as exc:
@@ -338,8 +421,17 @@ class ZmqTransport(ControlTransport):
                 )
                 continue
 
-            identity, data = frames
-            sender_id = identity.decode()
+            routing_id = frames[0].bytes
+            data = frames[1].bytes
+            fd = frames[1].get(zmq.SRCFD)
+            try:
+                sender_id = routing_id.decode()
+            except UnicodeDecodeError:
+                logger.warning(
+                    "ZmqTransport %s: dropping message from non-UTF-8 routing id",
+                    self._local_id,
+                )
+                continue
 
             logger.debug(
                 "ZmqTransport %s: ROUTER recv from %s (%d bytes)",
@@ -348,28 +440,82 @@ class ZmqTransport(ControlTransport):
                 len(data),
             )
 
-            try:
-                msg = msgspec.msgpack.decode(data)
-            except Exception as exc:
-                logger.warning(
-                    "ZmqTransport %s: failed to decode message from %s: %s",
-                    self._local_id,
-                    sender_id,
-                    exc,
-                )
+            msg = self._decode(sender_id, data)
+            if msg is None:
                 continue
 
             conn = self._connections.get(sender_id)
-
-            if conn is not None:
+            # The ROUTER binds a routing id to one live TCP connection, so a
+            # message on another fd means the earlier connection is gone.
+            if isinstance(conn, _AcceptedConnection) and conn.fd != fd:
+                conn.mark_dead()
+            if conn is not None and conn.alive:
                 conn.enqueue(msg)
             else:
-                self._pending_inbound.append((sender_id, msg))
+                self._pending_inbound.append((sender_id, routing_id, fd, msg))
+
+    def _recv_dealers(self) -> None:
+        """Non-blocking: receive replies on outbound DEALER sockets."""
+        for conn in self._connections.values():
+            if not isinstance(conn, ZmqConnection) or not conn.alive:
+                continue
+            while True:
+                try:
+                    frames = conn.dealer_socket.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                except zmq.ZMQError as exc:
+                    logger.warning(
+                        "ZmqTransport %s: recv error for peer %s: %s",
+                        self._local_id,
+                        conn.peer_id,
+                        exc,
+                    )
+                    break
+                if len(frames) != 1:
+                    logger.warning(
+                        "ZmqTransport %s: dropping message with %d frames "
+                        "(expected 1) from %s",
+                        self._local_id,
+                        len(frames),
+                        conn.peer_id,
+                    )
+                    continue
+                msg = self._decode(conn.peer_id, frames[0])
+                if msg is not None:
+                    conn.enqueue(msg)
+
+    def _check_router_monitor(self) -> None:
+        """Mark accepted connections whose TCP connection dropped as dead."""
+        while True:
+            try:
+                event = zmq.utils.monitor.recv_monitor_message(
+                    self._router_monitor, zmq.NOBLOCK
+                )
+            except zmq.Again:
+                return
+            except zmq.ZMQError as exc:
+                logger.warning(
+                    "ZmqTransport %s: ROUTER monitor error: %s", self._local_id, exc
+                )
+                return
+            if event["event"] != zmq.EVENT_DISCONNECTED:
+                continue
+            fd = int(event["value"])
+            for conn in self._connections.values():
+                if isinstance(conn, _AcceptedConnection) and conn.fd == fd:
+                    logger.debug(
+                        "ZmqTransport %s: inbound peer %s disconnected",
+                        self._local_id,
+                        conn.peer_id,
+                    )
+                    conn.mark_dead()
 
     def _check_monitors(self) -> None:
         """Non-blocking: check all monitor sockets for fatal events."""
+        self._check_router_monitor()
         for conn in self._connections.values():
-            if not conn.alive:
+            if not isinstance(conn, ZmqConnection) or not conn.alive:
                 continue
             while True:
                 try:
