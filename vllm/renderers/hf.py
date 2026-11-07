@@ -764,18 +764,40 @@ class AssistantTracker(jinja2.ext.Extension):
         return call_block.set_lineno(lineno)
 
 
-def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
+def _parse_chat_template(chat_template: str) -> jinja2.nodes.Template:
     env = jinja2.sandbox.ImmutableSandboxedEnvironment(
         trim_blocks=True,
         lstrip_blocks=True,
         extensions=[AssistantTracker, jinja2.ext.loopcontrols],
     )
-    parsed_content = env.parse(chat_template)
+    return env.parse(chat_template)
+
+
+def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
+    parsed_content = _parse_chat_template(chat_template)
     template_vars = jinja2.meta.find_undeclared_variables(parsed_content)
     return template_vars
 
 
 _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
+
+
+def validate_request_chat_template(chat_template: object) -> None:
+    """Refuse a request-supplied template that the render timeout cannot stop.
+
+    Integer ``**`` runs as a single native call that holds the GIL, so a large
+    exponent stalls the whole process and cannot be interrupted.
+    """
+    if not isinstance(chat_template, str):
+        raise VLLMValidationError("chat_template must be a string.")
+    try:
+        parsed_content = _parse_chat_template(chat_template)
+    except jinja2.TemplateError as e:
+        raise VLLMValidationError(str(e)) from e
+    if next(parsed_content.find_all(jinja2.nodes.Pow), None) is not None:
+        raise VLLMValidationError(
+            "Request-supplied chat templates may not use the '**' operator."
+        )
 
 
 @lru_cache

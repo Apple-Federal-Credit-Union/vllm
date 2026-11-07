@@ -16,6 +16,7 @@ from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.chat_utils import (
     ChatTemplateConfig,
 )
+from vllm.renderers.hf import validate_request_chat_template
 from vllm.renderers.inputs.preprocess import parse_model_prompt, prompt_to_seq
 from vllm.utils.async_utils import make_async
 from vllm.utils.mistral import is_mistral_tokenizer
@@ -290,18 +291,22 @@ class PoolingIOProcessor:
         chat_template_kwargs: dict[str, Any] | None,
         trust_request_chat_template: bool,
     ):
-        if not trust_request_chat_template and (
-            request_chat_template is not None
-            or (
-                chat_template_kwargs
-                and chat_template_kwargs.get("chat_template") is not None
+        request_templates = [
+            template
+            for template in (
+                request_chat_template,
+                (chat_template_kwargs or {}).get("chat_template"),
             )
-        ):
+            if template is not None
+        ]
+        if request_templates and not trust_request_chat_template:
             raise VLLMValidationError(
                 "Chat template is passed with request, but "
                 "--trust-request-chat-template is not set. "
                 "Refused request with untrusted chat template."
             )
+        for template in request_templates:
+            validate_request_chat_template(template)
         return None
 
     def _params_to_seq(
