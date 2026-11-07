@@ -138,14 +138,11 @@ class P2PSession:
         self._local_hash_seed = local_hash_seed
         self._conn: ControlConnection | None = None
 
-        # Control-channel authentication. ``initiator`` is True when we dialed
-        # the peer and False when we accepted their inbound connection. The
-        # producer (serving) side is always the acceptor, so an acceptor never
-        # discloses agent metadata or a hash seed, registers the peer's RDMA
-        # memory, or serves a block until the peer's ConnectMsg carries a valid
-        # tag. The tag we send and the one we require are bound to opposite
-        # directions, so a peer cannot pass by echoing ours back. With no PSK
-        # configured there is no tag, so inbound peers are refused.
+        # ``initiator`` is False for an accepted inbound connection, which is
+        # always the serving side. An acceptor discloses nothing, registers
+        # nothing, and serves nothing until the peer presents a valid tag.
+        # Sent and expected tags bind opposite directions so an echoed tag
+        # fails. Without a PSK there is no tag, so inbound peers are refused.
         self._local_psk = local_psk or None
         self._initiator = initiator
         self._connect_sent = False
@@ -323,10 +320,8 @@ class P2PSession:
         """Resolve inbound peer lookups against the tiering manager.
 
         Delegates to the server role; the ``parent`` handle is valid
-        only for the duration of this call. An unauthenticated peer is never
-        served: until the handshake completes (``ready``) the session holds no
-        peer registration, so resolving its lookups could only pin primary
-        slots for a peer that can receive nothing.
+        only for the duration of this call. Skipped until the handshake
+        completes, so an unauthenticated peer never pins primary slots.
         """
         if not self._send_ready:
             return
@@ -636,9 +631,8 @@ class P2PSession:
                     f"local={self._local_hash_seed!r}. Ensure PYTHONHASHSEED "
                     "(if set) matches on all P2P peers."
                 )
-            # The peer is authenticated; an acceptor may now disclose its own
-            # metadata so the peer can register it. Done before the remote
-            # registration below so both registrations proceed in parallel.
+            # Only now may an acceptor disclose its metadata. Sent before the
+            # registration below so both sides register in parallel.
             if not self._connect_sent:
                 self._send_connect()
             registration = self._transport.add_remote_peer_async(
