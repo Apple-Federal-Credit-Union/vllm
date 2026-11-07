@@ -2315,14 +2315,6 @@ class MooncakeStoreWorker:
 # ============================================================
 
 
-def _is_private_dir(st: os.stat_result) -> bool:
-    return (
-        stat.S_ISDIR(st.st_mode)
-        and st.st_uid == os.geteuid()
-        and stat.S_IMODE(st.st_mode) & 0o077 == 0
-    )
-
-
 class LookupKeyServer:
     """ZMQ server on worker rank 0 for the LookupKey admin channel.
 
@@ -2362,7 +2354,9 @@ class LookupKeyServer:
         if (
             (bound_dir_stat.st_dev, bound_dir_stat.st_ino)
             != (dir_stat.st_dev, dir_stat.st_ino)
-            or not _is_private_dir(bound_dir_stat)
+            or not stat.S_ISDIR(bound_dir_stat.st_mode)
+            or bound_dir_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(bound_dir_stat.st_mode) & 0o077
             or not stat.S_ISSOCK(bound_stat.st_mode)
             or bound_stat.st_uid != os.geteuid()
         ):
