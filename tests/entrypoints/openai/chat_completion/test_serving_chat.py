@@ -3157,7 +3157,8 @@ async def test_chat_ignores_kv_transfer_prompt_token_ids(ids, echo):
     plain = ChatCompletionRequest(model=MODEL_NAME, messages=messages, echo=echo)
     plain_result = await serving_chat.render_chat_request(plain)
     assert not isinstance(plain_result, ErrorResponse)
-    expected = plain_result[1][0]["prompt_token_ids"]
+    expected = plain_result[1][0]
+    assert expected["type"] == "token"
 
     request = ChatCompletionRequest(
         model=MODEL_NAME,
@@ -3168,9 +3169,10 @@ async def test_chat_ignores_kv_transfer_prompt_token_ids(ids, echo):
     result = await serving_chat.render_chat_request(request)
     assert not isinstance(result, ErrorResponse)
 
-    conversation, engine_inputs = result
+    conversation, (engine_input,) = result
     assert [msg["role"] for msg in conversation] == ["user"]
-    assert engine_inputs[0]["prompt_token_ids"] == expected
+    assert engine_input["type"] == "token"
+    assert engine_input["prompt_token_ids"] == expected["prompt_token_ids"]
     assert request.kv_transfer_params == {"do_remote_prefill": True}
 
 

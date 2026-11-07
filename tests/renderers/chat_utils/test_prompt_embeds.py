@@ -198,10 +198,7 @@ async def test_reasoning_embeds_render_before_content(
                 },
             }
         ],
-        kv_transfer_params={"prompt_token_ids": [1, 2, 3]},
     )
-    assert request.kv_transfer_params is not None
-    assert "prompt_token_ids" not in request.kv_transfer_params
     mc = _make_mock_model_config()
     mc.renderer_num_workers = 1
     mc.supports_multimodal_inputs = False

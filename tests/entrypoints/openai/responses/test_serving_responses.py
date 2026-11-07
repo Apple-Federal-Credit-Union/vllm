@@ -463,7 +463,9 @@ async def test_responses_ignore_kv_transfer_prompt_token_ids(
 
     assert not isinstance(result, ErrorResponse)
     render_chat.assert_awaited_once()
-    assert result.engine_input["prompt_token_ids"] == [1, 2]
+    engine_input = result.engine_input
+    assert engine_input["type"] == "token"
+    assert engine_input["prompt_token_ids"] == [1, 2]
     assert request.kv_transfer_params == {"do_remote_prefill": True}
 
 
