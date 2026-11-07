@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-import asyncio
 import copy
 import inspect
 import itertools
@@ -21,7 +20,6 @@ import jinja2.sandbox
 import torch
 from typing_extensions import override
 
-from vllm import envs
 from vllm.exceptions import ChatTemplateResolutionError, VLLMValidationError
 from vllm.inputs import EmbedsPrompt
 from vllm.inputs.engine import MultiModalInput
@@ -56,6 +54,7 @@ from vllm.utils.func_utils import supports_kw
 
 from .base import BaseRenderer
 from .inputs.preprocess import parse_dec_only_prompt
+from .render_timeout import render_with_timeout
 
 if TYPE_CHECKING:
     from collections.abc import Set
@@ -765,18 +764,40 @@ class AssistantTracker(jinja2.ext.Extension):
         return call_block.set_lineno(lineno)
 
 
-def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
+def _parse_chat_template(chat_template: str) -> jinja2.nodes.Template:
     env = jinja2.sandbox.ImmutableSandboxedEnvironment(
         trim_blocks=True,
         lstrip_blocks=True,
         extensions=[AssistantTracker, jinja2.ext.loopcontrols],
     )
-    parsed_content = env.parse(chat_template)
+    return env.parse(chat_template)
+
+
+def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
+    parsed_content = _parse_chat_template(chat_template)
     template_vars = jinja2.meta.find_undeclared_variables(parsed_content)
     return template_vars
 
 
 _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
+
+
+def validate_request_chat_template(chat_template: object) -> None:
+    """Refuse a request-supplied template that the render timeout cannot stop.
+
+    Integer ``**`` runs as a single native call that holds the GIL, so a large
+    exponent stalls the whole process and cannot be interrupted.
+    """
+    if not isinstance(chat_template, str):
+        raise VLLMValidationError("chat_template must be a string.")
+    try:
+        parsed_content = _parse_chat_template(chat_template)
+    except jinja2.TemplateError as e:
+        raise VLLMValidationError(str(e)) from e
+    if next(parsed_content.find_all(jinja2.nodes.Pow), None) is not None:
+        raise VLLMValidationError(
+            "Request-supplied chat templates may not use the '**' operator."
+        )
 
 
 @lru_cache
@@ -911,13 +932,16 @@ def safe_apply_chat_template(
         resolved_kwargs["return_dict"] = False
 
     try:
-        plain = tokenizer.apply_chat_template(
+        plain = render_with_timeout(
+            tokenizer.apply_chat_template,
             conversation=conversation,  # type: ignore[arg-type]
             tools=tools,  # type: ignore[arg-type]
             chat_template=chat_template,
             tokenize=tokenize,
             **resolved_kwargs,
         )
+    except TimeoutError:
+        raise
     except Exception as e:
         # Chat templates reject invalid user input (e.g. an unsupported
         # `reasoning_effort` value) by raising from within the template.
@@ -1058,44 +1082,6 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             maybe_make_thread_pool(
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
-
-    def _replace_executor(self) -> None:
-        """Replace the inner render pool after a stuck worker.
-
-        Called after a render timeout so that the stuck thread (which CPython
-        cannot interrupt) does not permanently block all subsequent renders.
-        The executor *object* is kept so ``make_async`` wrappers bound at
-        init (tokenize, decode, pooling, derender) keep submitting work.
-        The old inner pool is abandoned with wait=False — its thread will
-        eventually finish or be reaped on process exit.
-        """
-        self._executor.replace_inner()
-        logger.warning(
-            "Chat template render timed out — executor pool replaced "
-            "(%d worker(s)). The stuck thread may continue consuming "
-            "CPU until the process exits.",
-            self.model_config.renderer_num_workers,
-        )
-
-    async def _render_with_timeout(self, coro):
-        """Run a template-rendering coroutine with a timeout.
-
-        On timeout, replaces the executor so subsequent renders are not
-        permanently blocked by the stuck thread.
-        """
-        timeout = envs.VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT
-        if timeout <= 0:
-            return await coro
-        try:
-            return await asyncio.wait_for(coro, timeout=timeout)
-        except TimeoutError:
-            self._replace_executor()
-            raise TimeoutError(
-                f"Chat template rendering timed out after "
-                f"{timeout}s. This may indicate a malicious or "
-                f"excessively complex template. Adjust "
-                f"VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT to override."
-            ) from None
 
     def _can_produce_offsets(self) -> bool:
         # Only fast tokenizers expose offset_mapping.
@@ -1265,13 +1251,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         if prompt_embeds_tensors:
             visibility_check_kwargs = chat_template_kwargs.copy()
             visibility_check_kwargs["tokenize"] = False
-            rendered = await self._render_with_timeout(
-                self._apply_chat_template_async(
-                    model_config,
-                    tokenizer,
-                    conversation,
-                    **visibility_check_kwargs,
-                )
+            rendered = await self._apply_chat_template_async(
+                model_config,
+                tokenizer,
+                conversation,
+                **visibility_check_kwargs,
             )
             assert isinstance(rendered, str)
             prompt_embeds_tensors, conversation = _filter_prompt_embeds_by_template(
@@ -1286,13 +1270,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
 
-        prompt_raw = await self._render_with_timeout(
-            self._apply_chat_template_async(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
-            )
+        prompt_raw = await self._apply_chat_template_async(
+            model_config,
+            tokenizer,
+            conversation,
+            **chat_template_kwargs,
         )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
