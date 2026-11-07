@@ -18,6 +18,7 @@ from .base import BaseRenderer
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
 from .params import ChatParams
+from .render_timeout import render_with_timeout
 
 # Keep the original image mode (including the alpha channel) for K3 instead of
 # flattening images onto a background color. Server-level (--media-io-kwargs)
@@ -170,7 +171,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         if params.response_format is not None:
             kwargs["response_format"] = _dump_k3_template_value(params.response_format)
         kwargs["tokenize"] = True
-        return self.get_tokenizer().apply_chat_template(conversation, **kwargs)
+        return render_with_timeout(
+            self.get_tokenizer().apply_chat_template, conversation, **kwargs
+        )
 
     def render_messages(
         self,
