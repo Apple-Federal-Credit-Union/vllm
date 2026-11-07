@@ -337,9 +337,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         dp_index = offloading_spec.config.parallel.data_parallel_index
         port = int(port) + dp_index
         # Two decoupled identities:
-        #   _local_id (``host:port``): the ZMQ control identity that peers
-        #     dial back, used verbatim (the socket binds this host/port and
-        #     the address is parsed back into host:port by the remote).
+        #   _local_id (``host:port``): the ZMQ control identity this node
+        #     announces on its outbound connections; peers key the session by
+        #     it and reply over that same connection, never dialing it.
         #   _nixl_agent_name (uuid4): the NIXL agent name. It is never dialed
         #     — it travels opaquely inside the agent metadata blob — so it
         #     only needs to be globally unique. A per-process uuid guarantees
@@ -820,7 +820,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                     self._local_id,
                     conn.peer_id,
                 )
-            except (ValueError, KeyError, TypeError, AssertionError) as exc:
+            except (
+                ValueError,
+                KeyError,
+                TypeError,
+                AssertionError,
+                ConnectionError,
+            ) as exc:
                 logger.error("P2P %s: rejecting peer: %s", self._local_id, exc)
                 conn.close()
 
