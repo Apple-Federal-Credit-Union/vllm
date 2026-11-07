@@ -51,7 +51,6 @@ from vllm.renderers import (
 from vllm.renderers.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
-    has_non_text_content,
 )
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -1065,26 +1064,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "Cannot set both `continue_final_message` and "
                 "`add_generation_prompt` to True.",
             )
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def drop_prompt_token_ids_with_media(cls, data):
-        # The forwarded ids would drop media in ``messages``, so ignore them. Runs
-        # before validation, which can turn content into a one-shot iterator.
-        if not isinstance(data, dict):
-            return data
-        kv_transfer_params = data.get("kv_transfer_params")
-        if (
-            isinstance(kv_transfer_params, dict)
-            and kv_transfer_params.get("prompt_token_ids") is not None
-            and has_non_text_content(data.get("messages"))
-        ):
-            logger.debug(
-                "Ignoring kv_transfer_params['prompt_token_ids']: "
-                "messages have non-text content and are rendered instead."
-            )
-            kv_transfer_params.pop("prompt_token_ids")
         return data
 
     @model_validator(mode="before")
