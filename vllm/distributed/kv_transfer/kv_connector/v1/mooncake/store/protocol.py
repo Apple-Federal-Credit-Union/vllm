@@ -7,14 +7,19 @@ This is the single source of truth shared by ``LookupKeyClient`` and
 
 Wire format (REQ/REP over IPC):
 
-    Request: [msg_type: bytes] [payload_frames...]
+    Request: [msg_type: bytes] [auth_token: bytes] [payload_frames...]
+
+      The server binds in a private (0700) directory under a random name and
+      generates ``auth_token``; both reach the scheduler only through
+      ``LookupKeyCredentials`` (see ``LookupKeyServer``). Requests whose
+      token does not match, or whose frames are malformed, get [RESP_ERR].
 
       msg_type == LOOKUP_MSG:
-          frame 1: num_tokens (u32 big-endian, 4 bytes); the worker derives
+          frame 2: num_tokens (u32 big-endian, 4 bytes); the worker derives
                    the aligned lookup length
-          frame 2: hash_len (u16 big-endian, 2 bytes) — byte length of each
+          frame 3: hash_len (u16 big-endian, 2 bytes) — byte length of each
                    fixed-size block hash (0 when there are no hashes)
-          frame 3: raw block hashes concatenated back-to-back (each hash_len
+          frame 4: raw block hashes concatenated back-to-back (each hash_len
                    bytes); the server splits on hash_len
         Response: hit_length (u32 big-endian, first 4 bytes), followed by zero
                   or more 8-byte tail-key boundaries. Each entry is group_id
@@ -33,6 +38,11 @@ Mirrors the named-tag convention used by the NIXL connector (see
 ``vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py``).
 """
 
+from dataclasses import dataclass, field
+
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     MooncakeLookupResult,
     TailKeyBoundary,
@@ -48,6 +58,22 @@ RESP_ERR: bytes = b"\x00"
 
 # group_id (u32), boundary_tokens (u32).
 TAIL_KEY_BOUNDARY_ENTRY_SIZE: int = 8
+
+LOOKUP_NUM_TOKENS_SIZE: int = 4
+LOOKUP_HASH_LEN_SIZE: int = 2
+AUTH_TOKEN_SIZE: int = 32
+
+
+@dataclass(frozen=True)
+class LookupKeyCredentials(KVConnectorHandshakeMetadata):
+    """Endpoint and auth token of a ``LookupKeyServer``.
+
+    Handed from worker rank 0 to the scheduler as connector handshake
+    metadata over the engine's executor RPC, never through the filesystem.
+    """
+
+    endpoint: str
+    auth_token: bytes = field(repr=False)
 
 
 def encode_lookup_response(result: MooncakeLookupResult) -> bytes:

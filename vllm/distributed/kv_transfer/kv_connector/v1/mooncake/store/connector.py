@@ -26,6 +26,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorTransferResults,
@@ -301,6 +302,12 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_scheduler.reset_store()
         return None
 
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    ) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.set_lookup_credentials(metadata.values())
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
@@ -326,6 +333,12 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # ============================================================
     # Worker-side methods
     # ============================================================
+
+    def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+        if self.connector_worker is None:
+            return None
+        lookup_server = self.connector_worker.lookup_server
+        return None if lookup_server is None else lookup_server.credentials
 
     def get_mem_pool_context(self) -> AbstractContextManager | None:
         """Return a context manager for the custom MemPool, or None.

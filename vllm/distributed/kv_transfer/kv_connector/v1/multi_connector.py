@@ -4,7 +4,7 @@ import copy
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 
@@ -69,6 +69,27 @@ class MultiKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
                 metadata_list.append(metadata1.aggregate(metadata2))
 
         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))
+
+
+@dataclass
+class MultiKVConnectorHandshakeMetadata(KVConnectorHandshakeMetadata):
+    metadata: tuple[KVConnectorHandshakeMetadata | None, ...]
+
+
+_RankT = TypeVar("_RankT")
+
+
+def _sub_handshake_metadata(
+    metadata: dict[_RankT, KVConnectorHandshakeMetadata], index: int
+) -> dict[_RankT, KVConnectorHandshakeMetadata]:
+    """Select sub-connector ``index``'s entries from per-rank metadata."""
+    selected: dict[_RankT, KVConnectorHandshakeMetadata] = {}
+    for rank, rank_metadata in metadata.items():
+        if not isinstance(rank_metadata, MultiKVConnectorHandshakeMetadata):
+            selected[rank] = rank_metadata
+        elif (sub_metadata := rank_metadata.metadata[index]) is not None:
+            selected[rank] = sub_metadata
+    return selected
 
 
 @dataclass
@@ -532,29 +553,28 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
-        """Get the KVConnector handshake metadata from sub-connectors.
-        Returns the first non-None metadata from sub-connectors.
+        """Get the KVConnector handshake metadata of every sub-connector.
+        Returns None if no sub-connector has any.
         """
-        for c in self._connectors:
-            metadata = c.get_handshake_metadata()
-            if metadata is not None:
-                return metadata
-        return None
+        metadata = tuple(c.get_handshake_metadata() for c in self._connectors)
+        if all(m is None for m in metadata):
+            return None
+        return MultiKVConnectorHandshakeMetadata(metadata)
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
     ) -> None:
-        """Set the KV connector handshake metadata for all sub-connectors.
+        """Give each sub-connector the handshake metadata it produced.
         This is needed to start the NIXL listener thread for NixlConnector.
         """
-        for c in self._connectors:
-            c.set_xfer_handshake_metadata(metadata)
+        for i, c in enumerate(self._connectors):
+            c.set_xfer_handshake_metadata(_sub_handshake_metadata(metadata, i))
 
     def set_xfer_handshake_metadata_pp_aware(
         self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
-        for c in self._connectors:
-            c.set_xfer_handshake_metadata_pp_aware(metadata)
+        for i, c in enumerate(self._connectors):
+            c.set_xfer_handshake_metadata_pp_aware(_sub_handshake_metadata(metadata, i))
 
     def _aggregate_request_finished(
         self,
