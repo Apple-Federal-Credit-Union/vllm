@@ -3119,21 +3119,21 @@ async def test_streaming_n_gt1_independent_tool_parsers(
         )
 
 
-def test_make_request_with_harmony_reuses_kv_transfer_prompt_token_ids():
-    """The Harmony reuse branch honors ids forwarded in kv_transfer_params.
-
-    A GPT-OSS server is impractical to stand up here, so this exercises the
-    branch directly on a harmony-configured renderer.
-    """
+def test_make_request_with_harmony_ignores_kv_transfer_prompt_token_ids():
+    """Forwarded ids must not replace the Harmony-rendered prompt."""
     engine = MockEngine()
     engine.model_config.hf_config = MockHFConfig(model_type="gpt_oss")
     models = OpenAIServingModels(engine, BASE_MODEL_PATHS)
     online_renderer = _build_online_renderer(engine, models.registry)
     assert online_renderer.use_harmony
 
+    messages = [{"role": "user", "content": "hi"}]
+    plain = ChatCompletionRequest(model=MODEL_NAME, messages=messages)
+    _, (expected,) = online_renderer._make_request_with_harmony(plain)
+
     request = ChatCompletionRequest(
         model=MODEL_NAME,
-        messages=[{"role": "user", "content": "hi"}],
+        messages=messages,
         kv_transfer_params={
             "prompt_token_ids": [10, 20, 30],
             "do_remote_prefill": True,
@@ -3141,57 +3141,42 @@ def test_make_request_with_harmony_reuses_kv_transfer_prompt_token_ids():
     )
     conversation, engine_inputs = online_renderer._make_request_with_harmony(request)
 
-    assert conversation == []
-    assert len(engine_inputs) == 1
-    engine_input = engine_inputs[0]
-    assert engine_input["type"] == "token"
-    assert engine_input["prompt_token_ids"] == [10, 20, 30]
-    # The reuse key is consumed and other kv_transfer_params are preserved.
+    assert conversation
+    assert engine_inputs[0]["prompt_token_ids"] == expected["prompt_token_ids"]
     assert request.kv_transfer_params == {"do_remote_prefill": True}
 
 
-@pytest.mark.parametrize("ids", [[-1], [1.5]])
-def test_make_request_with_harmony_rejects_invalid_kv_transfer_prompt_token_ids(ids):
-    engine = MockEngine()
-    engine.model_config.hf_config = MockHFConfig(model_type="gpt_oss")
-    models = OpenAIServingModels(engine, BASE_MODEL_PATHS)
-    online_renderer = _build_online_renderer(engine, models.registry)
-
-    request = ChatCompletionRequest(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": "hi"}],
-        kv_transfer_params={"prompt_token_ids": ids},
-    )
-    with pytest.raises(VLLMValidationError, match="non-negative integers"):
-        online_renderer._make_request_with_harmony(request)
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ids", [[], [-1], [1.5], [1.0], ["1"], [True], "abc", 5])
-async def test_chat_kv_transfer_prompt_token_ids_rejects_invalid_ids(ids):
-    """``kv_transfer_params`` is untyped, so the ids are checked on reuse."""
+@pytest.mark.parametrize("echo", [False, True])
+@pytest.mark.parametrize("ids", [[10, 20, 30], [], [-1], [1.5], "abc", 5])
+async def test_chat_ignores_kv_transfer_prompt_token_ids(ids, echo):
+    """Forwarded ids, valid or not, must not replace the rendered messages."""
     serving_chat = _build_serving_chat(_build_mock_engine())
+    messages = [{"role": "user", "content": "hi"}]
+
+    plain = ChatCompletionRequest(model=MODEL_NAME, messages=messages, echo=echo)
+    plain_result = await serving_chat.render_chat_request(plain)
+    assert not isinstance(plain_result, ErrorResponse)
+    expected = plain_result[1][0]["prompt_token_ids"]
 
     request = ChatCompletionRequest(
         model=MODEL_NAME,
-        messages=[{"role": "user", "content": "hi"}],
-        kv_transfer_params={"prompt_token_ids": ids},
+        messages=messages,
+        echo=echo,
+        kv_transfer_params={"prompt_token_ids": ids, "do_remote_prefill": True},
     )
-    with pytest.raises(VLLMValidationError, match="non-negative integers"):
-        await serving_chat.render_chat_request(request)
+    result = await serving_chat.render_chat_request(request)
+    assert not isinstance(result, ErrorResponse)
+
+    conversation, engine_inputs = result
+    assert [msg["role"] for msg in conversation] == ["user"]
+    assert engine_inputs[0]["prompt_token_ids"] == expected
+    assert request.kv_transfer_params == {"do_remote_prefill": True}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("ids", "stream", "match"),
-    [
-        ([1.5], False, "non-negative integers"),
-        ([999999], True, r"out of vocabulary.*kv_transfer_params\.prompt_token_ids"),
-    ],
-)
-async def test_chat_kv_transfer_prompt_token_ids_rejection_notifies_kv_connector(
-    ids, stream, match
-):
+@pytest.mark.parametrize("stream", [False, True])
+async def test_chat_render_rejection_notifies_kv_connector(stream):
     """A render-time 400 on a decode request notifies the KV connector."""
     mock_engine = _build_mock_engine()
     mock_engine.notify_kv_transfer_request_rejected = AsyncMock()
@@ -3202,109 +3187,16 @@ async def test_chat_kv_transfer_prompt_token_ids_rejection_notifies_kv_connector
         model=MODEL_NAME,
         messages=[{"role": "user", "content": "hi"}],
         stream=stream,
-        kv_transfer_params={"prompt_token_ids": ids, "do_remote_prefill": True},
+        chat_template="{{ messages }}",
+        kv_transfer_params={"do_remote_prefill": True},
     )
-    with pytest.raises(VLLMValidationError, match=match):
-        await serving_chat.create_chat_completion(request)
+    result = await serving_chat.create_chat_completion(request)
+    assert isinstance(result, ErrorResponse)
+    assert "--trust-request-chat-template" in result.error.message
 
     mock_engine.notify_kv_transfer_request_rejected.assert_awaited_once_with(
         request.request_id, {"do_remote_prefill": True}, data_parallel_rank=None
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("ids", [[10, 20, 30], [1.5]])
-async def test_chat_kv_transfer_prompt_token_ids_ignored_with_echo(ids):
-    """``echo`` needs the rendered conversation, so the ids are not used."""
-    serving_chat = _build_serving_chat(_build_mock_engine())
-
-    request = ChatCompletionRequest(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": "hi"}],
-        kv_transfer_params={"prompt_token_ids": ids, "do_remote_prefill": True},
-        echo=True,
-    )
-    result = await serving_chat.render_chat_request(request)
-    assert not isinstance(result, ErrorResponse)
-
-    conversation, engine_inputs = result
-    assert [msg["role"] for msg in conversation] == ["user"]
-    assert engine_inputs[0]["type"] == "token"
-    assert engine_inputs[0]["prompt_token_ids"] != ids
-    assert request.kv_transfer_params == {"do_remote_prefill": True}
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        [
-            {"type": "text", "text": "what is in this image?"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
-        ],
-        # A part written without a "type" is identified by its media key.
-        [{"image_url": "https://example.com/a.png"}],
-        # A media key counts even when the part claims to be text, which is
-        # how chat_utils reads a part carrying a "uuid".
-        [
-            {
-                "type": "text",
-                "text": "look",
-                "uuid": "u1",
-                "image_url": "https://example.com/a.png",
-            }
-        ],
-        [{"type": "hologram", "hologram": "https://a/b.holo"}],
-        [{"type": ["image_url"]}],
-    ],
-)
-def test_chat_kv_transfer_prompt_token_ids_ignored_with_non_text_content(content):
-    """The ids are dropped so that ``messages`` is rendered with its media."""
-    request = ChatCompletionRequest(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": content}],
-        kv_transfer_params={
-            "prompt_token_ids": [10, 20, 30],
-            "do_remote_prefill": True,
-        },
-    )
-    assert request.kv_transfer_params == {"do_remote_prefill": True}
-
-
-def test_chat_kv_transfer_prompt_token_ids_ignored_with_reasoning_embeds():
-    request = ChatCompletionRequest(
-        messages=[
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "some text"}],
-                "reasoning": {"type": "prompt_embeds", "data": "tensor"},
-            }
-        ],
-        kv_transfer_params={
-            "prompt_token_ids": [10, 20, 30],
-            "do_remote_prefill": True,
-        },
-    )
-    assert request.kv_transfer_params == {"do_remote_prefill": True}
-
-
-def test_chat_kv_transfer_prompt_token_ids_allows_text_only_parts():
-    """Text-bearing part types are not multimodal, so the ids are kept."""
-    request = ChatCompletionRequest(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "let me think"},
-                    {"type": "refusal", "refusal": "no"},
-                ],
-            },
-            {"role": "user", "content": "plain string"},
-        ],
-        kv_transfer_params={"prompt_token_ids": [10, 20, 30]},
-    )
-    assert request.kv_transfer_params == {"prompt_token_ids": [10, 20, 30]}
 
 
 _TOOL_FINISH_REASON_TOOLS = [

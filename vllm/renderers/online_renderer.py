@@ -63,7 +63,6 @@ from vllm.renderers.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    has_non_text_content,
 )
 from vllm.renderers.inputs.preprocess import (
     extract_prompt_components,
@@ -109,52 +108,20 @@ def _extract_allowed_tools_from_mcp_requests(
     return allowed_tools_map
 
 
-def _reused_prompt_token_ids(
-    request: Any, renderer: BaseRenderer, messages: list[Any] | None = None
-) -> list[int] | None:
-    """Pop prompt token ids forwarded for decode-side reuse, if any.
+def _drop_forwarded_prompt_token_ids(request: Any) -> None:
+    """Drop ``kv_transfer_params['prompt_token_ids']`` without using it.
 
-    Disaggregated serving carries the prefill stage's ids in
-    ``kv_transfer_params`` so the decode stage can skip re-tokenizing. Removing
-    the key keeps the id list out of the engine's sampling metadata.
-
-    Returns None without checking the ids when ``echo`` is set or ``messages``
-    has non-text content, since both need ``messages`` to be rendered.
-    Otherwise raises VLLMValidationError if the ids are malformed or out of
-    vocabulary.
+    The chat prompt is always rendered from ``messages``: the server cannot
+    tell a prefill router from any other client, so caller-supplied ids must
+    not replace the template. Removing the key keeps the id list out of the
+    engine's sampling metadata.
     """
     kv = getattr(request, "kv_transfer_params", None)
-    if not isinstance(kv, dict):
-        return None
-    ids = kv.pop("prompt_token_ids", None)
-    if ids is None:
-        return None
-    if getattr(request, "echo", False):
+    if isinstance(kv, dict) and kv.pop("prompt_token_ids", None) is not None:
         logger.debug(
             "Ignoring kv_transfer_params['prompt_token_ids']: "
-            "echo is set, so messages are rendered instead."
+            "the chat prompt is rendered from messages."
         )
-        return None
-    if has_non_text_content(messages):
-        logger.debug(
-            "Ignoring kv_transfer_params['prompt_token_ids']: "
-            "messages have non-text content and are rendered instead."
-        )
-        return None
-    # bool is an int subclass, hence the exact type check.
-    if (
-        not isinstance(ids, list)
-        or not ids
-        or any(type(x) is not int or x < 0 for x in ids)
-    ):
-        raise VLLMValidationError(
-            "`kv_transfer_params['prompt_token_ids']` must be a non-empty list "
-            "of non-negative integers.",
-            parameter="kv_transfer_params.prompt_token_ids",
-        )
-    # The engine checks this too, but only after a streamed response starts.
-    renderer.validate_token_ids(ids, parameter="kv_transfer_params.prompt_token_ids")
-    return ids
 
 
 class OnlineRenderer:
@@ -241,12 +208,6 @@ class OnlineRenderer:
 
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
-
-        Decode-side token reuse (ids forwarded in ``kv_transfer_params``) is
-        handled deeper, in ``preprocess_chat`` / ``_make_request_with_harmony``,
-        so it skips only templating and tokenization while tool-choice
-        validation and ``adjust_request`` still run and the output is
-        detokenized (text-out).
         """
         tokenizer = self.renderer.tokenizer
 
@@ -550,12 +511,7 @@ class OnlineRenderer:
         should_include_tools: bool = True,
     ):
         """Build Harmony (GPT-OSS) messages and engine prompt from a chat request."""
-        reuse_ids = _reused_prompt_token_ids(request, self.renderer)
-        if reuse_ids:
-            # Decode-side token reuse: feed the forwarded ids straight to the
-            # engine. Harmony has no adjust_request hook to preserve.
-            engine_input = tokens_input(reuse_ids, cache_salt=request.cache_salt)
-            return [], [engine_input]
+        _drop_forwarded_prompt_token_ids(request)
 
         messages: list[OpenAIMessage] = []
 
@@ -807,28 +763,18 @@ class OnlineRenderer:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        reuse_ids = _reused_prompt_token_ids(request, renderer, messages)
-        if reuse_ids:
-            # Decode-side token reuse: feed the forwarded ids straight to the
-            # engine, skipping templating and tokenization. ``messages`` are not
-            # tokenized, so conversation is empty. The adjust_request tail below
-            # still runs.
-            conversation: list[ConversationMessage] = []
-            engine_input = tokens_input(
-                reuse_ids, cache_salt=getattr(request, "cache_salt", None)
-            )
-        else:
-            (conversation,), (engine_input,) = await renderer.render_chat_async(
-                [messages],
-                chat_params,
-                tok_params,
-                prompt_extras={
-                    k: v
-                    for k in ("mm_processor_kwargs", "cache_salt")
-                    if (v := getattr(request, k, None)) is not None
-                },
-                skip_mm_cache=skip_mm_cache,
-            )
+        _drop_forwarded_prompt_token_ids(request)
+        (conversation,), (engine_input,) = await renderer.render_chat_async(
+            [messages],
+            chat_params,
+            tok_params,
+            prompt_extras={
+                k: v
+                for k in ("mm_processor_kwargs", "cache_salt")
+                if (v := getattr(request, k, None)) is not None
+            },
+            skip_mm_cache=skip_mm_cache,
+        )
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser

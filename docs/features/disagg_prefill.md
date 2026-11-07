@@ -49,35 +49,9 @@ Now supports 9 types of connectors:
   --kv-transfer-config '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
   ```
 
-## Reusing prefill token ids on decode
+## Prompt token ids on decode
 
-!!! note
-    This applies to disaggregated prefill and decode serving on the `/v1/chat/completions` endpoint, using a KV connector configured as in the Usage example above. It is experimental and subject to change.
-
-In disaggregated serving, the prefill and decode stages both render the chat prompt from `messages` and tokenize it. Because the prefill stage has already produced the token ids, the decode stage can reuse them and skip its own templating and tokenization. The output is otherwise identical to a normal chat completion: it is detokenized to text, and tool and reasoning parsing, streaming, and structured output constraints all still apply.
-
-The token ids are passed to the decode stage through `kv_transfer_params`, the dict already attached to the decode request to coordinate the transfer:
-
-1. Send the prefill request with `return_token_ids` enabled, and read `prompt_token_ids` from the response.
-2. Set `kv_transfer_params["prompt_token_ids"]` to those ids on the decode request. `messages` is still required, but its content is not tokenized when the ids are present.
-
-```python
-prefill = client.chat.completions.create(
-    model=model,
-    messages=messages,
-    extra_body={"return_token_ids": True, "kv_transfer_params": {"do_remote_decode": True}},
-)
-ids = prefill.prompt_token_ids
-
-decode = client.chat.completions.create(
-    model=model,
-    messages=messages,
-    stream=True,
-    extra_body={"kv_transfer_params": {"do_remote_prefill": True, "prompt_token_ids": ids}},
-)
-```
-
-If `messages` has non-text content or `echo` is set, the ids are ignored and `messages` is rendered instead, so it must match the prefill request. Otherwise `kv_transfer_params["prompt_token_ids"]` must be a non-empty list of non-negative integers, or the request fails with HTTP 400, as it always does on `/v1/chat/completions/batch`.
+On `/v1/chat/completions` and the other chat-style endpoints, the decode stage always renders the prompt from `messages` with the server's chat template, so `messages` must match the prefill request. `kv_transfer_params["prompt_token_ids"]` is ignored and dropped: the server cannot tell a prefill router from any other client, so it does not let caller-supplied ids replace the rendered prompt. `/v1/chat/completions/batch` rejects the field with HTTP 400.
 
 ## Generate API output modes
 
