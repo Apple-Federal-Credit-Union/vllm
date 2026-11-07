@@ -759,7 +759,7 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
-    assert int.from_bytes(sent_frames[1], "big") == 128
+    assert int.from_bytes(sent_frames[2], "big") == 128
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():
@@ -777,7 +777,7 @@ def test_lookup_key_client_reset_uses_typed_protocol():
     # ACK path: server returns RESP_OK -> client returns True.
     fake_socket.recv.return_value = protocol.RESP_OK
     assert client.reset() is True
-    assert fake_socket.send.call_args[0][0] == protocol.RESET_MSG
+    assert fake_socket.send_multipart.call_args[0][0][0] == protocol.RESET_MSG
 
     # NACK path: server returns RESP_ERR -> client returns False.
     fake_socket.recv.return_value = protocol.RESP_ERR

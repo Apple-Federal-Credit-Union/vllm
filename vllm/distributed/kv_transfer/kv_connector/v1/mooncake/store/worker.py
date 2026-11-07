@@ -10,11 +10,16 @@ Includes the store worker, transfer threads, lookup server,
 and MooncakeDistributedStore integration.
 """
 
+import contextlib
 import dataclasses
+import hmac
 import math
 import os
 import queue
+import secrets
 import socket
+import stat
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -58,10 +63,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TPShardedStoreLayout,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
+    AUTH_TOKEN_SIZE,
+    LOOKUP_HASH_LEN_SIZE,
     LOOKUP_MSG,
+    LOOKUP_NUM_TOKENS_SIZE,
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    LookupKeyCredentials,
     decode_lookup_response,
     encode_lookup_response,
 )
@@ -94,6 +103,10 @@ logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
+
+# Credentials of LookupKeyServers running in this process, keyed by
+# get_zmq_rpc_path_lookup, for clients created in the same process.
+_LOCAL_LOOKUP_CREDENTIALS: dict[str, LookupKeyCredentials] = {}
 
 
 def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
@@ -2104,7 +2117,11 @@ class MooncakeStoreWorker:
         if self._capacity_only:
             return MooncakeLookupResult(0)
 
-        token_len = self.coord.align_lookup_length(num_tokens)
+        # No hit can extend past the supplied hashes; capping here keeps the
+        # lookup masks and hit scan sized by the request, not by num_tokens.
+        token_len = self.coord.align_lookup_length(
+            min(num_tokens, len(block_hashes) * self.hash_block_size)
+        )
         if not block_hashes or token_len <= 0:
             return MooncakeLookupResult(0)
 
@@ -2298,6 +2315,14 @@ class MooncakeStoreWorker:
 # ============================================================
 
 
+def _is_private_dir(st: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and st.st_uid == os.geteuid()
+        and stat.S_IMODE(st.st_mode) & 0o077 == 0
+    )
+
+
 class LookupKeyServer:
     """ZMQ server on worker rank 0 for the LookupKey admin channel.
 
@@ -2306,6 +2331,11 @@ class LookupKeyServer:
     - ``RESET_MSG``: drains the send thread queue, then runs
       ``store.remove_all(force=True)``. Caller must have paused the
       scheduler first.
+
+    The socket is bound under a fresh 0700 directory with a random name, and
+    every request must carry the server's random auth token. Both are only
+    published as ``credentials``, which reach the scheduler as connector
+    handshake metadata.
     """
 
     def __init__(
@@ -2314,62 +2344,117 @@ class LookupKeyServer:
         vllm_config: VllmConfig,
     ):
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
-        self._ipc_path = socket_path.removeprefix("ipc://")
-        if os.path.exists(self._ipc_path):
-            os.unlink(self._ipc_path)
+        self._ipc_dir = tempfile.mkdtemp(
+            prefix="vllm-mooncake-lookup-", dir=envs.VLLM_RPC_BASE_PATH
+        )
+        dir_stat = os.lstat(self._ipc_dir)
+        self._ipc_path = os.path.join(self._ipc_dir, f"{secrets.token_hex(8)}.sock")
+        endpoint = f"ipc://{self._ipc_path}"
         self.socket = make_zmq_socket(
             self.ctx,
-            socket_path,
+            endpoint,
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
         )
+        os.chmod(self._ipc_path, 0o600)
+        bound_dir_stat = os.lstat(self._ipc_dir)
+        bound_stat = os.lstat(self._ipc_path)
+        if (
+            (bound_dir_stat.st_dev, bound_dir_stat.st_ino)
+            != (dir_stat.st_dev, dir_stat.st_ino)
+            or not _is_private_dir(bound_dir_stat)
+            or not stat.S_ISSOCK(bound_stat.st_mode)
+            or bound_stat.st_uid != os.geteuid()
+        ):
+            self.socket.close(linger=0)
+            raise RuntimeError(
+                f"Mooncake lookup socket directory {self._ipc_dir} was "
+                "replaced or is not private; refusing to serve on it."
+            )
+
+        self.credentials = LookupKeyCredentials(
+            endpoint, secrets.token_bytes(AUTH_TOKEN_SIZE)
+        )
+        self._local_key = get_zmq_rpc_path_lookup(vllm_config)
+        _LOCAL_LOOKUP_CREDENTIALS[self._local_key] = self.credentials
 
         self.store_worker = store_worker
         self.running = True
 
         def process_request():
             while self.running:
-                all_frames = self.socket.recv_multipart(copy=False)
-                msg_type = bytes(all_frames[0])
-
-                if msg_type == LOOKUP_MSG:
-                    num_tokens = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_len = int.from_bytes(all_frames[2], byteorder="big")
-                    blob = all_frames[3].buffer
-                    block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(num_tokens, block_hashes)
-                    self.socket.send(encode_lookup_response(result))
-
-                elif msg_type == RESET_MSG:
-                    try:
-                        # Drain in-flight puts before wiping the master;
-                        # otherwise stale puts can repopulate it post-reset.
-                        # Safe across HMA: store.remove_all wipes the underlying
-                        # flat key space, clearing every (group_id, hash) entry.
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
-                        logger.info("Mooncake store reset via remove_all succeeded.")
-                        self.socket.send(RESP_OK)
-                    except Exception as e:
-                        logger.error("Mooncake remove_all failed: %s", e)
-                        self.socket.send(RESP_ERR)
-
-                else:
-                    logger.warning(
-                        "LookupKeyServer received unknown msg_type: %r",
-                        msg_type,
-                    )
-                    self.socket.send(RESP_ERR)
+                try:
+                    frames = self.socket.recv_multipart(copy=False)
+                    self.socket.send(self._handle_request(frames))
+                except zmq.ZMQError:  # type: ignore[attr-defined]
+                    if self.running:
+                        logger.exception("LookupKeyServer socket failed.")
+                    return
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
+    def _handle_request(self, frames: list[zmq.Frame]) -> bytes:
+        try:
+            if len(frames) < 2 or not hmac.compare_digest(
+                frames[1].bytes, self.credentials.auth_token
+            ):
+                logger.warning("LookupKeyServer rejected an unauthenticated request.")
+                return RESP_ERR
+            msg_type = frames[0].bytes
+            if msg_type == LOOKUP_MSG:
+                return self._handle_lookup(frames[2:])
+            if msg_type == RESET_MSG:
+                return self._handle_reset(frames[2:])
+            logger.warning("LookupKeyServer received unknown msg_type: %r", msg_type)
+            return RESP_ERR
+        except Exception:
+            logger.exception("LookupKeyServer failed to handle a request.")
+            return RESP_ERR
+
+    def _handle_lookup(self, payload: list[zmq.Frame]) -> bytes:
+        if len(payload) != 3:
+            return RESP_ERR
+        num_tokens_frame, hash_len_frame, hashes_frame = payload
+        if (
+            len(num_tokens_frame) != LOOKUP_NUM_TOKENS_SIZE
+            or len(hash_len_frame) != LOOKUP_HASH_LEN_SIZE
+        ):
+            return RESP_ERR
+        num_tokens = int.from_bytes(num_tokens_frame.bytes, byteorder="big")
+        hash_len = int.from_bytes(hash_len_frame.bytes, byteorder="big")
+        blob = hashes_frame.buffer
+        if (len(blob) % hash_len) if hash_len else len(blob):
+            return RESP_ERR
+        result = self.store_worker.lookup(num_tokens, BlobBlockHashes(blob, hash_len))
+        return encode_lookup_response(result)
+
+    def _handle_reset(self, payload: list[zmq.Frame]) -> bytes:
+        if payload:
+            return RESP_ERR
+        try:
+            # Drain in-flight puts before wiping the master;
+            # otherwise stale puts can repopulate it post-reset.
+            # Safe across HMA: store.remove_all wipes the underlying
+            # flat key space, clearing every (group_id, hash) entry.
+            if self.store_worker.kv_send_thread is not None:
+                self.store_worker.kv_send_thread.request_queue.join()
+            self.store_worker.store.remove_all(force=True)
+            logger.info("Mooncake store reset via remove_all succeeded.")
+            return RESP_OK
+        except Exception as e:
+            logger.error("Mooncake remove_all failed: %s", e)
+            return RESP_ERR
+
     def close(self):
+        self.running = False
         self.socket.close(linger=0)
-        if os.path.exists(self._ipc_path):
+        if _LOCAL_LOOKUP_CREDENTIALS.get(self._local_key) is self.credentials:
+            del _LOCAL_LOOKUP_CREDENTIALS[self._local_key]
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(self._ipc_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(self._ipc_dir)
 
 
 # ============================================================
@@ -2382,18 +2467,19 @@ class LookupKeyClient:
 
     Routes both prefix-cache lookups and admin commands (currently:
     ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
-    of every request is a named tag from ``protocol.py``.
+    of every request is a named tag from ``protocol.py``, the second the
+    server's auth token.
+
+    The server's endpoint and token arrive through ``set_credentials`` (from
+    worker rank 0's handshake metadata) or, when the server runs in this
+    process, from the server itself.
     """
 
     def __init__(self, vllm_config: VllmConfig):
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
-        self.socket = make_zmq_socket(
-            self.ctx,
-            socket_path,
-            zmq.REQ,  # type: ignore[attr-defined]
-            bind=False,
-        )
+        self._local_key = get_zmq_rpc_path_lookup(vllm_config)
+        self._credentials = _LOCAL_LOOKUP_CREDENTIALS.get(self._local_key)
+        self.socket = self._connect()
 
         # Async lookup support
         self.executor = ThreadPoolExecutor(
@@ -2401,18 +2487,50 @@ class LookupKeyClient:
         )
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
 
+    def _connect(self) -> zmq.Socket:
+        endpoint = (
+            self._local_key if self._credentials is None else self._credentials.endpoint
+        )
+        return make_zmq_socket(
+            self.ctx,
+            endpoint,
+            zmq.REQ,  # type: ignore[attr-defined]
+            bind=False,
+        )
+
+    def set_credentials(self, credentials: LookupKeyCredentials) -> None:
+        """Connect to the ``LookupKeyServer`` described by ``credentials``."""
+        self.executor.submit(self._set_credentials, credentials).result()
+
+    def _set_credentials(self, credentials: LookupKeyCredentials) -> None:
+        if credentials == self._credentials:
+            return
+        self._credentials = credentials
+        self.socket.close(linger=0)
+        self.socket = self._connect()
+
+    def _request(self, msg_type: bytes, *payload: bytes) -> bytes:
+        if self._credentials is None:
+            logger.warning_once(
+                "Mooncake lookup client has not received credentials for worker "
+                "rank 0's LookupKeyServer; its requests cannot be served."
+            )
+            auth_token = b""
+        else:
+            auth_token = self._credentials.auth_token
+        self.socket.send_multipart((msg_type, auth_token, *payload), copy=False)
+        return self.socket.recv()
+
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
     ) -> MooncakeLookupResult:
         hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = (
+        resp = self._request(
             LOOKUP_MSG,
-            num_tokens.to_bytes(4, byteorder="big"),
-            hash_len.to_bytes(2, byteorder="big"),
+            num_tokens.to_bytes(LOOKUP_NUM_TOKENS_SIZE, byteorder="big"),
+            hash_len.to_bytes(LOOKUP_HASH_LEN_SIZE, byteorder="big"),
             b"".join(block_hashes),
         )
-        self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
         return decode_lookup_response(resp)
 
     def lookup(
@@ -2452,9 +2570,7 @@ class LookupKeyClient:
         holds naturally at the step boundary after weight updates and
         rollout drain. Returns True on ACK, False on NACK.
         """
-        self.socket.send(RESET_MSG)
-        resp = self.socket.recv()
-        return bytes(resp) == RESP_OK
+        return bytes(self._request(RESET_MSG)) == RESP_OK
 
     def reset(self) -> bool:
         return self.executor.submit(self._reset).result()
@@ -2465,7 +2581,11 @@ class LookupKeyClient:
 
 
 def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
-    """Construct IPC path for ZMQ lookup socket."""
+    """Name the lookup channel of this engine's data-parallel rank.
+
+    Keys ``_LOCAL_LOOKUP_CREDENTIALS``, and is where a client that has no
+    credentials connects. The server never binds here.
+    """
     assert vllm_config.kv_transfer_config is not None
     dp_rank = vllm_config.parallel_config.data_parallel_index
     base_url = envs.VLLM_RPC_BASE_PATH

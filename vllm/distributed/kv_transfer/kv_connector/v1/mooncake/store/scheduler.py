@@ -5,10 +5,11 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
@@ -21,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
+    LookupKeyCredentials,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
@@ -759,6 +763,20 @@ class MooncakeStoreScheduler:
         request no longer defers its own free.
         """
         return bool(self._pinned_saves)
+
+    def set_lookup_credentials(
+        self, metadata: Iterable[KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Point the lookup client at worker rank 0's ``LookupKeyServer``."""
+        credentials = [m for m in metadata if isinstance(m, LookupKeyCredentials)]
+        if len(credentials) != 1:
+            logger.warning(
+                "Expected one Mooncake lookup server in handshake metadata, got "
+                "%d; lookups will be rejected until worker rank 0 reports one.",
+                len(credentials),
+            )
+            return
+        self.client.set_credentials(credentials[0])
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
