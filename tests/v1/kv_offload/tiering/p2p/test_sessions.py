@@ -41,6 +41,7 @@ from vllm.v1.kv_offload.tiering.p2p.session.client import (
     _PD_LOAD_TIMEOUT_S,
 )
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
+    AUTH_NONCE_BYTES,
     TYPE_KEY,
     AbortAckMsg,
     AbortFetchMsg,
@@ -77,9 +78,14 @@ _DEFAULT_HASH_SEED = "0"
 _TEST_PSK = "test-p2p-psk-placeholder"
 
 
-def _auth(sender_id: str, receiver_id: str) -> bytes:
-    """Tag the peer ``sender_id`` presents to the session ``receiver_id``."""
-    return compute_control_auth(_TEST_PSK, sender_id, receiver_id)
+def _session_nonce(conn: FakeConnection) -> bytes:
+    """Nonce the session under test opened its handshake with."""
+    return next(m[AuthMsg.NONCE] for m in conn._sent if m[TYPE_KEY] == AuthMsg.TYPE)
+
+
+def _auth(conn: FakeConnection, sender_id: str, receiver_id: str) -> bytes:
+    """Tag ``sender_id`` presents to session ``receiver_id`` over its nonce."""
+    return compute_control_auth(_TEST_PSK, sender_id, receiver_id, _session_nonce(conn))
 
 
 class FakeDataTransport:
@@ -253,6 +259,7 @@ class FakeConnection:
 
 
 def _peer_connect_msg(
+    conn: FakeConnection,
     peer_id: str = "peer:8000",
     block_len: int = 4096,
     fingerprint: str | None = None,
@@ -268,7 +275,7 @@ def _peer_connect_msg(
         ConnectMsg.NUM_BLOCKS: 16,
         ConnectMsg.BLOCK_LEN: block_len,
         ConnectMsg.HASH_SEED: hash_seed,
-        ConnectMsg.AUTH: _auth(peer_id, local_id),
+        ConnectMsg.AUTH: _auth(conn, peer_id, local_id),
     }
     if fingerprint is not None:
         msg[ConnectMsg.CONFIG_FINGERPRINT] = fingerprint
@@ -370,7 +377,7 @@ def _activate(
     session: P2PSession, conn: FakeConnection, peer_id: str = "peer:8000"
 ) -> None:
     """Drive the handshake: peer sends ConnectMsg + ConnectAckMsg."""
-    conn.enqueue(_peer_connect_msg(peer_id=peer_id))
+    conn.enqueue(_peer_connect_msg(conn, peer_id=peer_id))
     conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: peer_id})
     session.poll()
 
@@ -441,11 +448,11 @@ class TestConnectHandshake:
         assert len(conn._sent) == 1
         auth = conn._sent[0]
         assert auth[TYPE_KEY] == AuthMsg.TYPE
-        assert auth[AuthMsg.AUTH] == _auth("local:9000", "peer:8000")
+        assert len(auth[AuthMsg.NONCE]) == AUTH_NONCE_BYTES
         assert ConnectMsg.AGENT_METADATA not in auth
         assert ConnectMsg.HASH_SEED not in auth
 
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
         msg = next(m for m in conn._sent if m[TYPE_KEY] == ConnectMsg.TYPE)
         assert msg[ConnectMsg.PEER_ID] == "local:9000"
@@ -456,7 +463,7 @@ class TestConnectHandshake:
     def test_peer_connect_triggers_add_remote_and_ack(self):
         """Receiving ConnectMsg registers peer and replies with ConnectAck."""
         session, conn, transport = _make_session()
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
         assert "peer:8000" in transport._remote_peers
         ack = next(m for m in conn._sent if m[TYPE_KEY] == ConnectAckMsg.TYPE)
@@ -471,7 +478,7 @@ class TestConnectHandshake:
         """
         transport = FakeDataTransport(defer_registration=True)
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
 
         assert "peer:8000" not in transport._remote_peers
@@ -492,7 +499,7 @@ class TestConnectHandshake:
         """
         transport = FakeDataTransport(defer_registration=True)
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
         assert session.has_pending_work
 
@@ -504,7 +511,7 @@ class TestConnectHandshake:
         """A registration that fails kills the connection instead of acking."""
         transport = FakeDataTransport(defer_registration=True)
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
 
         transport.complete_registrations(exc=RuntimeError("nixl exploded"))
@@ -517,7 +524,7 @@ class TestConnectHandshake:
         """A ConnectAckMsg send that raises marks the connection dead."""
         transport = FakeDataTransport(defer_registration=True)
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
 
         transport.complete_registrations()
@@ -530,9 +537,9 @@ class TestConnectHandshake:
         """A second ConnectMsg mid-registration is a protocol violation."""
         transport = FakeDataTransport(defer_registration=True)
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
         assert not conn.alive
 
@@ -540,7 +547,7 @@ class TestConnectHandshake:
         """Session.ready becomes True after an authenticated peer's ack."""
         session, conn, _ = _make_session()
         assert not session.ready
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
         assert session.ready
@@ -559,7 +566,7 @@ class TestConnectHandshake:
         session.request_blocks(
             job_id=1, kv_request_id="req-1", keys=[OffloadKey(b"k")], block_ids=[0]
         )
-        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(_peer_connect_msg(conn))
         session.poll()
         # Peer authenticated, but no ack yet: the fetch is still queued.
         assert not any(m[TYPE_KEY] == FetchMsg.TYPE for m in conn._sent)
@@ -572,7 +579,7 @@ class TestConnectHandshake:
     def test_block_len_mismatch_marks_dead(self):
         """Mismatched block_len rejects peer and marks connection dead."""
         session, conn, transport = _make_session()
-        conn.enqueue(_peer_connect_msg(block_len=8192))  # mismatch
+        conn.enqueue(_peer_connect_msg(conn, block_len=8192))  # mismatch
         session.poll()
         assert "peer:8000" not in transport._remote_peers
         assert not session.alive
@@ -581,7 +588,7 @@ class TestConnectHandshake:
         """Mismatched config fingerprint rejects peer."""
         transport = FakeDataTransport(config_fingerprint="abc123")
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg(fingerprint="different"))
+        conn.enqueue(_peer_connect_msg(conn, fingerprint="different"))
         session.poll()
         assert "peer:8000" not in transport._remote_peers
         assert not session.alive
@@ -590,7 +597,7 @@ class TestConnectHandshake:
         """Matching fingerprints register the peer."""
         transport = FakeDataTransport(config_fingerprint="same_fp")
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg(fingerprint="same_fp"))
+        conn.enqueue(_peer_connect_msg(conn, fingerprint="same_fp"))
         session.poll()
         assert "peer:8000" in transport._remote_peers
         assert session.alive
@@ -599,7 +606,7 @@ class TestConnectHandshake:
         """A peer that omits the fingerprint is rejected when we have one."""
         transport = FakeDataTransport(config_fingerprint="abc123")
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())  # no fingerprint
+        conn.enqueue(_peer_connect_msg(conn))  # no fingerprint
         session.poll()
         assert "peer:8000" not in transport._remote_peers
         assert not session.alive
@@ -608,14 +615,14 @@ class TestConnectHandshake:
         """With no local fingerprint there is nothing to require."""
         transport = FakeDataTransport(config_fingerprint="")
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())  # no fingerprint
+        conn.enqueue(_peer_connect_msg(conn))  # no fingerprint
         session.poll()
         assert "peer:8000" in transport._remote_peers
 
     def test_hash_seed_mismatch_marks_dead(self):
         """Mismatched PYTHONHASHSEED rejects peer and marks connection dead."""
         session, conn, transport = _make_session(local_hash_seed="0")
-        conn.enqueue(_peer_connect_msg(hash_seed="12345"))  # mismatch
+        conn.enqueue(_peer_connect_msg(conn, hash_seed="12345"))  # mismatch
         session.poll()
         assert "peer:8000" not in transport._remote_peers
         assert not session.alive
@@ -624,7 +631,7 @@ class TestConnectHandshake:
     def test_hash_seed_match_succeeds(self):
         """Matching PYTHONHASHSEED registers the peer and acks."""
         session, conn, transport = _make_session(local_hash_seed="12345")
-        conn.enqueue(_peer_connect_msg(hash_seed="12345"))
+        conn.enqueue(_peer_connect_msg(conn, hash_seed="12345"))
         session.poll()
         assert "peer:8000" in transport._remote_peers
         assert session.alive
@@ -633,7 +640,7 @@ class TestConnectHandshake:
     def test_hash_seed_advertised_in_connect_msg(self):
         """Session advertises its own PYTHONHASHSEED in the ConnectMsg."""
         session, conn, _ = _make_session(local_hash_seed="777")
-        conn.enqueue(_peer_connect_msg(hash_seed="777"))
+        conn.enqueue(_peer_connect_msg(conn, hash_seed="777"))
         session.poll()
         msg = next(m for m in conn._sent if m[TYPE_KEY] == ConnectMsg.TYPE)
         assert msg[ConnectMsg.HASH_SEED] == "777"
@@ -3547,7 +3554,7 @@ class TestHandshakeDeadline:
                 ConnectMsg.BLOCK_LEN: 4096,
                 ConnectMsg.CONFIG_FINGERPRINT: "",
                 ConnectMsg.HASH_SEED: _DEFAULT_HASH_SEED,
-                ConnectMsg.AUTH: _auth("good:1234", "local:1"),
+                ConnectMsg.AUTH: _auth(conn, "good:1234", "local:1"),
             },
             {TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "good:1234"},
         ]
@@ -3588,7 +3595,7 @@ class TestHandshakeDeadline:
                 ConnectMsg.BLOCK_LEN: 4096,
                 ConnectMsg.CONFIG_FINGERPRINT: "",
                 ConnectMsg.HASH_SEED: _DEFAULT_HASH_SEED,
-                ConnectMsg.AUTH: _auth("late-ack:1", "local:1"),
+                ConnectMsg.AUTH: _auth(conn, "late-ack:1", "local:1"),
             },
             {TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "late-ack:1"},
         ]

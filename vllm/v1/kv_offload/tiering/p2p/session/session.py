@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import secrets
 import time
 from collections.abc import Sequence
 from concurrent.futures import Future
@@ -33,6 +34,7 @@ from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.p2p.control.base import ControlConnection
 from vllm.v1.kv_offload.tiering.p2p.session.client import ClientRole, LoadResult
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
+    AUTH_NONCE_BYTES,
     TYPE_KEY,
     AbortAckMsg,
     AbortFetchMsg,
@@ -151,15 +153,14 @@ class P2PSession:
         self._initiator = initiator
         self._connect_sent = False
         self._peer_authenticated = False
-        self._sent_auth: bytes | None = None
-        self._expected_auth: bytes | None = None
-        if self._local_psk is not None:
-            self._sent_auth = compute_control_auth(
-                self._local_psk, sender_id=local_id, receiver_id=peer_id
-            )
-            self._expected_auth = compute_control_auth(
-                self._local_psk, sender_id=peer_id, receiver_id=local_id
-            )
+        self._proof_sent = False
+        # A fresh nonce per connection makes each tag single-use: the peer
+        # must prove itself over this value, so a captured tag cannot be
+        # replayed. ``_peer_nonce`` is the one we must prove ourselves over.
+        self._local_nonce: bytes | None = (
+            secrets.token_bytes(AUTH_NONCE_BYTES) if self._local_psk else None
+        )
+        self._peer_nonce: bytes | None = None
 
         self._send_ready = False  # True after the peer acked our ConnectMsg
         # Msgs waiting to be sent on connection establishment
@@ -253,11 +254,11 @@ class P2PSession:
     def attach_connection(self, conn: ControlConnection) -> None:
         """Attach a connection to a pending session.
 
-        The initiator (we dialed the peer) proves the key with a tag-only
-        AuthMsg; it sends its ConnectMsg only after verifying the peer. The
-        acceptor stays silent until the peer authenticates. Either way no
-        agent metadata or hash seed reaches an unverified peer. Without a PSK
-        nothing can authenticate, so neither side sends anything.
+        The initiator (we dialed the peer) opens the handshake with an
+        AuthMsg carrying its nonce; it sends its ConnectMsg only after
+        verifying the peer. The acceptor stays silent until the peer opens.
+        Either way no agent metadata or hash seed reaches an unverified peer.
+        Without a PSK nothing can authenticate, so neither side sends anything.
         """
         if self._conn is not None:
             raise ValueError(f"P2PSession {self.peer_id}: already connected")
@@ -265,14 +266,8 @@ class P2PSession:
         now = time.monotonic()
         self._connected_at = now
         self._last_activity_at = now
-        if self._initiator and self._sent_auth is not None:
-            self._conn.send(
-                {
-                    TYPE_KEY: AuthMsg.TYPE,
-                    AuthMsg.PEER_ID: self._local_id,
-                    AuthMsg.AUTH: self._sent_auth,
-                }
-            )
+        if self._initiator and self._local_nonce is not None:
+            self._send_auth()
 
     # ------------------------------------------------------------------
     # Public API
@@ -672,26 +667,32 @@ class P2PSession:
         self._pending_registration = registration
 
     def _on_auth(self, msg: dict) -> None:
-        """Verify a peer's AuthMsg, then disclose our ConnectMsg to it."""
-        if self._peer_authenticated:
-            return
+        """Record the peer's nonce, verify its tag, and answer in kind.
+
+        Proves ourselves over the peer's nonce once we learn it, and discloses
+        our ConnectMsg only after the peer's own tag verifies.
+        """
         try:
             AuthMsg.validate(msg)
-            self._verify_peer_tag(msg[AuthMsg.AUTH])
+            self._require_auth_possible()
+            nonce = msg[AuthMsg.NONCE]
+            if self._peer_nonce is None:
+                self._peer_nonce = nonce
+            elif not hmac.compare_digest(nonce, self._peer_nonce):
+                raise ValueError("peer changed its handshake nonce")
+            if AuthMsg.AUTH in msg and not self._peer_authenticated:
+                self._verify_peer_tag(msg[AuthMsg.AUTH])
         except ValueError as exc:
             logger.error("P2PSession %s: rejecting peer auth: %s", self.peer_id, exc)
             self._mark_dead(f"rejected peer auth: {exc}")
             return
+        if not self._proof_sent:
+            self._send_auth()
         self._maybe_send_connect()
 
-    def _verify_peer_tag(self, proof: object) -> None:
-        """Mark the peer authenticated if ``proof`` is its valid tag.
-
-        Raises ValueError otherwise. Applies in both directions: no peer is
-        registered or served without a valid tag, and with no PSK configured
-        nobody can authenticate.
-        """
-        if self._expected_auth is None:
+    def _require_auth_possible(self) -> None:
+        """Raise ValueError if no peer could authenticate on this session."""
+        if self._local_psk is None:
             raise ValueError(
                 "P2P control channel requires VLLM_P2P_SIDE_CHANNEL_PSK; "
                 "refusing unauthenticated peer"
@@ -700,11 +701,43 @@ class P2PSession:
         # equal the one we send, defeating the direction binding.
         if self.peer_id == self._local_id:
             raise ValueError("peer claims this side's own control identity")
-        if not isinstance(proof, bytes) or not hmac.compare_digest(
-            proof, self._expected_auth
-        ):
+
+    def _verify_peer_tag(self, proof: object) -> None:
+        """Mark the peer authenticated if ``proof`` is its tag over our nonce.
+
+        Raises ValueError otherwise. Applies in both directions: no peer is
+        registered or served without a valid tag.
+        """
+        self._require_auth_possible()
+        assert self._local_psk is not None and self._local_nonce is not None
+        expected = compute_control_auth(
+            self._local_psk, self.peer_id, self._local_id, self._local_nonce
+        )
+        if not isinstance(proof, bytes) or not hmac.compare_digest(proof, expected):
             raise ValueError("peer failed P2P control-channel authentication")
         self._peer_authenticated = True
+
+    def _our_tag(self) -> bytes | None:
+        """Our tag over the peer's nonce, or None until we have learned it."""
+        if self._local_psk is None or self._peer_nonce is None:
+            return None
+        return compute_control_auth(
+            self._local_psk, self._local_id, self.peer_id, self._peer_nonce
+        )
+
+    def _send_auth(self) -> None:
+        """Send our nonce, plus our tag once the peer's nonce is known."""
+        assert self._conn is not None and self._local_nonce is not None
+        msg: dict = {
+            TYPE_KEY: AuthMsg.TYPE,
+            AuthMsg.PEER_ID: self._local_id,
+            AuthMsg.NONCE: self._local_nonce,
+        }
+        tag = self._our_tag()
+        if tag is not None:
+            msg[AuthMsg.AUTH] = tag
+            self._proof_sent = True
+        self._conn.send(msg)
 
     def _maybe_send_connect(self) -> None:
         """Disclose our ConnectMsg once, and only to an authenticated peer."""
@@ -789,8 +822,9 @@ class P2PSession:
             ConnectMsg.CONFIG_FINGERPRINT: self._transport.config_fingerprint,
             ConnectMsg.HASH_SEED: self._local_hash_seed,
         }
-        if self._sent_auth is not None:
-            msg[ConnectMsg.AUTH] = self._sent_auth
+        tag = self._our_tag()
+        if tag is not None:
+            msg[ConnectMsg.AUTH] = tag
         self._connect_sent = True
         self._conn.send(msg)
 

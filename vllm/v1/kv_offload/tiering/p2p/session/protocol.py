@@ -65,11 +65,16 @@ before any KV is exposed. Neither side discloses its agent metadata or hash
 seed, registers the peer's RDMA memory, or serves a block until it has
 verified the peer's tag (see :func:`compute_control_auth`):
 
-1. The dialer sends AuthMsg (a tag, no metadata). The acceptor stays silent.
-2. The acceptor verifies it, then sends its ConnectMsg with its own tag.
-3. The dialer verifies that tag, then sends its ConnectMsg.
+1. The dialer sends AuthMsg with a fresh nonce. The acceptor stays silent.
+2. The acceptor answers with AuthMsg: its own nonce and its tag over the
+   dialer's nonce.
+3. The dialer verifies that tag and proves itself with a tag over the
+   acceptor's nonce. Each side sends its ConnectMsg only after verifying
+   the other.
 
-With no key configured nobody can authenticate, so every peer is refused.
+Each tag covers a nonce the verifier just chose, so a tag captured from one
+handshake cannot be replayed on another connection. With no key configured
+nobody can authenticate, so every peer is refused.
 
 Sessions wrap all incoming message handling in try/except to guard
 against malformed messages from adversarial or buggy peers. Invalid
@@ -91,28 +96,40 @@ TYPE_KEY = "type"
 # computes under the same pre-shared key.
 _AUTH_LABEL = b"vllm-p2p-control-auth-v1"
 
+# Size of the per-connection nonce each side contributes to the handshake.
+AUTH_NONCE_BYTES = 32
 
-def compute_control_auth(psk: str, sender_id: str, receiver_id: str) -> bytes:
+
+def compute_control_auth(
+    psk: str, sender_id: str, receiver_id: str, receiver_nonce: bytes
+) -> bytes:
     """Authentication tag proving the sender holds the pre-shared key.
 
-    The tag is bound to the direction of one message: a side sends
-    ``compute_control_auth(psk, self, peer)`` and requires the peer to send
-    ``compute_control_auth(psk, peer, self)``. The two values differ, so a
-    peer that echoes our own tag back is rejected, and the tag a side sends
-    is independent of which side dialed. Binding the ZMQ identities means a
-    tag minted for one peer pair cannot be presented to another.
+    The tag covers the receiver's fresh per-connection nonce, so a tag
+    captured from one handshake is useless on any other connection. It is
+    also bound to the direction of the message: a side sends
+    ``compute_control_auth(psk, self, peer, peer_nonce)`` and requires
+    ``compute_control_auth(psk, peer, self, own_nonce)``, so a peer that
+    echoes our tag back is rejected. Binding the ZMQ identities means a tag
+    minted for one peer pair cannot be presented to another.
 
     Args:
         psk: The shared pre-shared key (``VLLM_P2P_SIDE_CHANNEL_PSK``).
         sender_id: ``host:port`` identity of the side sending the tag.
         receiver_id: ``host:port`` identity of the side verifying it.
+        receiver_nonce: Nonce the receiver chose for this connection.
 
     Returns:
-        The HMAC-SHA256 tag for this sender and receiver.
+        The HMAC-SHA256 tag for this sender, receiver, and nonce.
 
     """
     msg = b"\0".join(
-        (_AUTH_LABEL, sender_id.encode("utf-8"), receiver_id.encode("utf-8"))
+        (
+            _AUTH_LABEL,
+            sender_id.encode("utf-8"),
+            receiver_id.encode("utf-8"),
+            receiver_nonce,
+        )
     )
     return hmac.new(psk.encode("utf-8"), msg, hashlib.sha256).digest()
 
@@ -203,27 +220,37 @@ class ConnectMsg:
 
 
 class AuthMsg:
-    """Dialer → Acceptor: pre-shared-key proof, sent before any metadata.
+    """Either → Either: authentication handshake, sent before any metadata.
 
-    The dialer sends this instead of its ConnectMsg so it can prove the key
-    without disclosing its agent metadata or hash seed to a peer it has not
-    yet verified. The acceptor answers with its own ConnectMsg, whose AUTH
-    tag lets the dialer verify it in turn.
+    Carries the sender's fresh nonce, and once the sender knows the
+    receiver's nonce, its tag over that nonce. Lets both sides prove the
+    key without disclosing agent metadata or a hash seed to a peer that has
+    not yet been verified.
 
     Fields:
         PEER_ID: Sender's peer identity string.
-        AUTH: Tag for this sender and receiver (see compute_control_auth).
+        NONCE: Fresh random nonce the sender chose for this connection.
+        AUTH: Optional. Sender's tag over the receiver's nonce (see
+            compute_control_auth).
     """
 
     TYPE = "auth"
     PEER_ID = "peer_id"
+    NONCE = "nonce"
     AUTH = "auth"
 
     @staticmethod
     def validate(msg: dict) -> None:
         """Raise ValueError if any field has an invalid type or value."""
         _require(msg, AuthMsg.PEER_ID, str)
-        _require(msg, AuthMsg.AUTH, bytes)
+        _require(msg, AuthMsg.NONCE, bytes)
+        if len(msg[AuthMsg.NONCE]) != AUTH_NONCE_BYTES:
+            raise ValueError(
+                f"nonce: expected {AUTH_NONCE_BYTES} bytes, "
+                f"got {len(msg[AuthMsg.NONCE])}"
+            )
+        if AuthMsg.AUTH in msg:
+            _require(msg, AuthMsg.AUTH, bytes)
 
 
 class ConnectAckMsg:
