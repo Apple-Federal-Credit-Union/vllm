@@ -237,6 +237,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5600
     VLLM_P2P_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_P2P_SIDE_CHANNEL_PORT: int = 5710
+    VLLM_P2P_SIDE_CHANNEL_PSK: str = ""
     VLLM_P2P_MAX_PEERS: int = 128
     VLLM_P2P_HANDSHAKE_TIMEOUT_S: int = 30
     VLLM_P2P_IDLE_TIMEOUT_S: int = 300
@@ -1760,6 +1761,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_P2P_SIDE_CHANNEL_PORT": lambda: int(
         os.getenv("VLLM_P2P_SIDE_CHANNEL_PORT", "5710")
     ),
+    # Pre-shared key authenticating the P2P KV-offload control channel.
+    # Every peer that exchanges KV blocks must set the same value; a peer
+    # that cannot prove knowledge of it is refused before any agent
+    # metadata, hash seed, or cached block is disclosed or served. Empty
+    # (the default) disables P2P KV exchange: an unset key cannot
+    # authenticate anyone, so every peer is refused.
+    "VLLM_P2P_SIDE_CHANNEL_PSK": lambda: os.getenv("VLLM_P2P_SIDE_CHANNEL_PSK", ""),
     # Maximum number of concurrent P2P peer sessions. Limits ZMQ socket
     # consumption to prevent denial-of-service via unbounded peer
     # creation from client-supplied kv_transfer_params. Default: 128.

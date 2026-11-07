@@ -236,6 +236,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         tier_type: str = "p2p",
         host: str | None = None,
         port: int | None = None,
+        psk: str | None = None,
         backends: list[str] | None = None,
         num_threads: int = 4,
         unbound_store_timeout_s: float = _UNBOUND_STORE_TIMEOUT_S,
@@ -267,6 +268,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 The bound port is ``base + data_parallel_index`` so each
                 DP replica gets a distinct port (one socket per replica,
                 like NIXL); for DP=1 the offset is 0.
+            psk: Pre-shared key authenticating the control channel. Every
+                peer must share the same value; a peer that cannot prove it
+                is refused before any agent metadata, hash seed, or cached
+                block is disclosed or served. Defaults to
+                ``VLLM_P2P_SIDE_CHANNEL_PSK`` when not set. With no key
+                configured nobody can authenticate, so P2P KV exchange is
+                disabled.
             backends: NIXL transport backends (e.g. ``["UCX"]``,
                 ``["MOONCAKE"]``, ``["LIBFABRIC"]``). Defaults to
                 ``["UCX"]``. When any non-UCX backend is requested, the
@@ -347,6 +355,17 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         #     connector; avoids the "remote agent name equals local" reject).
         self._local_id = f"{host}:{port}"
         self._nixl_agent_name = str(uuid.uuid4())
+
+        if psk is None:
+            psk = envs.VLLM_P2P_SIDE_CHANNEL_PSK
+        self._psk = psk or None
+        if self._psk is None:
+            logger.warning(
+                "P2P %s: VLLM_P2P_SIDE_CHANNEL_PSK is not set; no peer can "
+                "authenticate, so P2P KV exchange is disabled. Set the same "
+                "key on every P2P peer to enable it.",
+                self._local_id,
+            )
 
         config_fields = FileMapper.from_offloading_spec(
             root_dir="",
@@ -755,6 +774,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 local_block_len=self._data.block_len,
                 local_hash_seed=self._get_hash_seed(),
                 conn=conn,
+                local_psk=self._psk,
+                initiator=True,
             )
         except Exception:
             logger.exception(
@@ -814,6 +835,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                     local_block_len=self._data.block_len,
                     local_hash_seed=self._get_hash_seed(),
                     conn=conn,
+                    local_psk=self._psk,
+                    initiator=False,
                 )
                 logger.info(
                     "P2P %s: created connected session for %s",
