@@ -565,9 +565,18 @@ class TestConnectHandshake:
         assert "peer:8000" in transport._remote_peers
         assert session.alive
 
-    def test_missing_fingerprint_allowed(self):
-        """Missing fingerprint on either side is allowed."""
+    def test_missing_fingerprint_rejected_when_local_set(self):
+        """A peer that omits the fingerprint is rejected when we have one."""
         transport = FakeDataTransport(config_fingerprint="abc123")
+        session, conn, _ = _make_session(transport=transport)
+        conn.enqueue(_peer_connect_msg())  # no fingerprint
+        session.poll()
+        assert "peer:8000" not in transport._remote_peers
+        assert not session.alive
+
+    def test_missing_fingerprint_allowed_when_local_unset(self):
+        """With no local fingerprint there is nothing to require."""
+        transport = FakeDataTransport(config_fingerprint="")
         session, conn, _ = _make_session(transport=transport)
         conn.enqueue(_peer_connect_msg())  # no fingerprint
         session.poll()

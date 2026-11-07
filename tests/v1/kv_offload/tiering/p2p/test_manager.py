@@ -52,6 +52,9 @@ from vllm.v1.kv_offload.tiering.p2p.session import (
 from vllm.v1.kv_offload.tiering.p2p.session.client import _LOOKUP_TIMEOUT_S
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import TYPE_KEY, DisconnectMsg
 
+# Placeholder pre-shared key for the control channel; not a real secret.
+_TEST_PSK = "test-p2p-psk-placeholder"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -129,6 +132,8 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._bp_detector = None
     mgr._local_id = "127.0.0.1:7777"
     mgr._hash_seed = "0"
+    # Shared by every manager built here so paired managers authenticate.
+    mgr._psk = _TEST_PSK
     mgr._finished_jobs = []
     mgr._failed_req_ids = set()
     mgr._sessions = {}
@@ -1590,8 +1595,9 @@ class TestAcceptNewPeers:
 
         assert peer_id in mgr._sessions
         assert mgr._sessions[peer_id].connected is True
-        # Session sent its ConnectMsg on the new connection.
-        assert any(m for m in sent)
+        # The acceptor stays silent until the peer authenticates, so nothing
+        # (in particular its ConnectMsg) reaches an unverified peer.
+        assert sent == []
 
 
 # ---------------------------------------------------------------------------

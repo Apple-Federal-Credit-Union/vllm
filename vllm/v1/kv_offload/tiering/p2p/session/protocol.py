@@ -59,16 +59,58 @@ message type (see per-message class docstrings below).
 Security
 --------
 
+The control socket is reachable by any process that can connect to it,
+so peers authenticate with a pre-shared key (``VLLM_P2P_SIDE_CHANNEL_PSK``)
+before any KV is exposed. The dialer sends its ConnectMsg first with an
+AUTH tag (see :func:`compute_control_auth`). The acceptor stays silent and
+verifies that tag before it discloses its own agent metadata or hash seed,
+registers the peer's RDMA memory, or serves a block. With no key configured
+an acceptor cannot authenticate anyone and refuses every inbound peer.
+
 Sessions wrap all incoming message handling in try/except to guard
 against malformed messages from adversarial or buggy peers. Invalid
 messages are logged and dropped without crashing the session.
 
 The config_fingerprint field in ConnectMsg ensures peers have
-compatible model configurations (model, dtype, block sizes). Mismatches
-are rejected during the handshake.
+compatible model configurations (model, dtype, block sizes). When a side
+has a fingerprint, the peer must present the same non-empty value; an
+omitted fingerprint is rejected during the handshake.
 """
 
+import hashlib
+import hmac
+
 TYPE_KEY = "type"
+
+# Domain-separation label for the control-channel authentication tag, so a
+# proof minted here can never be confused with any other HMAC the process
+# computes under the same pre-shared key.
+_AUTH_LABEL = b"vllm-p2p-control-auth-v1"
+
+
+def compute_control_auth(psk: str, sender_id: str, receiver_id: str) -> bytes:
+    """Authentication tag proving the sender holds the pre-shared key.
+
+    The tag is bound to the direction of one message: a side sends
+    ``compute_control_auth(psk, self, peer)`` and requires the peer to send
+    ``compute_control_auth(psk, peer, self)``. The two values differ, so a
+    peer that echoes our own tag back is rejected, and the tag a side sends
+    is independent of which side dialed. Binding the ZMQ identities means a
+    tag minted for one peer pair cannot be presented to another.
+
+    Args:
+        psk: The shared pre-shared key (``VLLM_P2P_SIDE_CHANNEL_PSK``).
+        sender_id: ``host:port`` identity of the side sending the tag.
+        receiver_id: ``host:port`` identity of the side verifying it.
+
+    Returns:
+        The HMAC-SHA256 tag for this sender and receiver.
+
+    """
+    msg = b"\0".join(
+        (_AUTH_LABEL, sender_id.encode("utf-8"), receiver_id.encode("utf-8"))
+    )
+    return hmac.new(psk.encode("utf-8"), msg, hashlib.sha256).digest()
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +170,11 @@ class ConnectMsg:
             if set, otherwise the built-in default). Block hashes chain from a
             seed derived from it, so peers with different values compute
             different hashes for identical content and must not exchange blocks.
+        AUTH: Pre-shared-key authentication tag for this peer pair (see
+            :func:`compute_control_auth`). Proves the sender holds the shared
+            ``VLLM_P2P_SIDE_CHANNEL_PSK`` without disclosing it. The acceptor
+            verifies it before registering the peer, serving any block, or
+            disclosing its own agent metadata and hash seed.
     """
 
     TYPE = "connect"
@@ -138,6 +185,7 @@ class ConnectMsg:
     BLOCK_LEN = "block_len"
     CONFIG_FINGERPRINT = "config_fingerprint"
     HASH_SEED = "hash_seed"
+    AUTH = "auth"
 
     @staticmethod
     def validate(msg: dict) -> None:

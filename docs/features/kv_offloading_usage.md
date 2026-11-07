@@ -308,6 +308,7 @@ Block content hashes must match across instances for peers to exchange blocks (s
 | `type` | yes | — | Must be `p2p`. |
 | `host` | no | `$VLLM_P2P_SIDE_CHANNEL_HOST` (`localhost`) | Address the control socket binds to, used verbatim as the identity peers dial back. When omitted, resolves from the env var below. The `localhost` default binds loopback only — for cross-host P2P you **must** set it to the node's routable IP (see below). |
 | `port` | no | `$VLLM_P2P_SIDE_CHANNEL_PORT` (`5710`) | Base port for the control socket. Must be reachable from peers. The bound port is `base + data_parallel_index` (one socket per DP replica). When omitted, the base resolves from the env var below. |
+| `psk` | yes, to serve peers | `$VLLM_P2P_SIDE_CHANNEL_PSK` (unset) | Pre-shared key that authenticates the control channel. Set the same value on every peer. See [Peer Authentication](#peer-authentication). Prefer the env var so the key stays out of the launch config. |
 | `backends` | no | `["UCX"]` | NIXL transport backends. See [NixlConnector Usage Guide](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin) for available backends and selection guidance. |
 | `num_threads` | no | `4` | NIXL agent worker threads. Only used when `backends` is UCX-only; ignored when any non-UCX backend is requested. |
 | `unbound_store_timeout_s` | no | `60` | Seconds a producer holds stored blocks for a consumer that has not fetched them yet. Raise it for deployments whose prefills outlast the default; the blocks keep primary-tier CPU slots pinned for the whole window. Once it expires a late fetch is rejected in a single round trip, so the consumer falls back to local prefill immediately. |
@@ -340,7 +341,23 @@ vllm serve <model> \
 Rather than embedding `host`/`port` in each `secondary_tiers` entry, set them once at deploy time via environment variables (mirroring `VLLM_NIXL_SIDE_CHANNEL_HOST`/`VLLM_NIXL_SIDE_CHANNEL_PORT`). Explicit `host`/`port` config keys, when present, take precedence.
 
 - `VLLM_P2P_SIDE_CHANNEL_HOST` (default `localhost`): address the P2P control socket binds to. It is used **verbatim** as both the bind address and the identity peers dial back — there is no auto-detection (this mirrors `VLLM_NIXL_SIDE_CHANNEL_HOST`). The default binds the loopback interface only, so peers on another host cannot reach it. **For any cross-host P2P deployment you must set this explicitly to the node's routable IP** (e.g. the pod IP) before launching `vllm serve` — otherwise remote peers will fail to connect. The NIXL agent name is a separate per-process identifier, so peers sharing a `host:port` never collide.
+- `VLLM_P2P_SIDE_CHANNEL_PSK` (default unset): pre-shared key that authenticates the P2P control channel. Every peer that exchanges KV blocks must set the same value. See [Peer Authentication](#peer-authentication).
 - `VLLM_P2P_SIDE_CHANNEL_PORT` (default `5710`): base port for the P2P control socket. The port actually bound is `VLLM_P2P_SIDE_CHANNEL_PORT + data_parallel_index` — one socket per DP replica, matching NIXL (for DP=1 the offset is 0). The peer's port is passed as `remote_port` in `kv_transfer_params`; the router/EPP that selects the DP rank (e.g. via the `X-data-parallel-rank` header) computes `remote_port = base + rank`. The DP-index offset separates replicas *within* one deployment; two co-located *deployments* (a prefiller and a decoder on the same host) still need distinct base ports (e.g. decoder base `5711`) to avoid a bind collision.
+
+#### Peer Authentication
+
+The control socket accepts connections from any process that can reach `host:port`. With the `localhost` default that means any other user on the host, and for cross-host P2P anything on the network. A peer that has completed the handshake can pull cached KV blocks for any prompt whose block hashes it can compute. For that reason the producer (serving) side authenticates every peer before it discloses its NIXL agent metadata or hash seed, registers the peer's memory, or serves a block.
+
+Set the same pre-shared key on every peer that exchanges KV blocks:
+
+```bash
+VLLM_P2P_SIDE_CHANNEL_PSK=<shared-secret> vllm serve ...
+```
+
+During the connect handshake each peer proves it holds the key with an HMAC tag tied to the two control identities and to the direction of the message. The key itself never crosses the wire, a peer cannot pass by sending back the tag it received, and a tag made for one peer pair cannot be used with another. A peer that omits the tag, presents a wrong one, or omits the config fingerprint is rejected.
+
+!!! warning
+    If `VLLM_P2P_SIDE_CHANNEL_PSK` is unset, no peer can authenticate. Every inbound peer is refused, so this instance serves no KV blocks to other instances. Set the key on every peer to turn P2P serving on. Generate it with a cryptographically secure random source (for example `openssl rand -hex 32`), keep it out of logs and version control, and rotate it if it leaks.
 
 #### Orchestration-Layer Protocol
 
