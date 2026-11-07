@@ -232,13 +232,19 @@ class ZmqTransport(ControlTransport):
         # Fail sends to a routing id with no live connection instead of
         # silently dropping them, so the owning session is marked dead.
         self._router.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        # Without handover a peer that reconnects with the same identity
+        # before the old pipe is dropped is ignored for the life of the
+        # socket, so its handshake never reaches _recv_router.
+        self._router.setsockopt(zmq.ROUTER_HANDOVER, 1)
         bind_addr = _tcp_addr(host, port)
         self._router.bind(bind_addr)
         logger.info("ZmqTransport %s: ROUTER bound on %s", self._local_id, bind_addr)
-        # Reports the fd of each dropped inbound TCP connection; matched
-        # against _AcceptedConnection.fd to retire the peer's connection.
+        # DISCONNECTED retires an accepted fd. ACCEPTED after that same fd
+        # means the kernel reused it for the replacement connection.
         router_monitor_addr = "inproc://p2p-router-monitor"
-        self._router.monitor(router_monitor_addr, zmq.EVENT_DISCONNECTED)
+        self._router.monitor(
+            router_monitor_addr, zmq.EVENT_DISCONNECTED | zmq.EVENT_ACCEPTED
+        )
         self._router_monitor: zmq.Socket = self._zmq_ctx.socket(zmq.PAIR)
         self._router_monitor.connect(router_monitor_addr)
 
@@ -283,17 +289,15 @@ class ZmqTransport(ControlTransport):
         # Retire connections a session killed since the last poll() before
         # routing traffic: otherwise a reconnecting peer's first message is
         # enqueued into the dead connection and discarded along with it.
-        # This closes only that between-polls window. A peer that dies while
-        # poll() is running is not seen until the next _check_monitors(), and
-        # one that dies silently not until the ZMQ heartbeat expires; both
-        # still take a message into a doomed connection and are out of scope.
         self._sweep_dead_connections()
-
-        self._recv_router()
+        # A peer that drops and reconnects before this poll queues
+        # DISCONNECTED and the new handshake together. Classify the
+        # handshake only after that disconnect is applied: Linux reuses
+        # the fd, so the message otherwise stays on the dying connection
+        # and the session drops it.
+        reaccepted = self._check_monitors()
+        self._recv_router(reaccepted)
         self._recv_dealers()
-        # After _recv_router(): a dropped connection's DISCONNECTED event is
-        # emitted before its fd can carry a new connection's messages, so
-        # every event older than the messages just read is visible here.
         self._check_monitors()
         self._sweep_dead_connections()
 
@@ -402,8 +406,15 @@ class ZmqTransport(ControlTransport):
             )
             return None
 
-    def _recv_router(self) -> None:
-        """Non-blocking: receive all pending messages from ROUTER."""
+    def _recv_router(self, reaccepted: set[int]) -> None:
+        """Non-blocking: receive all pending messages from ROUTER.
+
+        Args:
+            reaccepted: Fds disconnected and accepted again in this poll.
+                A message on one of them belongs to the replacement
+                connection, not the accepted connection that just died.
+
+        """
         while True:
             try:
                 frames = self._router.recv_multipart(zmq.NOBLOCK, copy=False)
@@ -445,11 +456,20 @@ class ZmqTransport(ControlTransport):
                 continue
 
             conn = self._connections.get(sender_id)
-            # The ROUTER binds a routing id to one live TCP connection, so a
-            # message on another fd means the earlier connection is gone.
-            if isinstance(conn, _AcceptedConnection) and conn.fd != fd:
+            # The routing id outlives the TCP connection it arrived on.
+            # Another fd, or the same fd accepted again after a disconnect,
+            # is a replacement peer — not more traffic on the old one.
+            if isinstance(conn, _AcceptedConnection) and (
+                conn.fd != fd or (not conn.alive and fd in reaccepted)
+            ):
                 conn.mark_dead()
-            if conn is not None and conn.alive:
+                self._pending_inbound.append((sender_id, routing_id, fd, msg))
+            elif conn is not None and (
+                conn.alive or isinstance(conn, _AcceptedConnection)
+            ):
+                # Includes trailing bytes on an accepted connection that
+                # dropped and was not replaced: those stay with it instead
+                # of opening a second peer.
                 conn.enqueue(msg)
             else:
                 self._pending_inbound.append((sender_id, routing_id, fd, msg))
@@ -485,35 +505,52 @@ class ZmqTransport(ControlTransport):
                 if msg is not None:
                     conn.enqueue(msg)
 
-    def _check_router_monitor(self) -> None:
-        """Mark accepted connections whose TCP connection dropped as dead."""
+    def _check_router_monitor(self) -> set[int]:
+        """Mark accepted connections whose TCP connection dropped as dead.
+
+        Returns:
+            Fds for which this drain saw ACCEPTED after DISCONNECTED.
+            The kernel may hand that fd to the connection that replaced
+            the one that dropped.
+
+        """
+        reaccepted: set[int] = set()
+        disconnected: set[int] = set()
         while True:
             try:
                 event = zmq.utils.monitor.recv_monitor_message(
                     self._router_monitor, zmq.NOBLOCK
                 )
             except zmq.Again:
-                return
+                return reaccepted
             except zmq.ZMQError as exc:
                 logger.warning(
                     "ZmqTransport %s: ROUTER monitor error: %s", self._local_id, exc
                 )
-                return
-            if event["event"] != zmq.EVENT_DISCONNECTED:
-                continue
+                return reaccepted
             fd = int(event["value"])
-            for conn in self._connections.values():
-                if isinstance(conn, _AcceptedConnection) and conn.fd == fd:
-                    logger.debug(
-                        "ZmqTransport %s: inbound peer %s disconnected",
-                        self._local_id,
-                        conn.peer_id,
-                    )
-                    conn.mark_dead()
+            if event["event"] == zmq.EVENT_DISCONNECTED:
+                disconnected.add(fd)
+                reaccepted.discard(fd)
+                for conn in self._connections.values():
+                    if isinstance(conn, _AcceptedConnection) and conn.fd == fd:
+                        logger.debug(
+                            "ZmqTransport %s: inbound peer %s disconnected",
+                            self._local_id,
+                            conn.peer_id,
+                        )
+                        conn.mark_dead()
+            elif event["event"] == zmq.EVENT_ACCEPTED and fd in disconnected:
+                reaccepted.add(fd)
 
-    def _check_monitors(self) -> None:
-        """Non-blocking: check all monitor sockets for fatal events."""
-        self._check_router_monitor()
+    def _check_monitors(self) -> set[int]:
+        """Non-blocking: check all monitor sockets for fatal events.
+
+        Returns:
+            Inbound fds accepted again after a disconnect in this drain.
+
+        """
+        reaccepted = self._check_router_monitor()
         for conn in self._connections.values():
             if not isinstance(conn, ZmqConnection) or not conn.alive:
                 continue
@@ -543,3 +580,4 @@ class ZmqTransport(ControlTransport):
                     )
                     conn.mark_dead()
                     break
+        return reaccepted

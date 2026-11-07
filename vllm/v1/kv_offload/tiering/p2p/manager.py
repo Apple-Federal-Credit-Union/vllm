@@ -777,6 +777,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 self._local_id,
                 conn.peer_id,
             )
+            # Accept runs before the tick's reap. A peer that died and
+            # reconnected in this poll still owns its session; retiring
+            # it here is what lets the new handshake in. Do it before the
+            # slot and backoff checks so a dead session neither consumes
+            # a slot nor skips a backoff its own reap just armed.
+            self._replace_dead_session(conn.peer_id)
             if len(self._sessions) >= max_peers:
                 logger.warning(
                     "P2P %s: rejecting inbound peer %s — session limit "
@@ -830,6 +836,18 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 logger.error("P2P %s: rejecting peer: %s", self._local_id, exc)
                 conn.close()
 
+    def _replace_dead_session(self, peer_id: str) -> None:
+        """Retire a dead session so *peer_id* can be accepted again.
+
+        Reports work the session already finished, then reaps it. A live
+        session is left in place and the caller rejects the new connection.
+        """
+        session = self._sessions.get(peer_id)
+        if session is None or not session.connected or session.alive:
+            return
+        self._record_session_poll(session)
+        self._reap_session(peer_id)
+
     def _reap_dead_sessions(self) -> None:
         # Reap connected sessions whose connection died — peer is gone.
         # Stranded prefiller-side stores are no longer tracked through a
@@ -844,44 +862,45 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if dead is None:
             return
         for pid in dead:
-            session = self._sessions.pop(pid)
-            # Purge any kv_request_id → session entries pointing at this
-            # session so subsequent submit_stores fall back to the unbound
-            # path (which will time out into failure if no peer rebinds).
-            stale_kv_ids = [
-                kid for kid, s in self._kv_to_session.items() if s is session
-            ]
-            for kid in stale_kv_ids:
-                del self._kv_to_session[kid]
-            close_result = session.close()
-            for job_id in close_result.failed_jobs:
-                self._finished_jobs.append(JobResult(job_id=job_id, success=False))
-            for job_id in close_result.failed_stores:
-                self._finished_jobs.append(JobResult(job_id=job_id, success=False))
-            # Fail every client-side request (in-flight loads plus unresolved
-            # symmetric-P2P probes) toward the dead peer so lookup() returns
-            # MISS (local prefill) instead of RETRY forever — even if a fresh
-            # session to the same peer is later opened by another request.
-            self._failed_req_ids.update(close_result.failed_req_ids)
-            # Release the TieringManager's per-request bookkeeping for the
-            # dead session's synthetic lookups on the next serve_external_requests.
-            self._failed_serve_ctxs.extend(close_result.failed_serves)
-            self._data.remove_remote_peer(pid)
-            fault_info = ""
-            if session.data_plane_fault is not None:
-                faults = self._data_plane_faults.get(pid, 0) + 1
-                self._data_plane_faults[pid] = faults
-                fault_info = f"; data-plane fault #{faults}"
-                backoff = self._schedule_reconnect_backoff(pid)
-                if backoff:
-                    fault_info += f"; reconnect backoff {backoff:.0f}s"
-            logger.warning(
-                "P2P %s: peer %s down (%s)%s",
-                self._local_id,
-                pid,
-                session.death_reason,
-                fault_info,
-            )
+            self._reap_session(pid)
+
+    def _reap_session(self, pid: str) -> None:
+        session = self._sessions.pop(pid)
+        # Purge any kv_request_id → session entries pointing at this
+        # session so subsequent submit_stores fall back to the unbound
+        # path (which will time out into failure if no peer rebinds).
+        stale_kv_ids = [kid for kid, s in self._kv_to_session.items() if s is session]
+        for kid in stale_kv_ids:
+            del self._kv_to_session[kid]
+        close_result = session.close()
+        for job_id in close_result.failed_jobs:
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+        for job_id in close_result.failed_stores:
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+        # Fail every client-side request (in-flight loads plus unresolved
+        # symmetric-P2P probes) toward the dead peer so lookup() returns
+        # MISS (local prefill) instead of RETRY forever — even if a fresh
+        # session to the same peer is later opened by another request.
+        self._failed_req_ids.update(close_result.failed_req_ids)
+        # Release the TieringManager's per-request bookkeeping for the
+        # dead session's synthetic lookups on the next serve_external_requests.
+        self._failed_serve_ctxs.extend(close_result.failed_serves)
+        self._data.remove_remote_peer(pid)
+        fault_info = ""
+        if session.data_plane_fault is not None:
+            faults = self._data_plane_faults.get(pid, 0) + 1
+            self._data_plane_faults[pid] = faults
+            fault_info = f"; data-plane fault #{faults}"
+            backoff = self._schedule_reconnect_backoff(pid)
+            if backoff:
+                fault_info += f"; reconnect backoff {backoff:.0f}s"
+        logger.warning(
+            "P2P %s: peer %s down (%s)%s",
+            self._local_id,
+            pid,
+            session.death_reason,
+            fault_info,
+        )
 
     def _schedule_reconnect_backoff(self, peer_id: str) -> float:
         """Record a data-plane fault for *peer_id*; return its reconnect wait.
@@ -1028,50 +1047,50 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         self._accept_new_peers(new_connections)
 
         for session in self._sessions.values():
-            result = session.poll()
-            for lr in result.loads:
-                self._finished_jobs.append(
-                    JobResult(job_id=lr.job_id, success=lr.success)
-                )
-                if not lr.success:
-                    self._failed_req_ids.add(lr.kv_request_id)
-            for sr in result.stores:
-                self._finished_jobs.append(
-                    JobResult(job_id=sr.job_id, success=sr.success)
-                )
-            # Bind kv_request_id → session for any FetchMsg this tick and
-            # replay any submit_store batches parked while no peer was
-            # asking. ServerRole.on_fetch already recorded the demand
-            # inline in dispatch, so the replayed add_stored_blocks calls
-            # match that demand and submit transfers immediately.
-            for kv_request_id in result.new_fetch_ids:
-                if kv_request_id in self._reaped_stores:
-                    # This id's blocks were already reaped, so no
-                    # submit_store will ever satisfy the demand on_fetch
-                    # just recorded. Finalize the round now: the peer gets
-                    # TransferDoneMsg(success=False) on this tick and falls
-                    # back to local prefill, instead of parking until its
-                    # own load timeout expires. The id is deliberately left
-                    # unbound so any later submit_store keeps taking the
-                    # reject path. Batches re-parked between the reap and the
-                    # retention prune are failed here rather than left to a
-                    # second reap, which would pin their slots for another
-                    # full timeout.
-                    session.finish_request(kv_request_id)
-                    for batch in self._unbound_stores.pop(kv_request_id, ()):
-                        self._finished_jobs.append(
-                            JobResult(job_id=batch.job_id, success=False)
-                        )
-                    continue
-                self._kv_to_session[kv_request_id] = session
-                for batch in self._unbound_stores.pop(kv_request_id, ()):
-                    session.add_stored_blocks(
-                        kv_request_id, batch.keys, batch.block_ids, batch.job_id
-                    )
+            self._record_session_poll(session)
 
         self._reap_dead_sessions()
         self._reap_unbound_stores()
         self._reap_idle_sessions()
+
+    def _record_session_poll(self, session: P2PSession) -> None:
+        """Poll one session and fold its results into the manager."""
+        result = session.poll()
+        for lr in result.loads:
+            self._finished_jobs.append(JobResult(job_id=lr.job_id, success=lr.success))
+            if not lr.success:
+                self._failed_req_ids.add(lr.kv_request_id)
+        for sr in result.stores:
+            self._finished_jobs.append(JobResult(job_id=sr.job_id, success=sr.success))
+        # Bind kv_request_id → session for any FetchMsg this tick and
+        # replay any submit_store batches parked while no peer was
+        # asking. ServerRole.on_fetch already recorded the demand
+        # inline in dispatch, so the replayed add_stored_blocks calls
+        # match that demand and submit transfers immediately.
+        for kv_request_id in result.new_fetch_ids:
+            if kv_request_id in self._reaped_stores:
+                # This id's blocks were already reaped, so no
+                # submit_store will ever satisfy the demand on_fetch
+                # just recorded. Finalize the round now: the peer gets
+                # TransferDoneMsg(success=False) on this tick and falls
+                # back to local prefill, instead of parking until its
+                # own load timeout expires. The id is deliberately left
+                # unbound so any later submit_store keeps taking the
+                # reject path. Batches re-parked between the reap and the
+                # retention prune are failed here rather than left to a
+                # second reap, which would pin their slots for another
+                # full timeout.
+                session.finish_request(kv_request_id)
+                for batch in self._unbound_stores.pop(kv_request_id, ()):
+                    self._finished_jobs.append(
+                        JobResult(job_id=batch.job_id, success=False)
+                    )
+                continue
+            self._kv_to_session[kv_request_id] = session
+            for batch in self._unbound_stores.pop(kv_request_id, ()):
+                session.add_stored_blocks(
+                    kv_request_id, batch.keys, batch.block_ids, batch.job_id
+                )
 
     # ------------------------------------------------------------------
     # Lifecycle

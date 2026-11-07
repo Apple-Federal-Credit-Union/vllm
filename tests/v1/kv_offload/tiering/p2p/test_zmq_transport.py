@@ -54,6 +54,24 @@ def _wait_for_inbound(transport: ZmqTransport, deadline: float = 2.0):
     raise AssertionError(f"no inbound connection within {deadline}s")
 
 
+def _wait_readable(sockets: list, timeout: float = 2.0) -> None:
+    """Wait until every socket has had data available at least once.
+
+    Used to stage a single poll() where both a message and a monitor
+    event are already queued. Reading either socket early would hide
+    the ordering the test is about.
+    """
+    poller = zmq.Poller()
+    for sock in sockets:
+        poller.register(sock, zmq.POLLIN)
+    pending = set(sockets)
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for ready, _ in poller.poll(50):
+            pending.discard(ready)
+    assert not pending, "timed out waiting for socket traffic"
+
+
 def _wait_for_messages(
     transport: ZmqTransport,
     conn: ZmqConnection,
@@ -352,6 +370,69 @@ class TestZmqReconnect:
         finally:
             transport_a.close()
             transport_b.close()
+
+    def test_reconnect_handshake_survives_same_poll_as_disconnect(self):
+        """A peer that drops and reconnects before poll() is accepted.
+
+        The disconnect and the new handshake are queued together. The
+        handshake has to come back on a new connection whether or not
+        the kernel reused the old fd; otherwise the peer waits out the
+        handshake timeout.
+        """
+        server, port = _make_transport()
+        client, _ = _make_transport()
+        try:
+            server_id = f"127.0.0.1:{port}"
+            out = client.connect(server_id)
+            out.send({"type": "connect", "n": 1})
+            old = _wait_for_inbound(server)[0]
+            assert old.peer_id == client._local_id
+            _wait_for_messages(server, old, 1)
+
+            # Retire the dealer without the server observing it, then
+            # dial again with the same identity and stage both events.
+            out.mark_dead()
+            rebound = client.connect(server_id)
+            rebound.send({"type": "connect", "n": 2})
+            _wait_readable([server._router, server._router_monitor])
+
+            new = server.poll()
+            assert len(new) == 1
+            assert new[0] is not old
+            assert not old.alive
+            assert list(old.recv()) == []
+            assert list(new[0].recv()) == [{"type": "connect", "n": 2}]
+            assert server._connections[client._local_id] is new[0]
+        finally:
+            server.close()
+            client.close()
+
+    def test_trailing_bytes_on_disconnect_do_not_open_a_peer(self):
+        """Unread bytes followed by a disconnect are not a new peer.
+
+        They share the dropped connection's fd and a DISCONNECTED event.
+        Promoting them to a fresh connection would accept a peer that
+        has already gone.
+        """
+        server, port = _make_transport()
+        client, _ = _make_transport()
+        try:
+            out = client.connect(f"127.0.0.1:{port}")
+            out.send({"n": 1})
+            old = _wait_for_inbound(server)[0]
+            _wait_for_messages(server, old, 1)
+
+            out.send({"n": 2})
+            _wait_readable([server._router])
+            client.close()
+            _wait_readable([server._router_monitor])
+
+            assert not server.poll()
+            assert not old.alive
+            assert list(old.recv()) == [{"n": 2}]
+        finally:
+            server.close()
+            client.close()
 
 
 class TestExpandedMonitorEvents:

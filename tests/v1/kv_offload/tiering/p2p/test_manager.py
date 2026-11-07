@@ -1546,6 +1546,65 @@ class TestAcceptNewPeers:
         # Session map unchanged.
         assert mgr._sessions[peer_id] is existing
 
+    def test_dead_session_yields_to_inbound_reconnect(self):
+        """A reconnect that arrives before reap replaces the dead session.
+
+        Accept runs before the tick's reap, so a still-registered dead
+        session used to fail the duplicate-peer check and the new
+        handshake was closed. Completed work from the dead session is
+        still reported.
+        """
+
+        class FakeData:
+            block_len = 4096
+            base_addr = 0x1000
+            num_blocks = 16
+            config_fingerprint = ""
+
+            def get_agent_metadata(self):
+                return b"meta"
+
+            def remove_remote_peer(self, pid):
+                pass
+
+        mgr = _make_manager()
+        mgr._data = FakeData()
+        peer_id = "10.0.0.1:8000"
+        dead = _FakeSession(
+            peer_id=peer_id,
+            alive=False,
+            connected=True,
+            loads=[LoadResult(job_id=9, kv_request_id="req-9", success=True)],
+            close_jobs=[8],
+        )
+        mgr._sessions[peer_id] = dead
+
+        sent: list[dict] = []
+
+        class _Conn:
+            def __init__(self, pid: str) -> None:
+                self.peer_id = pid
+                self.alive = True
+                self.close_calls = 0
+
+            def send(self, msg: dict) -> None:
+                sent.append(msg)
+
+            def close(self) -> None:
+                self.close_calls += 1
+                self.alive = False
+
+        new_conn = _Conn(peer_id)
+        mgr._accept_new_peers([new_conn])  # type: ignore[list-item]
+
+        assert new_conn.close_calls == 0
+        assert mgr._sessions[peer_id] is not dead
+        assert mgr._sessions[peer_id].connected is True
+        assert any(sent)
+        finished = {(r.job_id, r.success) for r in mgr._finished_jobs}
+        assert (9, True) in finished
+        assert (8, False) in finished
+
     def test_creates_session_for_new_peer(self):
         """An inbound conn from a peer with no existing session creates
         a fresh connected session and registers it under conn.peer_id.
