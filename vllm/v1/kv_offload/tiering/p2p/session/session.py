@@ -36,6 +36,7 @@ from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
     TYPE_KEY,
     AbortAckMsg,
     AbortFetchMsg,
+    AuthMsg,
     ConnectAckMsg,
     ConnectMsg,
     DisconnectMsg,
@@ -68,6 +69,9 @@ _MAX_CONSECUTIVE_DISPATCH_ERRORS = 5
 # before disconnecting: the peer frees their destination blocks on
 # DisconnectMsg, but a stuck transfer must not hold the session open.
 _PEER_FAULT_DRAIN_S = 10.0
+
+# The only message types accepted from a peer that has not authenticated.
+_PRE_AUTH_TYPES = frozenset({AuthMsg.TYPE, ConnectMsg.TYPE, DisconnectMsg.TYPE})
 
 
 class SessionPollResult(NamedTuple):
@@ -138,14 +142,15 @@ class P2PSession:
         self._local_hash_seed = local_hash_seed
         self._conn: ControlConnection | None = None
 
-        # ``initiator`` is False for an accepted inbound connection, which is
-        # always the serving side. An acceptor discloses nothing, registers
-        # nothing, and serves nothing until the peer presents a valid tag.
-        # Sent and expected tags bind opposite directions so an echoed tag
-        # fails. Without a PSK there is no tag, so inbound peers are refused.
+        # ``initiator`` is False for an accepted inbound connection. In either
+        # direction no peer is sent our metadata, registered, or served until
+        # it presents a valid tag. Sent and expected tags bind opposite
+        # directions so an echoed tag fails. Without a PSK there is no tag, so
+        # every peer is refused.
         self._local_psk = local_psk or None
         self._initiator = initiator
         self._connect_sent = False
+        self._peer_authenticated = False
         self._sent_auth: bytes | None = None
         self._expected_auth: bytes | None = None
         if self._local_psk is not None:
@@ -248,10 +253,11 @@ class P2PSession:
     def attach_connection(self, conn: ControlConnection) -> None:
         """Attach a connection to a pending session.
 
-        The initiator (we dialed the peer) advertises its NIXL metadata right
-        away so the peer can register it. The acceptor stays silent until the
-        peer authenticates in ``_on_connect``: announcing first would disclose
-        our agent metadata and hash seed to any process that reached the port.
+        The initiator (we dialed the peer) proves the key with a tag-only
+        AuthMsg; it sends its ConnectMsg only after verifying the peer. The
+        acceptor stays silent until the peer authenticates. Either way no
+        agent metadata or hash seed reaches an unverified peer. Without a PSK
+        nothing can authenticate, so neither side sends anything.
         """
         if self._conn is not None:
             raise ValueError(f"P2PSession {self.peer_id}: already connected")
@@ -259,8 +265,14 @@ class P2PSession:
         now = time.monotonic()
         self._connected_at = now
         self._last_activity_at = now
-        if self._initiator:
-            self._send_connect()
+        if self._initiator and self._sent_auth is not None:
+            self._conn.send(
+                {
+                    TYPE_KEY: AuthMsg.TYPE,
+                    AuthMsg.PEER_ID: self._local_id,
+                    AuthMsg.AUTH: self._sent_auth,
+                }
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -534,7 +546,14 @@ class P2PSession:
         if self._conn is not None and not self._conn.alive:
             return
         msg_type = msg.get(TYPE_KEY) if isinstance(msg, dict) else None
-        if msg_type == ConnectMsg.TYPE:
+        # Until the peer authenticates it may only run the handshake. Anything
+        # else would let it mark us ready (and so be served), bind a
+        # kv_request_id to its session, or probe which blocks we hold.
+        if not self._peer_authenticated and msg_type not in _PRE_AUTH_TYPES:
+            raise ValueError(f"{msg_type!r} before authentication")
+        if msg_type == AuthMsg.TYPE:
+            self._on_auth(msg)
+        elif msg_type == ConnectMsg.TYPE:
             self._on_connect(msg)
         elif msg_type == ConnectAckMsg.TYPE:
             ConnectAckMsg.validate(msg)
@@ -616,7 +635,8 @@ class P2PSession:
             return
         try:
             ConnectMsg.validate(msg)
-            self._authenticate_peer(msg)
+            if not self._peer_authenticated:
+                self._verify_peer_tag(msg.get(ConnectMsg.AUTH))
             if msg[ConnectMsg.BLOCK_LEN] != self._local_block_len:
                 raise ValueError(
                     f"block_len mismatch from {self.peer_id}: "
@@ -631,10 +651,9 @@ class P2PSession:
                     f"local={self._local_hash_seed!r}. Ensure PYTHONHASHSEED "
                     "(if set) matches on all P2P peers."
                 )
-            # Only now may an acceptor disclose its metadata. Sent before the
-            # registration below so both sides register in parallel.
-            if not self._connect_sent:
-                self._send_connect()
+            # Sent before the registration below so both sides register in
+            # parallel.
+            self._maybe_send_connect()
             registration = self._transport.add_remote_peer_async(
                 self.peer_id,
                 agent_metadata=msg[ConnectMsg.AGENT_METADATA],
@@ -652,30 +671,45 @@ class P2PSession:
         # against blocks this side has not registered yet.
         self._pending_registration = registration
 
-    def _authenticate_peer(self, msg: dict) -> None:
-        """Verify the peer's pre-shared-key proof, or raise ValueError.
+    def _on_auth(self, msg: dict) -> None:
+        """Verify a peer's AuthMsg, then disclose our ConnectMsg to it."""
+        if self._peer_authenticated:
+            return
+        try:
+            AuthMsg.validate(msg)
+            self._verify_peer_tag(msg[AuthMsg.AUTH])
+        except ValueError as exc:
+            logger.error("P2PSession %s: rejecting peer auth: %s", self.peer_id, exc)
+            self._mark_dead(f"rejected peer auth: {exc}")
+            return
+        self._maybe_send_connect()
 
-        With no PSK configured, an acceptor cannot authenticate anyone, so it
-        refuses every inbound peer. The initiator path keeps the legacy
-        unauthenticated behavior only toward a peer it deliberately dialed.
-        When a PSK is configured both directions are authenticated.
+    def _verify_peer_tag(self, proof: object) -> None:
+        """Mark the peer authenticated if ``proof`` is its valid tag.
+
+        Raises ValueError otherwise. Applies in both directions: no peer is
+        registered or served without a valid tag, and with no PSK configured
+        nobody can authenticate.
         """
         if self._expected_auth is None:
-            if not self._initiator:
-                raise ValueError(
-                    "P2P control channel requires VLLM_P2P_SIDE_CHANNEL_PSK; "
-                    "refusing unauthenticated peer"
-                )
-            return
+            raise ValueError(
+                "P2P control channel requires VLLM_P2P_SIDE_CHANNEL_PSK; "
+                "refusing unauthenticated peer"
+            )
         # A peer claiming our own identity would make the tag it must send
         # equal the one we send, defeating the direction binding.
         if self.peer_id == self._local_id:
             raise ValueError("peer claims this side's own control identity")
-        proof = msg.get(ConnectMsg.AUTH)
         if not isinstance(proof, bytes) or not hmac.compare_digest(
             proof, self._expected_auth
         ):
             raise ValueError("peer failed P2P control-channel authentication")
+        self._peer_authenticated = True
+
+    def _maybe_send_connect(self) -> None:
+        """Disclose our ConnectMsg once, and only to an authenticated peer."""
+        if self._peer_authenticated and not self._connect_sent:
+            self._send_connect()
 
     def _check_config_fingerprint(self, msg: dict) -> None:
         """Require a matching config fingerprint, or raise ValueError.

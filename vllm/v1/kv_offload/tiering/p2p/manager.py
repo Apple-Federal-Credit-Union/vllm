@@ -273,8 +273,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 is refused before any agent metadata, hash seed, or cached
                 block is disclosed or served. Defaults to
                 ``VLLM_P2P_SIDE_CHANNEL_PSK`` when not set. With no key
-                configured, inbound peers cannot authenticate, so serving
-                is disabled.
+                configured nobody can authenticate, so P2P KV exchange is
+                disabled.
             backends: NIXL transport backends (e.g. ``["UCX"]``,
                 ``["MOONCAKE"]``, ``["LIBFABRIC"]``). Defaults to
                 ``["UCX"]``. When any non-UCX backend is requested, the
@@ -356,19 +356,14 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         self._local_id = f"{host}:{port}"
         self._nixl_agent_name = str(uuid.uuid4())
 
-        # Pre-shared key authenticating the control channel. Every peer that
-        # exchanges KV blocks must hold the same value; a peer that cannot
-        # prove it is refused before any agent metadata, hash seed, or cached
-        # block is disclosed or served. With none configured, inbound peers
-        # cannot authenticate and are refused, so serving is disabled.
         if psk is None:
             psk = envs.VLLM_P2P_SIDE_CHANNEL_PSK
         self._psk = psk or None
         if self._psk is None:
             logger.warning(
-                "P2P %s: VLLM_P2P_SIDE_CHANNEL_PSK is not set; inbound peers "
-                "cannot authenticate and will be refused, so KV serving is "
-                "disabled. Set the same key on every P2P peer to enable it.",
+                "P2P %s: VLLM_P2P_SIDE_CHANNEL_PSK is not set; no peer can "
+                "authenticate, so P2P KV exchange is disabled. Set the same "
+                "key on every P2P peer to enable it.",
                 self._local_id,
             )
 

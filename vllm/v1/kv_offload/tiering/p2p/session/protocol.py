@@ -61,11 +61,15 @@ Security
 
 The control socket is reachable by any process that can connect to it,
 so peers authenticate with a pre-shared key (``VLLM_P2P_SIDE_CHANNEL_PSK``)
-before any KV is exposed. The dialer sends its ConnectMsg first with an
-AUTH tag (see :func:`compute_control_auth`). The acceptor stays silent and
-verifies that tag before it discloses its own agent metadata or hash seed,
-registers the peer's RDMA memory, or serves a block. With no key configured
-an acceptor cannot authenticate anyone and refuses every inbound peer.
+before any KV is exposed. Neither side discloses its agent metadata or hash
+seed, registers the peer's RDMA memory, or serves a block until it has
+verified the peer's tag (see :func:`compute_control_auth`):
+
+1. The dialer sends AuthMsg (a tag, no metadata). The acceptor stays silent.
+2. The acceptor verifies it, then sends its ConnectMsg with its own tag.
+3. The dialer verifies that tag, then sends its ConnectMsg.
+
+With no key configured nobody can authenticate, so every peer is refused.
 
 Sessions wrap all incoming message handling in try/except to guard
 against malformed messages from adversarial or buggy peers. Invalid
@@ -196,6 +200,30 @@ class ConnectMsg:
         _require_pos_int(msg, ConnectMsg.NUM_BLOCKS)
         _require_pos_int(msg, ConnectMsg.BLOCK_LEN)
         _require(msg, ConnectMsg.HASH_SEED, str)
+
+
+class AuthMsg:
+    """Dialer → Acceptor: pre-shared-key proof, sent before any metadata.
+
+    The dialer sends this instead of its ConnectMsg so it can prove the key
+    without disclosing its agent metadata or hash seed to a peer it has not
+    yet verified. The acceptor answers with its own ConnectMsg, whose AUTH
+    tag lets the dialer verify it in turn.
+
+    Fields:
+        PEER_ID: Sender's peer identity string.
+        AUTH: Tag for this sender and receiver (see compute_control_auth).
+    """
+
+    TYPE = "auth"
+    PEER_ID = "peer_id"
+    AUTH = "auth"
+
+    @staticmethod
+    def validate(msg: dict) -> None:
+        """Raise ValueError if any field has an invalid type or value."""
+        _require(msg, AuthMsg.PEER_ID, str)
+        _require(msg, AuthMsg.AUTH, bytes)
 
 
 class ConnectAckMsg:

@@ -1765,8 +1765,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Every peer that exchanges KV blocks must set the same value; a peer
     # that cannot prove knowledge of it is refused before any agent
     # metadata, hash seed, or cached block is disclosed or served. Empty
-    # (the default) leaves peer serving disabled: an unset key cannot
-    # authenticate anyone, so inbound peers are rejected.
+    # (the default) disables P2P KV exchange: an unset key cannot
+    # authenticate anyone, so every peer is refused.
     "VLLM_P2P_SIDE_CHANNEL_PSK": lambda: os.getenv("VLLM_P2P_SIDE_CHANNEL_PSK", ""),
     # Maximum number of concurrent P2P peer sessions. Limits ZMQ socket
     # consumption to prevent denial-of-service via unbounded peer

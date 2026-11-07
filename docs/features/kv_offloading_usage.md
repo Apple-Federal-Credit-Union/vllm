@@ -346,7 +346,7 @@ Rather than embedding `host`/`port` in each `secondary_tiers` entry, set them on
 
 #### Peer Authentication
 
-The control socket accepts connections from any process that can reach `host:port`. With the `localhost` default that means any other user on the host, and for cross-host P2P anything on the network. A peer that has completed the handshake can pull cached KV blocks for any prompt whose block hashes it can compute. For that reason the producer (serving) side authenticates every peer before it discloses its NIXL agent metadata or hash seed, registers the peer's memory, or serves a block.
+The control socket accepts connections from any process that can reach `host:port`. With the `localhost` default that means any other user on the host, and for cross-host P2P anything on the network. A peer that has completed the handshake can pull cached KV blocks for any prompt whose block hashes it can compute. For that reason neither side discloses its NIXL agent metadata or hash seed, registers the peer's memory, or serves a block until it has authenticated the peer. This holds whichever side dialed.
 
 Set the same pre-shared key on every peer that exchanges KV blocks:
 
@@ -354,10 +354,10 @@ Set the same pre-shared key on every peer that exchanges KV blocks:
 VLLM_P2P_SIDE_CHANNEL_PSK=<shared-secret> vllm serve ...
 ```
 
-During the connect handshake each peer proves it holds the key with an HMAC tag tied to the two control identities and to the direction of the message. The key itself never crosses the wire, a peer cannot pass by sending back the tag it received, and a tag made for one peer pair cannot be used with another. A peer that omits the tag, presents a wrong one, or omits the config fingerprint is rejected.
+During the connect handshake each peer proves it holds the key with an HMAC tag tied to the two control identities and to the direction of the message. The dialing side sends only its tag first and sends its metadata after it verifies the other side's tag. The key itself never crosses the wire, a peer cannot pass by sending back the tag it received, and a tag made for one peer pair cannot be used with another. A peer that omits the tag, presents a wrong one, omits the config fingerprint, or sends any other message before authenticating is disconnected.
 
 !!! warning
-    If `VLLM_P2P_SIDE_CHANNEL_PSK` is unset, no peer can authenticate. Every inbound peer is refused, so this instance serves no KV blocks to other instances. Set the key on every peer to turn P2P serving on. Generate it with a cryptographically secure random source (for example `openssl rand -hex 32`), keep it out of logs and version control, and rotate it if it leaks.
+    If `VLLM_P2P_SIDE_CHANNEL_PSK` is unset, no peer can authenticate and every peer is refused, so this instance neither serves KV blocks to other instances nor loads them from other instances. Set the key on every peer to turn P2P exchange on. Generate it with a cryptographically secure random source (for example `openssl rand -hex 32`), keep it out of logs and version control, and rotate it if it leaks.
 
 #### Orchestration-Layer Protocol
 

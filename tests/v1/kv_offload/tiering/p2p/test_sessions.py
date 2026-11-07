@@ -44,6 +44,7 @@ from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
     TYPE_KEY,
     AbortAckMsg,
     AbortFetchMsg,
+    AuthMsg,
     ConnectAckMsg,
     ConnectMsg,
     DisconnectMsg,
@@ -51,6 +52,7 @@ from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
     LookupMsg,
     LookupRespMsg,
     TransferDoneMsg,
+    compute_control_auth,
 )
 from vllm.v1.kv_offload.tiering.p2p.session.server import (
     _CANCEL_DRAIN_TIMEOUT_S,
@@ -70,6 +72,14 @@ from vllm.v1.kv_offload.tiering.p2p.session.session import (
 # Shared PYTHONHASHSEED used by the session under test and the fake peer's
 # ConnectMsg so the handshake succeeds unless a test overrides one side.
 _DEFAULT_HASH_SEED = "0"
+
+# Placeholder pre-shared key for the control channel; not a real secret.
+_TEST_PSK = "test-p2p-psk-placeholder"
+
+
+def _auth(sender_id: str, receiver_id: str) -> bytes:
+    """Tag the peer ``sender_id`` presents to the session ``receiver_id``."""
+    return compute_control_auth(_TEST_PSK, sender_id, receiver_id)
 
 
 class FakeDataTransport:
@@ -247,8 +257,9 @@ def _peer_connect_msg(
     block_len: int = 4096,
     fingerprint: str | None = None,
     hash_seed: str = _DEFAULT_HASH_SEED,
+    local_id: str = "local:9000",
 ) -> dict:
-    """Build a ConnectMsg as if the peer sent it."""
+    """Build a ConnectMsg as if the peer sent it to session ``local_id``."""
     msg = {
         TYPE_KEY: ConnectMsg.TYPE,
         ConnectMsg.PEER_ID: peer_id,
@@ -257,6 +268,7 @@ def _peer_connect_msg(
         ConnectMsg.NUM_BLOCKS: 16,
         ConnectMsg.BLOCK_LEN: block_len,
         ConnectMsg.HASH_SEED: hash_seed,
+        ConnectMsg.AUTH: _auth(peer_id, local_id),
     }
     if fingerprint is not None:
         msg[ConnectMsg.CONFIG_FINGERPRINT] = fingerprint
@@ -344,6 +356,7 @@ def _make_session(
         local_block_len=transport.block_len,
         local_hash_seed=local_hash_seed,
         conn=conn,
+        local_psk=_TEST_PSK,
     )
     return session, conn, transport
 
@@ -422,12 +435,19 @@ def _srv_total_inflight(session: P2PSession) -> int:
 
 
 class TestConnectHandshake:
-    def test_connect_msg_sent_on_creation(self):
-        """Session sends its own ConnectMsg on connection."""
+    def test_dialer_proves_key_before_disclosing_metadata(self):
+        """The dialer opens with a tag only; metadata waits for peer auth."""
         session, conn, _ = _make_session()
         assert len(conn._sent) == 1
-        msg = conn._sent[0]
-        assert msg[TYPE_KEY] == ConnectMsg.TYPE
+        auth = conn._sent[0]
+        assert auth[TYPE_KEY] == AuthMsg.TYPE
+        assert auth[AuthMsg.AUTH] == _auth("local:9000", "peer:8000")
+        assert ConnectMsg.AGENT_METADATA not in auth
+        assert ConnectMsg.HASH_SEED not in auth
+
+        conn.enqueue(_peer_connect_msg())
+        session.poll()
+        msg = next(m for m in conn._sent if m[TYPE_KEY] == ConnectMsg.TYPE)
         assert msg[ConnectMsg.PEER_ID] == "local:9000"
         assert msg[ConnectMsg.NUM_BLOCKS] == 16
         assert msg[ConnectMsg.BLOCK_LEN] == 4096
@@ -517,12 +537,21 @@ class TestConnectHandshake:
         assert not conn.alive
 
     def test_connect_ack_makes_session_ready(self):
-        """Session.ready becomes True after ConnectAckMsg."""
+        """Session.ready becomes True after an authenticated peer's ack."""
         session, conn, _ = _make_session()
         assert not session.ready
+        conn.enqueue(_peer_connect_msg())
         conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
         assert session.ready
+
+    def test_connect_ack_before_auth_is_refused(self):
+        """An ack from an unauthenticated peer must not make us ready."""
+        session, conn, _ = _make_session()
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
+        session.poll()
+        assert not session.ready
+        assert not session.alive
 
     def test_messages_queued_before_ack_flush_on_ack(self):
         """Outgoing messages sent before ConnectAck are flushed after."""
@@ -530,9 +559,10 @@ class TestConnectHandshake:
         session.request_blocks(
             job_id=1, kv_request_id="req-1", keys=[OffloadKey(b"k")], block_ids=[0]
         )
-        # Before ack: only our ConnectMsg was sent.
-        assert len(conn._sent) == 1
-        assert conn._sent[0][TYPE_KEY] == ConnectMsg.TYPE
+        conn.enqueue(_peer_connect_msg())
+        session.poll()
+        # Peer authenticated, but no ack yet: the fetch is still queued.
+        assert not any(m[TYPE_KEY] == FetchMsg.TYPE for m in conn._sent)
         # Ack arrives.
         conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
@@ -602,8 +632,11 @@ class TestConnectHandshake:
 
     def test_hash_seed_advertised_in_connect_msg(self):
         """Session advertises its own PYTHONHASHSEED in the ConnectMsg."""
-        _, conn, _ = _make_session(local_hash_seed="777")
-        assert conn._sent[0][ConnectMsg.HASH_SEED] == "777"
+        session, conn, _ = _make_session(local_hash_seed="777")
+        conn.enqueue(_peer_connect_msg(hash_seed="777"))
+        session.poll()
+        msg = next(m for m in conn._sent if m[TYPE_KEY] == ConnectMsg.TYPE)
+        assert msg[ConnectMsg.HASH_SEED] == "777"
 
 
 # ---------------------------------------------------------------------------
@@ -2926,8 +2959,8 @@ class TestPendingSession:
         assert not session.connected
         assert session.alive
 
-    def test_attach_connection_sends_connect(self):
-        """attach_connection triggers our ConnectMsg send."""
+    def test_attach_connection_sends_auth(self):
+        """attach_connection on a dialer sends only its tag-only AuthMsg."""
         transport = FakeDataTransport()
         session = P2PSession(
             peer_id="peer:8000",
@@ -2936,11 +2969,11 @@ class TestPendingSession:
             local_block_len=4096,
             local_hash_seed=_DEFAULT_HASH_SEED,
             conn=None,
+            local_psk=_TEST_PSK,
         )
         conn = FakeConnection(peer_id="peer:8000")
         session.attach_connection(conn)
-        assert conn._sent
-        assert conn._sent[0][TYPE_KEY] == ConnectMsg.TYPE
+        assert [m[TYPE_KEY] for m in conn._sent] == [AuthMsg.TYPE]
 
     def test_attach_connection_twice_raises(self):
         """attach_connection on an already-connected session raises."""
@@ -3500,6 +3533,7 @@ class TestHandshakeDeadline:
             local_block_len=4096,
             local_hash_seed=_DEFAULT_HASH_SEED,
             conn=conn,
+            local_psk=_TEST_PSK,
         )
 
         # Complete the handshake by feeding ConnectMsg + ConnectAckMsg.
@@ -3513,6 +3547,7 @@ class TestHandshakeDeadline:
                 ConnectMsg.BLOCK_LEN: 4096,
                 ConnectMsg.CONFIG_FINGERPRINT: "",
                 ConnectMsg.HASH_SEED: _DEFAULT_HASH_SEED,
+                ConnectMsg.AUTH: _auth("good:1234", "local:1"),
             },
             {TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "good:1234"},
         ]
@@ -3540,6 +3575,7 @@ class TestHandshakeDeadline:
             local_block_len=4096,
             local_hash_seed=_DEFAULT_HASH_SEED,
             conn=conn,
+            local_psk=_TEST_PSK,
         )
         session._connected_at = time.monotonic() - 5
         conn._inbox = [
@@ -3552,6 +3588,7 @@ class TestHandshakeDeadline:
                 ConnectMsg.BLOCK_LEN: 4096,
                 ConnectMsg.CONFIG_FINGERPRINT: "",
                 ConnectMsg.HASH_SEED: _DEFAULT_HASH_SEED,
+                ConnectMsg.AUTH: _auth("late-ack:1", "local:1"),
             },
             {TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "late-ack:1"},
         ]
