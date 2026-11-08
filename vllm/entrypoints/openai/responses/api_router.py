@@ -93,6 +93,7 @@ async def retrieve_responses(
         response_id,
         starting_after=starting_after,
         stream=stream,
+        raw_request=raw_request,
     )
 
     if isinstance(response, ErrorResponse):
@@ -114,7 +115,7 @@ async def cancel_responses(response_id: str, raw_request: Request):
     if handler is None:
         raise NotImplementedError("The model does not support Responses API")
 
-    response = await handler.cancel_responses(response_id)
+    response = await handler.cancel_responses(response_id, raw_request)
 
     if isinstance(response, ErrorResponse):
         return JSONResponse(

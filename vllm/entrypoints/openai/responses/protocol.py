@@ -359,7 +359,8 @@ class ResponsesRequest(OpenAIBaseModel):
         description=(
             "The request_id related to this request. If the caller does "
             "not set it, a random_uuid will be generated. This id is used "
-            "through out the inference process and return in response."
+            "through out the inference process. A caller-supplied value is "
+            "not used as the response id."
         ),
     )
     session_id: str | None = Field(
@@ -538,6 +539,20 @@ class ResponsesRequest(OpenAIBaseModel):
         default=None
     )
     """Parser-derived constraints that preserve the public request's text metadata."""
+
+    _generated_response_id: str = PrivateAttr(
+        default_factory=lambda: f"resp_{random_uuid()}"
+    )
+
+    _store_binding: Any = PrivateAttr(default=None)
+    """Owner and history state set by the serving layer for stored responses."""
+
+    @property
+    def response_id(self) -> str:
+        """Server-generated id of the response; never a caller-chosen id."""
+        if "request_id" in self.model_fields_set:
+            return self._generated_response_id
+        return self.request_id
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -950,6 +965,9 @@ class ResponsesResponse(OpenAIBaseModel):
     )
     # --8<-- [end:responses-response-extra-params]
 
+    _store_binding: Any = PrivateAttr(default=None)
+    """Owner and history state set by the serving layer for stored responses."""
+
     # NOTE: openAI harmony doesn't serialize TextContent properly,
     # TODO: this fixes for TextContent, but need to verify for tools etc
     # https://github.com/openai/harmony/issues/78
@@ -986,7 +1004,7 @@ class ResponsesResponse(OpenAIBaseModel):
         # which is content_filter
         # incomplete_details = IncompleteDetails(reason='content_filter')
         return cls(
-            id=request.request_id,
+            id=request.response_id,
             created_at=created_time,
             incomplete_details=incomplete_details,
             instructions=request.instructions,
