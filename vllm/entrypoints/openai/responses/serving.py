@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
+import secrets
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Final, cast
 
@@ -99,6 +102,37 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+
+_BackgroundEvents = tuple[deque[StreamingResponsesResponse], asyncio.Event]
+
+
+@dataclass(eq=False)
+class _StoreBinding:
+    """Server-side state bound to a stored response when it is created.
+
+    Retrieve, cancel, and ``previous_response_id`` act on the binding of the
+    response they authorized, never on a second lookup by id.
+    """
+
+    owner: str | None
+    messages: ResponsesPreviousMessages | None = None
+    task: asyncio.Task | None = None
+    events: _BackgroundEvents | None = None
+
+    def is_owned_by(self, owner: str | None) -> bool:
+        if self.owner is None or owner is None:
+            return self.owner is owner
+        return secrets.compare_digest(self.owner, owner)
+
+
+def _store_owner(raw_request: Request | None) -> str | None:
+    """Identify the caller of a stored response by its Authorization header."""
+    if raw_request is None:
+        return None
+    authorization = raw_request.headers.get("Authorization")
+    if not authorization:
+        return None
+    return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
 
 
 class OpenAIServingResponses(GenerateBaseServing):
@@ -295,13 +329,9 @@ class OpenAIServingResponses(GenerateBaseServing):
         previous_messages: ResponsesPreviousMessages | None = None
         previous_response_outputs: list[ResponseOutputItem] | None = None
         if prev_response is not None:
-            stored_messages = (
-                self.msg_store[prev_response.id]
-                if self.use_harmony
-                else self.msg_store.get(prev_response.id)
-            )
-            if stored_messages is not None:
-                previous_messages = stored_messages.copy()
+            binding: _StoreBinding = prev_response._store_binding
+            if binding.messages is not None:
+                previous_messages = binding.messages.copy()
             previous_response_outputs = list(prev_response.output)
 
         return await self.online_renderer.render_responses(
@@ -361,11 +391,13 @@ class OpenAIServingResponses(GenerateBaseServing):
             # value).
             request.store = False
 
+        store_owner = _store_owner(raw_request)
+
         # Handle the previous response ID.
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
             async with self.response_store_lock:
-                prev_response = self.response_store.get(prev_response_id)
+                prev_response = self._get_owned_response(prev_response_id, store_owner)
             if prev_response is None:
                 return self._make_not_found_error(prev_response_id)
         else:
@@ -537,9 +569,13 @@ class OpenAIServingResponses(GenerateBaseServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        binding = _StoreBinding(owner=store_owner)
+        request._store_binding = binding
+
         # Store the input messages.
         if request.store:
-            self.msg_store[request.request_id] = messages
+            binding.messages = messages
+            self.msg_store[request.response_id] = messages
 
         if request.background:
             created_time = int(time.time())
@@ -552,6 +588,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                 status="queued",
                 usage=None,
             )
+            response._store_binding = binding
+            if request.stream:
+                events: _BackgroundEvents = (deque(), asyncio.Event())
+                binding.events = events
+                self.event_store[response.id] = events
             async with self.response_store_lock:
                 self.response_store[response.id] = response
 
@@ -560,6 +601,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 task = asyncio.create_task(
                     self._run_background_request_stream(
                         request,
+                        events,
                         sampling_params,
                         result_generator,
                         context,
@@ -568,7 +610,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                         request_metadata,
                         created_time,
                     ),
-                    name=f"create_{request.request_id}",
+                    name=f"create_{response.id}",
                 )
             else:
                 task = asyncio.create_task(
@@ -585,15 +627,18 @@ class OpenAIServingResponses(GenerateBaseServing):
                     name=f"create_{response.id}",
                 )
 
-            # For cleanup.
+            binding.task = task
             response_id = response.id
             self.background_tasks[response_id] = task
-            task.add_done_callback(
-                lambda _: self.background_tasks.pop(response_id, None)
-            )
+
+            def _release_task(_: asyncio.Task) -> None:
+                binding.task = None
+                self.background_tasks.pop(response_id, None)
+
+            task.add_done_callback(_release_task)
 
             if request.stream:
-                return self.responses_background_stream_generator(request.request_id)
+                return self._stream_background_events(response_id, events)
             return response
 
         if request.stream:
@@ -941,7 +986,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             ec_transfer_params=context.ec_transfer_params,
         )
 
-        if request.store:
+        if request.store and request._store_binding is not None:
+            response._store_binding = request._store_binding
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
                 # If the response is already cancelled, don't update it.
@@ -1088,12 +1134,11 @@ class OpenAIServingResponses(GenerateBaseServing):
     async def _run_background_request_stream(
         self,
         request: ResponsesRequest,
+        events: _BackgroundEvents,
         *args,
         **kwargs,
     ):
-        event_deque: deque[StreamingResponsesResponse] = deque()
-        new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        event_deque, new_event_signal = events
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
@@ -1112,26 +1157,36 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         if isinstance(response, ErrorResponse):
             # If the request has failed, update the status to "failed".
-            response_id = request.request_id
+            response_id = request.response_id
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response_id)
                 assert stored_response is not None
                 if stored_response.status not in ("completed", "cancelled"):
                     stored_response.status = "failed"
 
-    async def responses_background_stream_generator(
+    def responses_background_stream_generator(
         self,
         response_id: str,
         starting_after: int | None = None,
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
-        if response_id not in self.event_store:
+        return self._stream_background_events(
+            response_id, self.event_store.get(response_id), starting_after
+        )
+
+    async def _stream_background_events(
+        self,
+        response_id: str,
+        events: _BackgroundEvents | None,
+        starting_after: int | None = None,
+    ) -> AsyncGenerator[StreamingResponsesResponse, None]:
+        if events is None:
             raise VLLMValidationError(
                 f"Unknown response_id: {response_id}",
                 parameter="response_id",
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+        event_deque, new_event_signal = events
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
@@ -1151,25 +1206,44 @@ class OpenAIServingResponses(GenerateBaseServing):
 
             await new_event_signal.wait()
 
+    def _get_owned_response(
+        self, response_id: str, owner: str | None
+    ) -> ResponsesResponse | None:
+        """Look up a stored response once and return it only to its owner.
+
+        Callers must hold ``response_store_lock`` and act on the returned
+        response and its ``_store_binding`` rather than looking ``response_id``
+        up again.
+        """
+        response = self.response_store.get(response_id)
+        if response is None:
+            return None
+        binding = response._store_binding
+        if not isinstance(binding, _StoreBinding) or not binding.is_owned_by(owner):
+            return None
+        return response
+
     async def retrieve_responses(
         self,
         response_id: str,
         starting_after: int | None,
         stream: bool | None,
+        raw_request: Request | None = None,
     ) -> (
         ErrorResponse
         | ResponsesResponse
         | AsyncGenerator[StreamingResponsesResponse, None]
     ):
         async with self.response_store_lock:
-            response = self.response_store.get(response_id)
+            response = self._get_owned_response(response_id, _store_owner(raw_request))
 
         if response is None:
             return self._make_not_found_error(response_id)
 
         if stream:
-            return self.responses_background_stream_generator(
+            return self._stream_background_events(
                 response_id,
+                response._store_binding.events,
                 starting_after,
             )
         return response
@@ -1177,11 +1251,13 @@ class OpenAIServingResponses(GenerateBaseServing):
     async def cancel_responses(
         self,
         response_id: str,
+        raw_request: Request | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         async with self.response_store_lock:
-            response = self.response_store.get(response_id)
+            response = self._get_owned_response(response_id, _store_owner(raw_request))
             if response is None:
                 return self._make_not_found_error(response_id)
+            binding: _StoreBinding = response._store_binding
 
             prev_status = response.status
             if prev_status not in ("queued", "in_progress"):
@@ -1195,7 +1271,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             response.status = "cancelled"
 
         # Abort the request.
-        if task := self.background_tasks.get(response_id):
+        if task := binding.task:
             task.cancel()
             try:
                 await task
