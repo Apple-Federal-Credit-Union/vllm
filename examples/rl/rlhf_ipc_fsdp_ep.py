@@ -165,7 +165,6 @@ def start_vllm_server(model_path: str, device_ids: str) -> subprocess.Popen:
     ]
     env = os.environ.copy()
     env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes weight-transfer + sleep endpoints
-    env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"  # IPC handles over HTTP
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     print(f"[server] Launching: {' '.join(serve_args)} (GPUs {device_ids})")
     proc = subprocess.Popen(
@@ -231,14 +230,7 @@ def print_generations(label: str, prompts: list[str], outputs: list[str]) -> Non
 
 
 def main():
-    ray.init(
-        runtime_env={
-            "env_vars": {
-                # The trainer pickles IPC handles for the HTTP client.
-                "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
-            }
-        }
-    )
+    ray.init()
 
     local_model_path = snapshot_download(MODEL_NAME)
     print(f"[init] Model downloaded to {local_model_path}")

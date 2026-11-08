@@ -6,16 +6,15 @@ The trainer uses only `torch`, `requests`, `safetensors`, `pybase64` and the
 stdlib, and speaks the wire protocol in
 `docs/training/weight_transfer/ipc.md` ("Trainer Without vLLM over HTTP"):
 it exports its tensors with `torch.multiprocessing.reductions.reduce_tensor`
-and sends the handles, pickled and base64-encoded, in `ipc_handles_pickled`.
+and sends each handle as a typed JSON object in `ipc_handles`.
 
 IPC requires colocation: this process holds a full copy of the weights on every
 GPU the server uses, and keys each handle by that GPU's UUID. A multi-process
 trainer would instead gather the per-rank `{uuid: args}` dicts to one rank.
 
-Start a server; IPC handles are pickled, so it needs
-`VLLM_ALLOW_INSECURE_SERIALIZATION=1` (the weights it starts with are discarded):
+Start a server (the weights it starts with are discarded):
 
-    VLLM_SERVER_DEV_MODE=1 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+    VLLM_SERVER_DEV_MODE=1 \
         CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B \
         --load-format dummy --enforce-eager --gpu-memory-utilization 0.4 \
         --weight-transfer-config '{"backend": "ipc"}'
@@ -43,7 +42,6 @@ sys.meta_path.insert(0, _BlockVLLM())
 
 import argparse  # noqa: E402
 import glob  # noqa: E402
-import pickle  # noqa: E402
 
 import pybase64 as base64  # noqa: E402
 import requests  # noqa: E402
@@ -77,6 +75,43 @@ def generate(prompts: list[str]) -> list[str]:
 # UUID is str(torch.cuda.get_device_properties(i).uuid), with no "GPU-" prefix.
 Weights = dict[str, dict[str, torch.Tensor]]
 
+# Parameter names of `rebuild_cuda_tensor`, in `reduce_tensor(t)[1]` order.
+IPC_ARG_FIELDS = (
+    "tensor_cls",
+    "tensor_size",
+    "tensor_stride",
+    "tensor_offset",
+    "storage_cls",
+    "dtype",
+    "storage_device",
+    "storage_handle",
+    "storage_size_bytes",
+    "storage_offset_bytes",
+    "requires_grad",
+    "ref_counter_handle",
+    "ref_counter_offset",
+    "event_handle",
+    "event_sync_required",
+)
+
+
+def handle_to_json(args: tuple) -> dict:
+    """Encode one `reduce_tensor(t)[1]` as the typed JSON the worker accepts."""
+    fields = dict(zip(IPC_ARG_FIELDS, args, strict=True))
+    fields["tensor_cls"] = fields["tensor_cls"].__name__
+    fields["storage_cls"] = fields["storage_cls"].__name__
+    fields["dtype"] = str(fields["dtype"]).removeprefix("torch.")
+    fields["tensor_size"] = list(fields["tensor_size"])
+    fields["tensor_stride"] = list(fields["tensor_stride"])
+    for name in ("storage_handle", "ref_counter_handle", "event_handle"):
+        if fields[name] is not None:
+            fields[name] = base64.b64encode(fields[name]).decode()
+    return fields
+
+
+def handles_to_json(handles: dict[str, tuple]) -> dict[str, dict]:
+    return {uuid: handle_to_json(args) for uuid, args in handles.items()}
+
 
 def update_weights(
     weights: Weights,
@@ -89,7 +124,11 @@ def update_weights(
         "names": names,
         "dtype_names": [str(w[n].dtype).removeprefix("torch.") for n in names],
         "shapes": [list(w[n].shape) for n in names],
-        "ipc_handles_pickled": base64.b64encode(pickle.dumps(ipc_handles)).decode(),
+        "ipc_handles": (
+            [handles_to_json(h) for h in ipc_handles]
+            if isinstance(ipc_handles, list)
+            else handles_to_json(ipc_handles)
+        ),
     }
     if tensor_sizes is not None:
         update_info["tensor_sizes"] = tensor_sizes

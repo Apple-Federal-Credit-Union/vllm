@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """IPC-based weight transfer engine using CUDA IPC for communication."""
 
-import pickle
+import binascii
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
@@ -10,7 +11,6 @@ import pybase64 as base64
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
 
-from vllm import envs
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
     TrainerInitInfo,
@@ -30,6 +30,139 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_ipc_consumer,
     packed_ipc_producer,
 )
+
+# Positional args of `rebuild_cuda_tensor`, as produced by `reduce_tensor`.
+_IPC_ARG_FIELDS = (
+    "tensor_cls",
+    "tensor_size",
+    "tensor_stride",
+    "tensor_offset",
+    "storage_cls",
+    "dtype",
+    "storage_device",
+    "storage_handle",
+    "storage_size_bytes",
+    "storage_offset_bytes",
+    "requires_grad",
+    "ref_counter_handle",
+    "ref_counter_offset",
+    "event_handle",
+    "event_sync_required",
+)
+_IPC_INT_FIELDS = (
+    "tensor_offset",
+    "storage_device",
+    "storage_size_bytes",
+    "storage_offset_bytes",
+    "ref_counter_offset",
+)
+_IPC_BOOL_FIELDS = ("requires_grad", "event_sync_required")
+_IPC_BYTES_FIELDS = ("storage_handle", "ref_counter_handle", "event_handle")
+_IPC_TENSOR_CLASSES: dict[str, type] = {
+    "Tensor": torch.Tensor,
+    "Parameter": torch.nn.Parameter,
+}
+_IPC_STORAGE_CLASSES: dict[str, type] = {
+    "TypedStorage": torch.storage.TypedStorage,
+    "UntypedStorage": torch.UntypedStorage,
+}
+_TORCH_DTYPES: dict[str, torch.dtype] = {
+    str(dtype).removeprefix("torch."): dtype
+    for dtype in vars(torch).values()
+    if isinstance(dtype, torch.dtype)
+}
+
+
+def _class_key(cls: type, allowed: dict[str, type]) -> str:
+    for key, allowed_cls in allowed.items():
+        if cls is allowed_cls:
+            return key
+    raise ValueError(f"Unsupported class in IPC handle: {cls!r}")
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def ipc_handle_args_to_json(args: Sequence[Any]) -> dict[str, Any]:
+    """Encode CUDA `reduce_tensor` rebuild args as JSON-native fields."""
+    fields = dict(zip(_IPC_ARG_FIELDS, args, strict=True))
+    fields["tensor_cls"] = _class_key(fields["tensor_cls"], _IPC_TENSOR_CLASSES)
+    fields["storage_cls"] = _class_key(fields["storage_cls"], _IPC_STORAGE_CLASSES)
+    fields["dtype"] = str(fields["dtype"]).removeprefix("torch.")
+    fields["tensor_size"] = list(fields["tensor_size"])
+    fields["tensor_stride"] = list(fields["tensor_stride"])
+    for name in _IPC_BYTES_FIELDS:
+        if fields[name] is not None:
+            fields[name] = base64.b64encode(fields[name]).decode("ascii")
+    return fields
+
+
+def ipc_handle_args_from_json(obj: dict[str, Any]) -> tuple:
+    """Validate `ipc_handle_args_to_json` output and rebuild the args tuple."""
+    if set(obj) != set(_IPC_ARG_FIELDS):
+        raise ValueError(
+            f"IPC handle must have exactly the fields {list(_IPC_ARG_FIELDS)}, "
+            f"got {sorted(obj)}"
+        )
+    fields = dict(obj)
+    for name, allowed in (
+        ("tensor_cls", _IPC_TENSOR_CLASSES),
+        ("storage_cls", _IPC_STORAGE_CLASSES),
+    ):
+        key = fields[name]
+        if not isinstance(key, str) or key not in allowed:
+            raise ValueError(f"IPC handle `{name}` must be one of {list(allowed)}")
+        fields[name] = allowed[key]
+    dtype = fields["dtype"]
+    if not isinstance(dtype, str) or dtype not in _TORCH_DTYPES:
+        raise ValueError(f"IPC handle `dtype` is not a torch dtype: {dtype!r}")
+    fields["dtype"] = _TORCH_DTYPES[dtype]
+    for name in ("tensor_size", "tensor_stride"):
+        dims = fields[name]
+        if not isinstance(dims, list) or not all(_is_int(d) for d in dims):
+            raise ValueError(f"IPC handle `{name}` must be a list of ints")
+    fields["tensor_size"] = torch.Size(fields["tensor_size"])
+    fields["tensor_stride"] = tuple(fields["tensor_stride"])
+    for name in _IPC_INT_FIELDS:
+        if not _is_int(fields[name]):
+            raise ValueError(f"IPC handle `{name}` must be an int")
+    for name in _IPC_BOOL_FIELDS:
+        if not isinstance(fields[name], bool):
+            raise ValueError(f"IPC handle `{name}` must be a bool")
+    for name in _IPC_BYTES_FIELDS:
+        value = fields[name]
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"IPC handle `{name}` must be a base64 string")
+        try:
+            fields[name] = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"IPC handle `{name}` is not valid base64") from e
+    return tuple(fields[name] for name in _IPC_ARG_FIELDS)
+
+
+def ipc_handles_to_json(
+    ipc_handles: list[dict[str, tuple]] | dict[str, tuple],
+) -> list[dict[str, dict[str, Any]]] | dict[str, dict[str, Any]]:
+    """Encode `ipc_handles` for JSON transports such as HTTP."""
+
+    def encode(handle: dict[str, tuple]) -> dict[str, dict[str, Any]]:
+        return {uuid: ipc_handle_args_to_json(args) for uuid, args in handle.items()}
+
+    if isinstance(ipc_handles, list):
+        return [encode(handle) for handle in ipc_handles]
+    return encode(ipc_handles)
+
+
+def _decode_ipc_handle(handle: Any) -> dict[str, tuple]:
+    if not isinstance(handle, dict):
+        raise ValueError("Each IPC handle must map GPU UUIDs to rebuild args")
+    return {
+        gpu_uuid: ipc_handle_args_from_json(args) if isinstance(args, dict) else args
+        for gpu_uuid, args in handle.items()
+    }
 
 
 @dataclass
@@ -66,36 +199,23 @@ class IPCWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
-    ipc_handles: list[dict[str, tuple]] | dict[str, tuple] | None = None
+    ipc_handles: list[dict[str, Any]] | dict[str, Any] | None = None
     """IPC handles mapping physical GPU UUID to rebuild_cuda_tensor args.
     For non-packed mode: list of per-parameter handle dicts.
-    For packed mode: single handle dict for the packed buffer."""
-    ipc_handles_pickled: str | None = None
-    """Base64-encoded pickled IPC handles, used for HTTP transport."""
+    For packed mode: single handle dict for the packed buffer.
+    Over JSON transports each args tuple is sent in the typed form produced by
+    `ipc_handle_args_to_json` and decoded here."""
     tensor_sizes: list[int] | None = None
     """Per-parameter sizes in bytes within the packed buffer.
     Required when packed=True, unused otherwise."""
 
     def __post_init__(self):
-        if self.ipc_handles_pickled is not None:
-            if self.ipc_handles is not None:
-                raise ValueError(
-                    "Cannot specify both `ipc_handles` and `ipc_handles_pickled`"
-                )
-
-            if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
-                raise ValueError(
-                    "Refusing to deserialize `ipc_handles_pickled` without "
-                    "VLLM_ALLOW_INSECURE_SERIALIZATION=1"
-                )
-
-            self.ipc_handles = pickle.loads(base64.b64decode(self.ipc_handles_pickled))
-            self.ipc_handles_pickled = None
-
         if self.ipc_handles is None:
-            raise ValueError(
-                "Either `ipc_handles` or `ipc_handles_pickled` must be provided"
-            )
+            raise ValueError("`ipc_handles` must be provided")
+        if isinstance(self.ipc_handles, list):
+            self.ipc_handles = [_decode_ipc_handle(h) for h in self.ipc_handles]
+        else:
+            self.ipc_handles = _decode_ipc_handle(self.ipc_handles)
         num_params = len(self.names)
         if len(self.dtype_names) != num_params:
             raise ValueError(
@@ -455,7 +575,8 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
         ships (non-sender ranks already contributed to the handle all-gather).
 
         Emits raw `ipc_handles`; transports that cannot carry them natively
-        (HTTP/JSON) pickle them in their client (see `HTTPVLLMWeightSyncClient`).
+        (HTTP/JSON) encode them with `ipc_handles_to_json` in their client (see
+        `HTTPVLLMWeightSyncClient`).
         """
         if not self.is_sender:
             return
