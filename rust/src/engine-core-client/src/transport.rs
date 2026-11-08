@@ -18,7 +18,7 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{PullSocket, RouterSendHalf, RouterSocket, ZmqError, ZmqMessage};
 
-use crate::coordinator::CoordinatorBootstrap;
+use crate::coordinator::{CoordinatorAuthKey, CoordinatorBootstrap};
 use crate::error::{Error, Result, bail_unexpected_handshake_message};
 use crate::protocol::handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
@@ -483,6 +483,7 @@ async fn send_init_message(
             outputs: vec![output_address.to_string()],
             coordinator_input: coordinator.map(|c| c.input_address.clone()),
             coordinator_output: coordinator.map(|c| c.output_address.clone()),
+            coordinator_auth_key: coordinator.map(|c| c.auth_key.as_bytes().to_vec()),
             frontend_stats_publish_address: None,
         },
         parallel_config: Default::default(),
@@ -588,8 +589,12 @@ pub async fn send_message(
 
 /// Run the output loop to receive messages from the engine and send them to the
 /// provided channel.
-pub async fn run_output_loop(
+///
+/// With `auth_key`, messages whose trailing MAC frame does not verify are
+/// dropped, and the MAC frame is stripped from the rest.
+pub(crate) async fn run_output_loop(
     mut output_socket: PullSocket,
+    auth_key: Option<CoordinatorAuthKey>,
     tx: mpsc::Sender<Result<EngineCoreOutputs>>,
 ) {
     loop {
@@ -608,6 +613,16 @@ pub async fn run_output_loop(
         let frame_count = message.len();
         trace!(frame_count, "received output message");
         let frames = message.into_vec();
+        let frames = match &auth_key {
+            None => frames.as_slice(),
+            Some(auth_key) => match auth_key.verify(&frames) {
+                Some(payload) if !payload.is_empty() => payload,
+                _ => {
+                    warn!(frame_count, "dropping unauthenticated output message");
+                    continue;
+                }
+            },
+        };
         let frame = frames.first().expect("output message must have at least one frame");
         let frame_len = frame.len();
         if frame.as_ref() == ENGINE_CORE_DEAD_SENTINEL {
@@ -615,7 +630,7 @@ pub async fn run_output_loop(
             let _ = tx.send(Err(Error::EngineCoreDead)).await;
             return;
         }
-        let decoded = match decode_engine_core_outputs(&frames) {
+        let decoded = match decode_engine_core_outputs(frames) {
             Ok(decoded) => {
                 trace!(frame_len, outputs = ?decoded, "decoded output message");
                 Ok(decoded)

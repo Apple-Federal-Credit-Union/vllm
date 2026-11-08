@@ -21,6 +21,7 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, XPubSocket, ZmqMessage};
 
+use crate::mock_engine::MockCoordinatorSockets;
 use crate::protocol::handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage};
 use crate::protocol::kv_hints::{KvHintAction, KvHintsEnvelope};
 use crate::protocol::logprobs::MaybeWireLogprobs;
@@ -268,9 +269,16 @@ async fn recv_start_dp_wave(sub: &mut SubSocket) -> (u32, Option<u32>) {
     rmp_serde::from_slice(&frames[1]).expect("decode START_DP_WAVE payload")
 }
 
-async fn send_start_wave(push: &mut PushSocket, engine_index: u32, wave: u32) {
-    send_outputs(
-        push,
+async fn send_coordinator_outputs(
+    coordinator: &mut MockCoordinatorSockets,
+    outputs: EngineCoreOutputs,
+) {
+    coordinator.send_outputs(&outputs).await.unwrap();
+}
+
+async fn send_start_wave(coordinator: &mut MockCoordinatorSockets, engine_index: u32, wave: u32) {
+    send_coordinator_outputs(
+        coordinator,
         DpControlOutput {
             engine_index,
             timestamp: 0.0,
@@ -631,7 +639,7 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
             assert_eq!(request.request_id, "req-1");
             assert_eq!(request.current_wave, 0);
-            send_start_wave(&mut coordinator.output_push, 0, 0).await;
+            send_start_wave(&mut coordinator, 0, 0).await;
 
             let (wave, exclude_engine) = recv_start_dp_wave(&mut coordinator.input_sub).await;
             assert_eq!((wave, exclude_engine), (0, Some(0)));
@@ -669,8 +677,8 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             )
             .await;
 
-            send_outputs(
-                &mut coordinator.output_push,
+            send_coordinator_outputs(
+                &mut coordinator,
                 DpControlOutput {
                     engine_index: 0,
                     timestamp: 0.0,
@@ -685,7 +693,7 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
             assert_eq!(request.request_id, "req-3");
             assert_eq!(request.current_wave, 1);
-            send_start_wave(&mut coordinator.output_push, 0, 1).await;
+            send_start_wave(&mut coordinator, 0, 1).await;
 
             let (wave, exclude_engine) = recv_start_dp_wave(&mut coordinator.input_sub).await;
             assert_eq!((wave, exclude_engine), (1, Some(0)));
@@ -854,8 +862,8 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
 
-            send_outputs(
-                &mut coordinator.output_push,
+            send_coordinator_outputs(
+                &mut coordinator,
                 DpControlOutput {
                     engine_index: 1,
                     timestamp: 0.0,
@@ -907,8 +915,8 @@ async fn coordinator_accepts_stats_only_outputs() {
             engine.coordinator.take().expect("coordinator sockets should be present");
         let data_socket = engine.data_sockets.first_mut().expect("data socket");
 
-        send_outputs(
-            &mut coordinator.output_push,
+        send_coordinator_outputs(
+            &mut coordinator,
             RequestBatchOutputs {
                 outputs: Vec::new(),
                 scheduler_stats: Some(Box::new(SchedulerStats {

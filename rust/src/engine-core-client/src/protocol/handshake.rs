@@ -114,12 +114,16 @@ pub struct EngineCoreReadyResponse {
 ///
 /// Original Python definition (`EngineZmqAddresses`):
 /// <https://github.com/vllm-project/vllm/blob/f22d6e026798a74e6542a52ef776c054f2de572a/vllm/v1/engine/utils.py#L53-L67>
+#[serde_with::serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeAddresses {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub coordinator_input: Option<String>,
     pub coordinator_output: Option<String>,
+    /// Key that authenticates engine messages sent to `coordinator_output`.
+    #[serde_as(as = "Option<serde_with::Bytes>")]
+    pub coordinator_auth_key: Option<Vec<u8>>,
     pub frontend_stats_publish_address: Option<String>,
 }
 

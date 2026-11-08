@@ -3,15 +3,18 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::time::{sleep, timeout};
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, ZmqMessage};
 
 use crate::EngineId;
+use crate::coordinator::CoordinatorAuthKey;
 use crate::error::{Error, Result, bail_unexpected_handshake_message};
 use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage};
+use crate::protocol::output::EngineCoreOutputs;
 use crate::protocol::{decode_msgpack, encode_msgpack};
 
 /// Default model length advertised by reusable mock engine helpers.
@@ -83,8 +86,24 @@ pub struct MockCoordinatorSockets {
     /// `START_DP_WAVE`.
     pub input_sub: SubSocket,
     /// Push socket used to send coordinator-only `EngineCoreOutputs` back to
-    /// the frontend.
+    /// the frontend. Messages sent directly on it are not authenticated; use
+    /// [`Self::send_outputs`] to send messages the coordinator accepts.
     pub output_push: PushSocket,
+    auth_key: Option<CoordinatorAuthKey>,
+}
+
+impl MockCoordinatorSockets {
+    /// Send coordinator-only `EngineCoreOutputs`, authenticated with the key
+    /// received in the startup handshake.
+    pub async fn send_outputs(&mut self, outputs: &EngineCoreOutputs) -> Result<()> {
+        let mut frames = vec![Bytes::from(encode_msgpack(outputs)?)];
+        if let Some(auth_key) = &self.auth_key {
+            frames.push(auth_key.sign(&frames));
+        }
+        let message = ZmqMessage::try_from(frames).expect("message has at least one frame");
+        self.output_push.send(message).await?;
+        Ok(())
+    }
 }
 
 /// One mock engine's connection to one frontend client.
@@ -254,6 +273,11 @@ pub async fn connect_to_frontend(
             Some(MockCoordinatorSockets {
                 input_sub,
                 output_push,
+                auth_key: init
+                    .addresses
+                    .coordinator_auth_key
+                    .clone()
+                    .map(CoordinatorAuthKey::from_bytes),
             })
         }
         (None, None) => None,
