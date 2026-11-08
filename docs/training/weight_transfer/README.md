@@ -42,8 +42,10 @@ engine drives on your behalf:
 
 ### Inference Side
 
-The inference side takes only a backend name. Everything else about the transfer
-is decided by the trainer and shipped over at the init handshake.
+The inference side takes a backend name and, for the TCPStore rendezvous of the
+`nccl`, `sparse_nccl` and `nccl_m2n` backends, the trainer's store address.
+Everything else about the transfer is decided by the trainer and shipped over at
+the init handshake.
 
 ```python
 from vllm import LLM
@@ -52,7 +54,11 @@ from vllm.config import WeightTransferConfig
 llm = LLM(
     model="my-model",
     # Other backends: "ipc", "sparse_nccl", "sharded_rdt", "nccl_m2n".
-    weight_transfer_config=WeightTransferConfig(backend="nccl"),
+    weight_transfer_config=WeightTransferConfig(
+        backend="nccl",
+        master_address=master_address,
+        master_port=master_port,
+    ),
 )
 ```
 
@@ -60,8 +66,12 @@ Or, for online serving:
 
 ```bash
 vllm serve my-model \
-    --weight-transfer-config '{"backend": "nccl"}'
+    --weight-transfer-config \
+    '{"backend": "nccl", "master_address": "10.0.0.1", "master_port": 29500}'
 ```
+
+Workers only join the store pinned here; an init request that names any other
+address is rejected.
 
 ### Trainer Side
 
@@ -109,7 +119,8 @@ on. This is the main rule to internalize:
 
 | Setting | Lives on | Notes |
 | ------- | -------- | ----- |
-| Backend, inference side | `WeightTransferConfig(backend=...)` | A plain string selector — that is all this config holds |
+| Backend, inference side | `WeightTransferConfig(backend=...)` | A plain string selector |
+| TCPStore rendezvous | `WeightTransferConfig(master_address=..., master_port=...)` and the trainer init info | Both must name the same store; workers refuse any other |
 | Backend, trainer side | `init_info.backend` | A `ClassVar` on each init info; never passed by hand |
 | Wire params (`packed`, buffer sizes) | the backend's `TrainerInitInfo` | The trainer propagates them to the worker during `trainer_init`, so the two sides *cannot* disagree |
 | Weights to send | a [`WeightSource`](base.md#weightsource) | Usually written for your framework; `ModuleSource(model)` covers modules every rank holds whole (plain, FSDP, DTensor) |

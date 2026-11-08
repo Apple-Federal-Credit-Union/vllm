@@ -507,7 +507,9 @@ def inference_receive_tensor(
             for name, tensor in weights:
                 self.received.append((name, tensor.clone()))
 
-    config = WeightTransferConfig(backend="nccl")
+    config = WeightTransferConfig(
+        backend="nccl", master_address=master_address, master_port=master_port
+    )
     vllm_config = MagicMock()
     parallel_config = MagicMock(spec=ParallelConfig)
     parallel_config.rank = 0
@@ -1782,7 +1784,7 @@ def test_nccl_worker_learns_wire_params_from_init_handshake(monkeypatch):
     import vllm.distributed.weight_transfer.nccl_engine as nccl_engine_mod
 
     monkeypatch.setattr(
-        nccl_engine_mod, "worker_init_process_group", lambda info, pc: MagicMock()
+        nccl_engine_mod, "worker_init_process_group", lambda info, pc, cfg: MagicMock()
     )
 
     engine = NCCLWeightTransferEngine(
@@ -1891,7 +1893,7 @@ def test_nccl_worker_reuses_metadata_per_model(monkeypatch):
     import vllm.distributed.weight_transfer.nccl_engine as nccl_engine_mod
 
     monkeypatch.setattr(
-        nccl_engine_mod, "worker_init_process_group", lambda info, pc: MagicMock()
+        nccl_engine_mod, "worker_init_process_group", lambda info, pc, cfg: MagicMock()
     )
     target, draft = MagicMock(spec=torch.nn.Module), MagicMock(spec=torch.nn.Module)
     received: list = []

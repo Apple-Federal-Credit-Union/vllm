@@ -196,6 +196,18 @@ fn build_router_with_options(
             .route("/reset_prefix_cache", post(cache::reset_prefix_cache))
             .route("/reset_mm_cache", post(cache::reset_mm_cache))
             .route("/reset_encoder_cache", post(cache::reset_encoder_cache))
+            .route("/sleep", post(sleep::sleep))
+            .route(
+                "/release_kv_cache_memory",
+                post(sleep::release_kv_cache_memory),
+            )
+            .route("/wake_up", post(sleep::wake_up))
+            .route("/is_sleeping", get(sleep::is_sleeping))
+            .route("/server_info", get(server_info::server_info));
+
+        // RL control routes and `/collective_rpc` require the API key even
+        // though they are outside the guarded prefixes.
+        let protected = Router::new()
             .route("/collective_rpc", post(collective_rpc::collective_rpc))
             .route(
                 "/init_weight_transfer_engine",
@@ -225,18 +237,15 @@ fn build_router_with_options(
             .route("/weight_info", get(weight_transfer::weight_info))
             .route("/weight_checker", post(weight_checker::weight_checker))
             .route("/abort_requests", post(abort_requests::abort_requests))
-            .route("/sleep", post(sleep::sleep))
-            .route(
-                "/release_kv_cache_memory",
-                post(sleep::release_kv_cache_memory),
-            )
-            .route("/wake_up", post(sleep::wake_up))
-            .route("/is_sleeping", get(sleep::is_sleeping))
             .route("/pause", post(pause::pause))
             .route("/resume", post(pause::resume))
             .route("/is_paused", get(pause::is_paused))
-            .route("/server_info", get(server_info::server_info))
             .route("/get_world_size", get(world_size::get_world_size))
+            .route_layer(from_fn_with_state(
+                state.clone(),
+                middleware::require_api_key,
+            ));
+        router = router.merge(protected);
     }
 
     if let Some(profiler) = &state.profiler {

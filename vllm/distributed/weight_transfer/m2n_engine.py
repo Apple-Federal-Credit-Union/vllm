@@ -255,7 +255,7 @@ class M2NWeightTransferEngine(
             world_size=init_info.world_size,
         )
         metadata_group = worker_init_metadata_group(
-            rendezvous_info, self.parallel_config
+            rendezvous_info, self.parallel_config, self.config
         )
 
         wire_params: tuple[M2NWireParam, ...] = ()

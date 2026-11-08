@@ -32,6 +32,29 @@ pub async fn authenticate_api_key(
         return next.run(req).await;
     }
 
+    unauthorized()
+}
+
+/// Require the configured API key on a route outside the guarded prefixes.
+///
+/// Mirrors Python `APIKeyProtectedRoute`, used by the RL control routes and
+/// `/collective_rpc`. Applied as a route layer, so it runs only for matched
+/// routes and before the request body is read.
+pub async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !state.has_api_keys()
+        || verify_token(req.headers().get(AUTHORIZATION), state.api_key_hashes())
+    {
+        return next.run(req).await;
+    }
+
+    unauthorized()
+}
+
+fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "Unauthorized" })),

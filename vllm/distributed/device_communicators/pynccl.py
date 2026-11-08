@@ -159,7 +159,10 @@ class PyNcclCommunicator:
             for i, byte in enumerate(byte_list):
                 self.unique_id.internal[i] = byte
         else:
-            self.unique_id = group.broadcast_obj(self.unique_id, src=0)
+            unique_id_bytes = group.broadcast_bytes(
+                bytes(self.unique_id.internal) if self.rank == 0 else None, src=0
+            )
+            self.unique_id = self.nccl.unique_id_from_bytes(unique_id_bytes)
         self._init_comm(device)
 
     def _init_comm(self, device: int | str | torch.device) -> None:

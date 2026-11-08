@@ -101,6 +101,9 @@ class TrainModel:
         self.master_port = get_open_port()
         self.engine = None
 
+    def get_rendezvous(self) -> tuple[str, int]:
+        return self.master_address, self.master_port
+
     def init_sparse_engine(self, world_size: int, llm_handle) -> None:
         self.engine = WeightTransferTrainerFactory.trainer_init(
             init_info=SparseNCCLTrainerInitInfo(
@@ -157,7 +160,11 @@ class TrainModel:
             self.engine = None
 
 
-def launch_llm(scheduling_strategy: PlacementGroupSchedulingStrategy):
+def launch_llm(
+    scheduling_strategy: PlacementGroupSchedulingStrategy,
+    master_address: str,
+    master_port: int,
+):
     return ray.remote(
         num_cpus=0,
         num_gpus=0,
@@ -172,7 +179,12 @@ def launch_llm(scheduling_strategy: PlacementGroupSchedulingStrategy):
         distributed_executor_backend="ray",
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
-        weight_transfer_config=WeightTransferConfig(backend="sparse_nccl"),
+        # Inference workers only join the trainer store pinned here.
+        weight_transfer_config=WeightTransferConfig(
+            backend="sparse_nccl",
+            master_address=master_address,
+            master_port=master_port,
+        ),
     )
 
 
@@ -213,7 +225,9 @@ def main() -> None:
             placement_group_capture_child_tasks=True,
             placement_group_bundle_index=0,
         )
-        llm = launch_llm(scheduling_strategy)
+        llm = launch_llm(
+            scheduling_strategy, *ray.get(train_model.get_rendezvous.remote())
+        )
 
         before = generate(llm)
         print_generations("BEFORE sparse update", before)

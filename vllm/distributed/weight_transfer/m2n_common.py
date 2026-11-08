@@ -15,8 +15,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+import pybase64 as base64
 import torch
 
+from vllm.distributed.device_communicators.pynccl_wrapper import (
+    NCCL_UNIQUE_ID_BYTES,
+)
 from vllm.distributed.weight_transfer.base import ParamMeta, Shard
 from vllm.utils.nccl import unpinned_nccl_env
 
@@ -95,11 +99,13 @@ def create_m2n_communicator(
 ) -> Any:
     """Create the M2N data-plane communicator through NCCL4Py."""
     if unique_id_bytes is None:
-        envelope: dict[str, bytes | str | None] | None = None
+        envelope: dict[str, str | None] | None = None
         if group.rank == 0:
             try:
                 envelope = {
-                    "unique_id": bytes(nccl.get_unique_id().as_bytes),
+                    "unique_id": base64.b64encode(
+                        bytes(nccl.get_unique_id().as_bytes)
+                    ).decode(),
                     "error": None,
                 }
             except Exception as exc:
@@ -116,9 +122,17 @@ def create_m2n_communicator(
             if not isinstance(error, str) or not error:
                 raise RuntimeError("invalid NCCL4Py unique-id error")
             raise RuntimeError(f"NCCL4Py unique-id generation failed: {error}")
-        if not isinstance(received_unique_id, bytes):
-            raise RuntimeError("NCCL4Py unique-id broadcast did not return bytes")
-        unique_id_bytes = received_unique_id
+        if not isinstance(received_unique_id, str):
+            raise RuntimeError("NCCL4Py unique-id broadcast did not return a string")
+        try:
+            unique_id_bytes = base64.b64decode(received_unique_id, validate=True)
+        except ValueError as exc:
+            raise RuntimeError("NCCL4Py unique-id broadcast is not base64") from exc
+        if len(unique_id_bytes) != NCCL_UNIQUE_ID_BYTES:
+            raise RuntimeError(
+                f"NCCL4Py unique-id broadcast must be {NCCL_UNIQUE_ID_BYTES} "
+                f"bytes, got {len(unique_id_bytes)}"
+            )
 
     unique_id = nccl.UniqueId.from_bytes(unique_id_bytes)
     with unpinned_nccl_env():

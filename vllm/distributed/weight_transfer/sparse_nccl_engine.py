@@ -137,7 +137,7 @@ class SparseNCCLWeightTransferEngine(
     def init_transfer_engine(self, init_info: NCCLWeightTransferInitInfo) -> None:
         """Initialize the NCCL process group with the trainer."""
         self.model_update_group = worker_init_process_group(
-            init_info, self.parallel_config
+            init_info, self.parallel_config, self.config
         )
 
     def start_weight_update(self) -> None:

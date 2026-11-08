@@ -40,13 +40,19 @@ from vllm.config import WeightTransferConfig
 
 llm = LLM(
     model="my-model",
-    weight_transfer_config=WeightTransferConfig(backend="nccl_m2n"),
+    weight_transfer_config=WeightTransferConfig(
+        backend="nccl_m2n", master_address=master_address, master_port=master_port
+    ),
 )
 ```
 
 ```bash
-vllm serve my-model --weight-transfer-config '{"backend": "nccl_m2n"}'
+vllm serve my-model --weight-transfer-config \
+    '{"backend": "nccl_m2n", "master_address": "10.0.0.1", "master_port": 29500}'
 ```
+
+`master_address` / `master_port` name the trainer's metadata TCPStore. Workers
+only join that store, and the metadata exchanged on it is JSON.
 
 ## Trainer Side
 

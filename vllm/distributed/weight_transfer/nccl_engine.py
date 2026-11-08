@@ -161,7 +161,7 @@ class NCCLWeightTransferEngine(
         self.packed_num_buffers = init_info.packed_num_buffers
         self._last_update_info.clear()
         self.model_update_group = worker_init_process_group(
-            init_info, self.parallel_config
+            init_info, self.parallel_config, self.config
         )
 
     def start_weight_update(self) -> None:

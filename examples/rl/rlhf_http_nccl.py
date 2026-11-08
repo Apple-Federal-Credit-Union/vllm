@@ -22,6 +22,7 @@ Run:
     $ python examples/rl/rlhf_http_nccl.py
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -58,8 +59,17 @@ PROMPTS = [
 ]
 
 
-def start_vllm_server() -> subprocess.Popen:
-    """Spawn `vllm serve` and block until it is healthy."""
+def start_vllm_server(master_address: str, master_port: int) -> subprocess.Popen:
+    """Spawn `vllm serve` and block until it is healthy.
+
+    The trainer's rendezvous is pinned in the server config; workers refuse to
+    join any other store.
+    """
+    weight_transfer_config = {
+        "backend": "nccl",
+        "master_address": master_address,
+        "master_port": master_port,
+    }
     serve_args = [
         "vllm",
         "serve",
@@ -76,7 +86,7 @@ def start_vllm_server() -> subprocess.Popen:
         "--port",
         str(SERVER_PORT),
         "--weight-transfer-config",
-        '{"backend": "nccl"}',
+        json.dumps(weight_transfer_config),
     ]
     env = os.environ.copy()
     # Exposes the weight-transfer and pause/resume endpoints.
@@ -147,7 +157,9 @@ def print_generations(label: str, prompts: list[str], outputs: list[str]) -> Non
 
 
 def main():
-    server_proc = start_vllm_server()
+    master_address = get_ip()
+    master_port = get_open_port()
+    server_proc = start_vllm_server(master_address, master_port)
     try:
         # The trainer sits on the GPU after the server's, and is NCCL rank 0.
         torch.accelerator.set_device_index(TRAINER_DEVICE)
@@ -166,8 +178,6 @@ def main():
 
         # The transfer NCCL group is the trainer plus every inference worker.
         world_size = get_world_size(BASE_URL) + 1
-        master_address = get_ip()
-        master_port = get_open_port()
         print(
             f"[transfer] Rendezvous at {master_address}:{master_port}, "
             f"world_size={world_size} (1 trainer + {world_size - 1} vLLM workers)"

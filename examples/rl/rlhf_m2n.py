@@ -147,12 +147,19 @@ def main():
     ray.get([w.ready.remote() for w in fsdp_workers])
     print(f"[init] {FSDP_WORLD_SIZE} FSDP workers ready.")
 
+    # Inference workers only join the trainer metadata store pinned here.
+    metadata_address = get_ip()
+    metadata_port = get_open_port()
     llm = ray.remote(num_cpus=0, num_gpus=0)(MyLLM).remote(
         model=local_model_path,
         enforce_eager=True,
         tensor_parallel_size=INFERENCE_TP_SIZE,
         distributed_executor_backend="ray",
-        weight_transfer_config=WeightTransferConfig(backend="nccl_m2n"),
+        weight_transfer_config=WeightTransferConfig(
+            backend="nccl_m2n",
+            master_address=metadata_address,
+            master_port=metadata_port,
+        ),
         load_format="dummy",
     )
     ray.get(llm.ready.remote())
@@ -177,8 +184,6 @@ def main():
     # one communicator, so the two meshes are contiguous rank intervals.
     nccl_unique_id_b64 = base64.b64encode(nccl.get_unique_id().as_bytes).decode()
     world_size = FSDP_WORLD_SIZE + num_workers
-    metadata_address = get_ip()
-    metadata_port = get_open_port()
 
     print("[transfer] Initializing nccl_m2n weight transfer (all FSDP ranks)...")
     ray.get(
