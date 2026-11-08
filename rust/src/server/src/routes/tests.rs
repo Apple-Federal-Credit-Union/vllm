@@ -7920,6 +7920,74 @@ async fn admin_routes_are_hidden_when_dev_mode_is_disabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn rl_control_routes_require_api_key_in_dev_mode() {
+    let (chat, engine_task) = test_chat_with_engine_handle().await;
+    let app = build_router_with_dev_mode(
+        Arc::new(
+            AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+                .with_api_keys(vec!["secret".to_string()]),
+        ),
+        true,
+    );
+    // Bounded, so a route that reaches its engine-bound handler fails instead
+    // of waiting on the scripted engine.
+    let call = |method: &str, uri: &str, authorization: Option<&str>| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = app.clone().call(request.body(Body::from("{}")).expect("build request"));
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), response)
+                .await
+                .expect("route answered without reaching the engine")
+        }
+    };
+
+    for (method, uri) in [
+        ("GET", "/is_paused"),
+        ("POST", "/pause"),
+        ("POST", "/resume"),
+        ("POST", "/collective_rpc"),
+        ("POST", "/abort_requests"),
+        ("POST", "/init_weight_transfer_engine"),
+        ("POST", "/shutdown_weight_transfer_engine"),
+        ("POST", "/start_weight_update"),
+        ("POST", "/start_draft_weight_update"),
+        ("POST", "/update_weights"),
+        ("POST", "/finish_weight_update"),
+        ("POST", "/update_weight_version"),
+        ("GET", "/weight_info"),
+        ("POST", "/weight_checker"),
+        ("GET", "/get_world_size"),
+    ] {
+        for authorization in [None, Some("Bearer wrong")] {
+            let response = call(method, uri, authorization).await.expect("call app");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} {authorization:?}"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(json, json!({ "error": "Unauthorized" }));
+        }
+    }
+
+    let response = call(
+        "POST",
+        "/init_weight_transfer_engine",
+        Some("Bearer secret"),
+    )
+    .await
+    .expect("call app");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn weight_transfer_routes_support_the_http_training_lifecycle() {
     let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
         boxed_test_future(async move {

@@ -15,6 +15,7 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.rl.online.metrics import weight_operation_metrics
+from vllm.entrypoints.serve.middleware.authenticate import APIKeyProtectedRoute
 from vllm.logger import init_logger
 from vllm.v1.engine import PauseMode
 
@@ -25,7 +26,7 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-router = APIRouter()
+router = APIRouter(route_class=APIKeyProtectedRoute)
 
 
 @router.post("/pause")

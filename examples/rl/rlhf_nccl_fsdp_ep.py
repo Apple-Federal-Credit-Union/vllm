@@ -165,8 +165,19 @@ class FSDPTrainWorker:
         self.engine.send_weights()
 
 
-def start_vllm_server(server_gpus: str) -> subprocess.Popen:
-    """Spawn a `vllm serve` HTTP server (EP+DP) on `server_gpus` and wait for it."""
+def start_vllm_server(
+    server_gpus: str, transfer_addr: str, transfer_port: int
+) -> subprocess.Popen:
+    """Spawn a `vllm serve` HTTP server (EP+DP) on `server_gpus` and wait for it.
+
+    The trainer's rendezvous is pinned in the server config; workers refuse to
+    join any other store.
+    """
+    weight_transfer_config = {
+        "backend": "nccl",
+        "master_address": transfer_addr,
+        "master_port": transfer_port,
+    }
     serve_args = [
         "vllm",
         "serve",
@@ -186,7 +197,7 @@ def start_vllm_server(server_gpus: str) -> subprocess.Popen:
         "--port",
         str(SERVER_PORT),
         "--weight-transfer-config",
-        json.dumps({"backend": "nccl"}),
+        json.dumps(weight_transfer_config),
     ]
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = server_gpus
@@ -281,8 +292,14 @@ def main():
     server_gpus = ",".join(str(g) for g in server_gpu_ids)
     print(f"[init] Training GPUs {sorted(training_gpus)}; server GPUs [{server_gpus}].")
 
+    print("[transfer] Setting up weight-transfer endpoint...")
+    transfer_addr, transfer_port = ray.get(
+        fsdp_workers[0].setup_transfer_endpoint.remote()
+    )
+    print(f"[transfer] Endpoint ready at {transfer_addr}:{transfer_port}")
+
     # Start the inference server on the complementary GPUs.
-    server_proc = start_vllm_server(server_gpus)
+    server_proc = start_vllm_server(server_gpus, transfer_addr, transfer_port)
     try:
         client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
 
@@ -305,12 +322,6 @@ def main():
             print("-" * 60)
 
         # --- Weight-transfer setup ---
-        print("[transfer] Setting up weight-transfer endpoint...")
-        transfer_addr, transfer_port = ray.get(
-            fsdp_workers[0].setup_transfer_endpoint.remote()
-        )
-        print(f"[transfer] Endpoint ready at {transfer_addr}:{transfer_port}")
-
         transfer_world_size = INFERENCE_TP_SIZE * INFERENCE_DP_SIZE + 1
         print(
             f"[transfer] World size: {transfer_world_size} "

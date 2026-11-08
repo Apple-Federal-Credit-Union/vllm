@@ -7,6 +7,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import functools
+import json
 import os
 import pickle
 import socket
@@ -16,7 +17,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
+from typing import Any, Self
 
 import torch
 from torch.distributed import ProcessGroup, Store, TCPStore
@@ -293,11 +294,17 @@ class StatelessProcessGroup:
         self.recv_src_counter = {i: 0 for i in range(self.world_size)}
         self.broadcast_recv_src_counter = {i: 0 for i in range(self.world_size)}
 
+    def _dumps(self, obj: Any) -> bytes:
+        return pickle.dumps(obj)
+
+    def _loads(self, data: bytes) -> Any:
+        return pickle.loads(data)
+
     def send_obj(self, obj: Any, dst: int):
         """Send an object to a destination rank."""
         self.expire_data()
         key = f"send_to/{dst}/{self.send_dst_counter[dst]}"
-        self.store.set(key, pickle.dumps(obj))
+        self.store.set(key, self._dumps(obj))
         self.send_dst_counter[dst] += 1
         self.entries.append((key, time.time()))
 
@@ -314,11 +321,31 @@ class StatelessProcessGroup:
 
     def recv_obj(self, src: int) -> Any:
         """Receive an object from a source rank."""
-        obj = pickle.loads(
+        obj = self._loads(
             self.store.get(f"send_to/{self.rank}/{self.recv_src_counter[src]}")
         )
         self.recv_src_counter[src] += 1
         return obj
+
+    def broadcast_bytes(self, data: bytes | None, src: int) -> bytes:
+        """Broadcast raw bytes from a source rank to all other ranks.
+
+        Receivers get the stored value as-is; nothing is deserialized. Shares
+        the key sequence of `broadcast_obj`.
+        """
+        if self.rank == src:
+            if data is None:
+                raise ValueError("the source rank must provide the bytes")
+            self.expire_data()
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
+            self.store.set(key, data)
+            self.broadcast_send_counter += 1
+            self.entries.append((key, time.time()))
+            return data
+        key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
+        received = self.store.get(key)
+        self.broadcast_recv_src_counter[src] += 1
+        return received
 
     def broadcast_obj(self, obj: Any | None, src: int) -> Any:
         """Broadcast an object from a source rank to all other ranks.
@@ -326,17 +353,9 @@ class StatelessProcessGroup:
         Use it for limited times, e.g., for initialization.
         """
         if self.rank == src:
-            self.expire_data()
-            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
-            self.store.set(key, pickle.dumps(obj))
-            self.broadcast_send_counter += 1
-            self.entries.append((key, time.time()))
+            self.broadcast_bytes(self._dumps(obj), src)
             return obj
-        else:
-            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
-            recv_obj = pickle.loads(self.store.get(key))
-            self.broadcast_recv_src_counter[src] += 1
-            return recv_obj
+        return self._loads(self.broadcast_bytes(None, src))
 
     def all_gather_obj(self, obj: Any) -> list[Any]:
         """All gather an object from all ranks."""
@@ -353,7 +372,7 @@ class StatelessProcessGroup:
     def broadcast(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
         """Broadcast a tensor from source rank to all other ranks."""
         if self.rank == src:
-            tensor_bytes = pickle.dumps(tensor)
+            tensor_bytes = self._dumps(tensor)
             self.expire_data()
             key = f"broadcast_tensor/{src}/{self.broadcast_send_counter}"
             self.store.set(key, tensor_bytes)
@@ -362,7 +381,7 @@ class StatelessProcessGroup:
             return tensor
         else:
             key = f"broadcast_tensor/{src}/{self.broadcast_recv_src_counter[src]}"
-            tensor = pickle.loads(self.store.get(key))
+            tensor = self._loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return tensor
 
@@ -370,14 +389,14 @@ class StatelessProcessGroup:
         """Send a tensor to a destination rank."""
         self.expire_data()
         key = f"send_tensor/{dst}/{self.send_dst_counter[dst]}"
-        self.store.set(key, pickle.dumps(tensor))
+        self.store.set(key, self._dumps(tensor))
         self.send_dst_counter[dst] += 1
         self.entries.append((key, time.time()))
 
     def recv(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from a source rank."""
         key = f"send_tensor/{self.rank}/{self.recv_src_counter[src]}"
-        received = pickle.loads(self.store.get(key))
+        received = self._loads(self.store.get(key))
         self.recv_src_counter[src] += 1
         tensor.copy_(received)
         return tensor
@@ -533,8 +552,9 @@ class StatelessProcessGroup:
             except Exception:
                 logger.debug("Error deleting key: %s", f"departure_{barrier_id}_{i}")
 
-    @staticmethod
+    @classmethod
     def create(
+        cls,
         host: str,
         port: int,
         rank: int,
@@ -542,7 +562,7 @@ class StatelessProcessGroup:
         data_expiration_seconds: int = 3600,
         store_timeout: int = 300,
         listen_socket: socket.socket | None = None,
-    ) -> "StatelessProcessGroup":
+    ) -> Self:
         """A replacement for `torch.distributed.init_process_group` that does not
         pollute the global state.
 
@@ -574,12 +594,27 @@ class StatelessProcessGroup:
             use_libuv=False,  # for now: github.com/pytorch/pytorch/pull/150215
         )
 
-        return StatelessProcessGroup(
+        return cls(
             rank=rank,
             world_size=world_size,
             store=store,
             data_expiration_seconds=data_expiration_seconds,
         )
+
+
+class JSONStatelessProcessGroup(StatelessProcessGroup):
+    """A `StatelessProcessGroup` that exchanges objects as JSON.
+
+    For groups that join a store hosted by a process outside this deployment
+    (e.g. an RL trainer), so a peer can never make this process unpickle
+    data. Only JSON-serializable objects can be exchanged, and tensors cannot.
+    """
+
+    def _dumps(self, obj: Any) -> bytes:
+        return json.dumps(obj).encode()
+
+    def _loads(self, data: bytes) -> Any:
+        return json.loads(data)
 
 
 @functools.lru_cache(maxsize=1)

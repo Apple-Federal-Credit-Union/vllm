@@ -9,11 +9,12 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.middleware.authenticate import APIKeyProtectedRoute
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(route_class=APIKeyProtectedRoute)
 
 
 def engine_client(request: Request) -> EngineClient:

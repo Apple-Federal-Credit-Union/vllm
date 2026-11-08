@@ -20,23 +20,35 @@ owns that concurrency internally.
 
 ## Inference Side
 
-The inference side takes a plain backend selector. The rendezvous parameters and
-the packing wire params arrive from the trainer at the init handshake.
+The inference side takes the backend selector and the trainer's TCPStore
+address. Workers only join that store: the `master_address` / `master_port` in
+`init_weight_transfer_engine` must match it, or init is rejected. The packing
+wire params arrive from the trainer at the init handshake.
 
 ```python
 from vllm import LLM
 from vllm.config import WeightTransferConfig
 
-llm = LLM(model="my-model", weight_transfer_config=WeightTransferConfig(backend="nccl"))
+llm = LLM(
+    model="my-model",
+    weight_transfer_config=WeightTransferConfig(
+        backend="nccl", master_address=master_address, master_port=master_port
+    ),
+)
 ```
 
 ```bash
-vllm serve my-model --weight-transfer-config '{"backend": "nccl"}'
+vllm serve my-model --weight-transfer-config \
+    '{"backend": "nccl", "master_address": "10.0.0.1", "master_port": 29500}'
 ```
 
 Nothing else is required: `init_weight_transfer_engine`, `start_weight_update`,
 `update_weights`, and `finish_weight_update` are all driven remotely by the
-trainer engine.
+trainer engine. When the server has an API key (`--api-key` / `VLLM_API_KEY`),
+these routes require it; pass it as `HTTPVLLMWeightSyncClient(url, api_key=...)`.
+
+The unique-id rendezvous (`nccl_unique_id_b64`, below) does not use a TCPStore
+and needs no `master_address` / `master_port`.
 
 ## Trainer Side
 
@@ -213,7 +225,8 @@ Trainer-side communicators without vLLM:
 ## Sparse NCCL
 
 Sparse, flat-index weight patches use
-`WeightTransferConfig(backend="sparse_nccl")`. Names, full shapes, and flat
+`WeightTransferConfig(backend="sparse_nccl", master_address=..., master_port=...)`,
+with the same pinned rendezvous as the dense backend. Names, full shapes, and flat
 indices are interpreted in **checkpoint/Hugging Face coordinates**. Every
 inference rank receives the same checkpoint-global patch, then the model's native
 `load_weights()` maps it to rank-local TP/EP and packed runtime parameters.

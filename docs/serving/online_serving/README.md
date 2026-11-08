@@ -187,6 +187,8 @@ When using the flag VLLM_SERVER_DEV_MODE=1, you enable development endpoints.
 
 For further details on Weight Transfer, please refer to [this page](../../training/weight_transfer/README.md).
 
+When `--api-key` or `VLLM_API_KEY` is set, these endpoints and `/collective_rpc` require it as a Bearer token.
+
 - `/pause` - Pause generation (causes denial of service)
 - `/resume` - Resume generation
 - `/is_paused` - Check if generation is paused

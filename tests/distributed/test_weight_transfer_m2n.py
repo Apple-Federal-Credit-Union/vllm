@@ -1265,7 +1265,12 @@ def _m2n_worker_receive(
 
     recorder = Recorder()
     engine = M2NWeightTransferEngine(
-        WeightTransferConfig(backend="nccl_m2n"), vllm_config, device, recorder
+        WeightTransferConfig(
+            backend="nccl_m2n", master_address=master_address, master_port=master_port
+        ),
+        vllm_config,
+        device,
+        recorder,
     )
     if mixed_layout:
         params = [

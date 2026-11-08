@@ -119,6 +119,9 @@ class TrainModel:
         self.port = get_open_port()
         self.master_address = get_ip()
 
+    def get_rendezvous(self) -> tuple[str, int]:
+        return self.master_address, self.port
+
     def init_weight_transfer(self, world_size, llm_handle):
         """Build the trainer-side weight-transfer engine and rendezvous."""
         self.engine = WeightTransferTrainerFactory.trainer_init(
@@ -165,6 +168,8 @@ ray.init(runtime_env={"env_vars": ray_env_vars})
 # Launch the training model actor. Ray's resource scheduler will allocate
 # 1 GPU (via num_gpus=1 in the decorator), ensuring pg_inference gets different GPUs.
 train_model = TrainModel.remote(MODEL_NAME_V2)
+# Inference workers only join the trainer store pinned in their config.
+master_address, master_port = ray.get(train_model.get_rendezvous.remote())
 
 rocm_determinism_kwargs = {}
 if current_platform.is_rocm():
@@ -184,7 +189,9 @@ llm_kwargs = dict(
     distributed_executor_backend="ray",
     attention_backend=ATTN_BACKEND,
     gpu_memory_utilization=0.75,
-    weight_transfer_config=WeightTransferConfig(backend="nccl"),
+    weight_transfer_config=WeightTransferConfig(
+        backend="nccl", master_address=master_address, master_port=master_port
+    ),
 )
 llm_kwargs.update(rocm_determinism_kwargs)
 

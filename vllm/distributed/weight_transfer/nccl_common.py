@@ -19,8 +19,9 @@ import torch
 
 if TYPE_CHECKING:
     from vllm.config.parallel import ParallelConfig
+    from vllm.config.weight_transfer import WeightTransferConfig
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.utils import JSONStatelessProcessGroup
 
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCL_UNIQUE_ID_BYTES,
@@ -178,11 +179,11 @@ def stateless_init_metadata_group(
     world_size: int,
     *,
     listen_socket: socket.socket | None = None,
-) -> "StatelessProcessGroup":
+) -> "JSONStatelessProcessGroup":
     """Create only the TCPStore group used for metadata agreement."""
-    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.utils import JSONStatelessProcessGroup
 
-    return StatelessProcessGroup.create(
+    return JSONStatelessProcessGroup.create(
         host=master_address,
         port=master_port,
         rank=rank,
@@ -205,9 +206,9 @@ def stateless_init_process_group(
     and vLLM workers.
     """
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.utils import JSONStatelessProcessGroup
 
-    pg = StatelessProcessGroup.create(
+    pg = JSONStatelessProcessGroup.create(
         host=master_address, port=master_port, rank=rank, world_size=world_size
     )
     with unpinned_nccl_env():
@@ -244,16 +245,41 @@ def _worker_group_rank(rank_offset: int, parallel_config: "ParallelConfig") -> i
     return rank_offset + dp_rank * world_size_per_dp + rank_within_dp
 
 
+def configured_rendezvous(
+    init_info: NCCLWeightTransferInitInfo,
+    config: "WeightTransferConfig",
+) -> tuple[str, int]:
+    """Return the trainer TCPStore pinned in `WeightTransferConfig`.
+
+    Init info arrives from the control plane, so it may repeat the configured
+    address but never chooses which store a worker joins.
+    """
+    if config.master_address is None or config.master_port is None:
+        raise ValueError(
+            "TCPStore weight-transfer rendezvous requires "
+            "weight_transfer_config.master_address and "
+            "weight_transfer_config.master_port to be set"
+        )
+    pinned = (config.master_address, config.master_port)
+    requested = (init_info.master_address, init_info.master_port)
+    if requested != pinned:
+        raise ValueError(
+            f"init_info rendezvous {requested} does not match the configured "
+            f"weight_transfer_config rendezvous {pinned}"
+        )
+    return pinned
+
+
 def worker_init_metadata_group(
     init_info: NCCLWeightTransferInitInfo,
     parallel_config: "ParallelConfig",
-) -> "StatelessProcessGroup":
+    config: "WeightTransferConfig",
+) -> "JSONStatelessProcessGroup":
     """Join the trainer-to-worker TCP metadata group without constructing NCCL."""
-    assert init_info.master_address is not None
-    assert init_info.master_port is not None
+    master_address, master_port = configured_rendezvous(init_info, config)
     return stateless_init_metadata_group(
-        init_info.master_address,
-        init_info.master_port,
+        master_address,
+        master_port,
         _worker_group_rank(init_info.rank_offset, parallel_config),
         init_info.world_size,
     )
@@ -262,11 +288,13 @@ def worker_init_metadata_group(
 def worker_init_process_group(
     init_info: NCCLWeightTransferInitInfo,
     parallel_config: "ParallelConfig",
+    config: "WeightTransferConfig",
 ) -> "PyNcclCommunicator":
     """Create the trainer<->worker NCCL group on an inference worker.
 
     Computes a unique rank for this worker across all data-parallel groups and
-    joins the trainer via whichever rendezvous mode `init_info` carries.
+    joins the trainer via whichever rendezvous mode `init_info` carries. The
+    TCPStore mode only joins the store pinned in `config`.
     """
     rank = _worker_group_rank(init_info.rank_offset, parallel_config)
 
@@ -279,12 +307,10 @@ def worker_init_process_group(
             init_info.world_size,
             device,
         )
-    # __post_init__ guarantees the TCP pair when there is no unique id.
-    assert init_info.master_address is not None
-    assert init_info.master_port is not None
+    master_address, master_port = configured_rendezvous(init_info, config)
     return stateless_init_process_group(
-        init_info.master_address,
-        init_info.master_port,
+        master_address,
+        master_port,
         rank,
         init_info.world_size,
         device=device,
