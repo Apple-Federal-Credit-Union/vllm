@@ -382,6 +382,7 @@ impl EngineCoreClient {
         ));
         let output_task = AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
             connected.output_socket,
+            None,
             output_tx,
         )));
         let dispatcher_task = AbortOnDropHandle::new(
@@ -403,6 +404,7 @@ impl EngineCoreClient {
                 let coordinator_output_task =
                     AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
                         coordinator_transport.output_socket,
+                        Some(coordinator_transport.auth_key),
                         coordinator_output_tx,
                     )));
                 let coordinator_task = AbortOnDropHandle::new(

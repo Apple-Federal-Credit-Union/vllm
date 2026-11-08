@@ -108,6 +108,8 @@ class EngineZmqAddresses:
     coordinator_input: str | None = None
     # ZMQ output socket address of DP coordinator if applicable
     coordinator_output: str | None = None
+    # Key authenticating messages sent to the DP coordinator if applicable
+    coordinator_auth_key: bytes | None = None
     # ZMQ socket for front-end to connect to DP coordinator.
     # Not used by engine, just relayed to front-end in handshake response.
     # Only required for external DP LB case.
@@ -1272,6 +1274,7 @@ def launch_core_engines(
         addresses.coordinator_input, addresses.coordinator_output = (
             coordinator.get_engine_socket_addresses()
         )
+        addresses.coordinator_auth_key = coordinator.auth_key
         addresses.frontend_stats_publish_address = (
             coordinator.get_stats_publish_address()
         )

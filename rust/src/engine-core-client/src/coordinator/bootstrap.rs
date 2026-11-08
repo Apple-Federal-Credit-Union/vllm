@@ -4,10 +4,12 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use tracing::warn;
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::{PullSocket, XPubSocket, ZmqMessage};
 
-use crate::error::{Error, Result, bail_unexpected_handshake_message};
+use crate::coordinator::CoordinatorAuthKey;
+use crate::error::{Error, Result};
 
 /// Engine-facing sockets owned by the in-process coordinator.
 pub(crate) struct CoordinatorBootstrap {
@@ -15,6 +17,8 @@ pub(crate) struct CoordinatorBootstrap {
     pub output_address: String,
     pub input_socket: XPubSocket,
     pub output_socket: PullSocket,
+    /// Key that engine messages on `output_socket` must be authenticated with.
+    pub auth_key: CoordinatorAuthKey,
 }
 
 impl CoordinatorBootstrap {
@@ -32,6 +36,7 @@ impl CoordinatorBootstrap {
             output_address,
             input_socket,
             output_socket,
+            auth_key: CoordinatorAuthKey::generate(),
         })
     }
 
@@ -63,10 +68,11 @@ async fn wait_for_engine_subscriptions(
                     timeout: ready_timeout,
                 }
             })??;
+        // Any peer can send on the broadcast socket, so other messages are not
+        // fatal.
         if !is_engine_subscription(&message) {
-            bail_unexpected_handshake_message!(
-                "expected coordinator subscription [0x01], got {message:?}"
-            );
+            warn!("ignoring unexpected message while waiting for coordinator subscriptions");
+            continue;
         }
         received += 1;
     }
