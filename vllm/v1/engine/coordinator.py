@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import hashlib
+import hmac
 import multiprocessing
 import multiprocessing.connection
+import secrets
 import time
 import weakref
+from collections.abc import Sequence
 
 import msgspec.msgpack
 import zmq
@@ -14,10 +18,42 @@ from vllm.logger import configure_logging, init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import get_mp_context, set_process_title
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
-from vllm.v1.serial_utils import MsgpackDecoder
+from vllm.v1.serial_utils import MsgpackDecoder, bytestr
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
 logger = init_logger(__name__)
+
+_AUTH_KEY_SIZE = 32
+_MAC_SIZE = hashlib.sha256().digest_size
+_ENGINE_OUTPUT_DOMAIN = b"vllm-dp-coordinator/engine-output"
+_SCALE_DOMAIN = b"vllm-dp-coordinator/scale-elastic-ep"
+
+
+def _compute_mac(key: bytes, domain: bytes, frames: Sequence[bytestr]) -> bytes:
+    mac = hmac.new(key, domain, hashlib.sha256)
+    for frame in frames:
+        view = memoryview(frame)
+        mac.update(view.nbytes.to_bytes(8, "little"))
+        mac.update(view)
+    return mac.digest()
+
+
+def sign_engine_output(key: bytes, frames: Sequence[bytestr]) -> list[bytestr]:
+    """Append the coordinator MAC frame to an engine -> coordinator message."""
+    return [*frames, _compute_mac(key, _ENGINE_OUTPUT_DOMAIN, frames)]
+
+
+def sign_scale_elastic_ep(key: bytes, payload: bytes) -> bytes:
+    """Append the coordinator MAC to a front-end SCALE_ELASTIC_EP message.
+
+    The MAC is a suffix so the message never starts with a byte that an
+    XSUB socket interprets as a (un)subscription.
+    """
+    return payload + _compute_mac(key, _SCALE_DOMAIN, (payload,))
+
+
+def _verify(key: bytes, domain: bytes, frames: Sequence[bytes], mac: bytes) -> bool:
+    return hmac.compare_digest(mac, _compute_mac(key, domain, frames))
 
 
 class DPCoordinator:
@@ -96,6 +132,15 @@ class DPCoordinator:
         back_publish_address = get_engine_client_zmq_addr(local_only_eng, host=host)
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host=host)
 
+        # Engines and the front-end receive this key with the coordinator
+        # addresses; the coordinator drops any message not authenticated by it.
+        self.auth_key = secrets.token_bytes(_AUTH_KEY_SIZE)
+        max_engine_count = (
+            parallel_config.elastic_ep_max_dp_size
+            if parallel_config.enable_elastic_ep
+            else None
+        )
+
         context = get_mp_context()
         parent_zmq_addr_pipe, child_zmq_addr_pipe = context.Pipe(duplex=False)
         self.proc: multiprocessing.Process = context.Process(
@@ -109,6 +154,8 @@ class DPCoordinator:
                 "zmq_addr_pipe": child_zmq_addr_pipe,
                 "enable_wave_coordination": enable_wave_coordination,
                 "logging_config": logging_config,
+                "auth_key": self.auth_key,
+                "max_engine_count": max_engine_count,
             },
             daemon=True,
         )
@@ -151,7 +198,17 @@ class DPCoordinatorProc:
         engine_count: int,
         min_stats_update_interval_ms: int = 100,
         enable_wave_coordination: bool = True,
+        auth_key: bytes | None = None,
+        max_engine_count: int | None = None,
     ):
+        """Args:
+        auth_key: Key that engine and SCALE_ELASTIC_EP messages must be
+            authenticated with. If None, a fresh key is generated and no
+            such message will be accepted.
+        max_engine_count: Upper bound for SCALE_ELASTIC_EP. If None,
+            SCALE_ELASTIC_EP messages are rejected.
+
+        """
         set_process_title("DPCoordinator")
         self.ctx = zmq.Context()
 
@@ -159,6 +216,10 @@ class DPCoordinatorProc:
 
         self.stats_update_interval_ms = min_stats_update_interval_ms
         self.enable_wave_coordination = enable_wave_coordination
+        self.auth_key = (
+            auth_key if auth_key is not None else secrets.token_bytes(_AUTH_KEY_SIZE)
+        )
+        self.max_engine_count = max_engine_count
 
     @staticmethod
     def run_coordinator(
@@ -170,6 +231,8 @@ class DPCoordinatorProc:
         min_stats_update_interval_ms: int = 100,
         enable_wave_coordination: bool = True,
         logging_config: LoggingConfig | None = None,
+        auth_key: bytes | None = None,
+        max_engine_count: int | None = None,
     ):
         if logging_config is not None:
             configure_logging(logging_config)
@@ -178,6 +241,8 @@ class DPCoordinatorProc:
             engine_count=engine_count,
             min_stats_update_interval_ms=min_stats_update_interval_ms,
             enable_wave_coordination=enable_wave_coordination,
+            auth_key=auth_key,
+            max_engine_count=max_engine_count,
         )
         try:
             coordinator.process_input_socket(
@@ -243,13 +308,15 @@ class DPCoordinatorProc:
                 finally:
                     zmq_addr_pipe.close()
             # Wait until all engines subscribe.
-            for _ in self.engines:
-                if publish_back.recv() != b"\x01":
+            subscribed = 0
+            while subscribed < len(self.engines):
+                if publish_back.recv() == b"\x01":
+                    subscribed += 1
+                else:
                     logger.error(
                         "DP Coordinator received unexpected message while "
                         "waiting for engines to subscribe"
                     )
-                    return
             # Send ready message to engines.
             publish_back.send(b"READY")
 
@@ -314,14 +381,9 @@ class DPCoordinatorProc:
                         # Ignore subscription messages.
                         continue
 
-                    decoded = msgspec.msgpack.decode(buffer)
-                    if (
-                        isinstance(decoded, (list, tuple))
-                        and len(decoded) == 2
-                        and decoded[0] == "SCALE_ELASTIC_EP"
-                    ):
+                    new_engine_count = self._decode_scale_elastic_ep(buffer)
+                    if new_engine_count is not None:
                         # Handle scale up notification
-                        new_engine_count = decoded[1]
                         current_count = len(self.engines)
                         if new_engine_count > current_count:
                             for _ in range(new_engine_count - current_count):
@@ -357,11 +419,11 @@ class DPCoordinatorProc:
                 if output_back in events:
                     # We received a message from one of the engines.
 
-                    buffer = output_back.recv()
-                    outputs: EngineCoreOutputs = decoder.decode(buffer)
-
-                    assert not outputs.outputs
-                    assert outputs.utility_output is None
+                    outputs = self._decode_engine_output(
+                        decoder, output_back.recv_multipart()
+                    )
+                    if outputs is None:
+                        continue
 
                     eng_index = outputs.engine_index
                     scheduler_stats = outputs.scheduler_stats
@@ -442,6 +504,56 @@ class DPCoordinatorProc:
                 if wave_state_changed:
                     message = (None, current_wave, engines_running)
                     publish_front.send(msgspec.msgpack.encode(message))
+
+    def _decode_engine_output(
+        self, decoder: MsgpackDecoder, frames: list[bytes]
+    ) -> EngineCoreOutputs | None:
+        """Authenticate and decode an engine message, or return None."""
+        if len(frames) < 2 or not _verify(
+            self.auth_key, _ENGINE_OUTPUT_DOMAIN, frames[:-1], frames[-1]
+        ):
+            logger.error("DP Coordinator dropped unauthenticated engine message")
+            return None
+        try:
+            outputs = decoder.decode(frames[:-1])
+        except Exception:
+            logger.exception("DP Coordinator failed to decode engine message")
+            return None
+        if outputs.outputs or outputs.utility_output is not None:
+            logger.error("DP Coordinator received request outputs from an engine")
+            return None
+        return outputs
+
+    def _decode_scale_elastic_ep(self, buffer: bytes) -> int | None:
+        """Authenticate a SCALE_ELASTIC_EP message and return the new engine
+        count, or return None."""
+        payload, mac = buffer[:-_MAC_SIZE], buffer[-_MAC_SIZE:]
+        if len(buffer) <= _MAC_SIZE or not _verify(
+            self.auth_key, _SCALE_DOMAIN, (payload,), mac
+        ):
+            return None
+        try:
+            decoded = msgspec.msgpack.decode(payload)
+        except msgspec.DecodeError:
+            return None
+        if not (
+            isinstance(decoded, list)
+            and len(decoded) == 2
+            and decoded[0] == "SCALE_ELASTIC_EP"
+            and type(decoded[1]) is int
+        ):
+            return None
+        new_engine_count = decoded[1]
+        if self.max_engine_count is None or not (
+            1 <= new_engine_count <= self.max_engine_count
+        ):
+            logger.error(
+                "DP Coordinator rejected scale to %d engines (max: %s)",
+                new_engine_count,
+                self.max_engine_count,
+            )
+            return None
+        return new_engine_count
 
     @staticmethod
     def _send_start_wave(

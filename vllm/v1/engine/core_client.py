@@ -51,7 +51,7 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
 )
-from vllm.v1.engine.coordinator import DPCoordinator
+from vllm.v1.engine.coordinator import DPCoordinator, sign_scale_elastic_ep
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
@@ -643,6 +643,7 @@ class MPClient(EngineCoreClient):
             self.stats_update_address: str | None = None
             self.coordinator_input_address: str | None = None
             self.coordinator_output_address: str | None = None
+            self.coordinator_auth_key: bytes | None = None
             tensor_queue: Queue | None = None
             if client_addresses:
                 # Engines are managed externally to this client.
@@ -917,6 +918,7 @@ class MPClient(EngineCoreClient):
         for attribute in (
             "coordinator_input_address",
             "coordinator_output_address",
+            "coordinator_auth_key",
         ):
             address = getattr(response, attribute)
             if address is not None:
@@ -1571,7 +1573,15 @@ class DPAsyncMPClient(AsyncMPClient):
                             else:
                                 self.lb_engines = self.lb_engines[:new_engine_count]
                         # Forward the scale notification to the coordinator.
-                        await socket.send(buf)
+                        if self.coordinator_auth_key is None:
+                            logger.error(
+                                "Cannot notify DP coordinator of scaling: no "
+                                "coordinator key was received from the engines"
+                            )
+                        else:
+                            await socket.send(
+                                sign_scale_elastic_ep(self.coordinator_auth_key, buf)
+                            )
                         continue
 
                     buf = None

@@ -84,6 +84,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.coordinator import sign_engine_output
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -1270,6 +1271,7 @@ class EngineCoreProc(EngineCore):
                 args=(
                     addresses.outputs,
                     addresses.coordinator_output,
+                    addresses.coordinator_auth_key,
                     self.engine_index,
                 ),
                 daemon=True,
@@ -1928,6 +1930,7 @@ class EngineCoreProc(EngineCore):
             coord_store_port=parallel_config._coord_store_port,
             coordinator_input_address=self.addresses.coordinator_input,
             coordinator_output_address=self.addresses.coordinator_output,
+            coordinator_auth_key=self.addresses.coordinator_auth_key,
         )
 
     def process_input_sockets(
@@ -2040,7 +2043,11 @@ class EngineCoreProc(EngineCore):
                     self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(
-        self, output_paths: list[str], coord_output_path: str | None, engine_index: int
+        self,
+        output_paths: list[str],
+        coord_output_path: str | None,
+        coord_auth_key: bytes | None,
+        engine_index: int,
     ):
         """Output socket IO thread."""
         # Msgpack serialization encoding.
@@ -2087,7 +2094,10 @@ class EngineCoreProc(EngineCore):
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
                     assert coord_socket is not None
-                    coord_socket.send_multipart(encoder.encode(outputs))
+                    frames = encoder.encode(outputs)
+                    if coord_auth_key is not None:
+                        frames = sign_engine_output(coord_auth_key, frames)
+                    coord_socket.send_multipart(frames)
                     continue
 
                 # Reclaim buffers that zmq is finished with.

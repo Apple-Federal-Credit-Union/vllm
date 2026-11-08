@@ -293,6 +293,7 @@ class ExternalElasticEPScaleCoordinator:
             outputs=[self.client.output_address],
             coordinator_input=coordinator_input,
             coordinator_output=coordinator_output,
+            coordinator_auth_key=self.client.coordinator_auth_key,
             frontend_stats_publish_address=self.client.stats_update_address,
         )
 
