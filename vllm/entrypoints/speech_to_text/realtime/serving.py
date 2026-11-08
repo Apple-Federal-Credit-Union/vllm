@@ -56,6 +56,7 @@ class OpenAIServingRealtime(GenerateBaseServing):
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
+        input_chunk_slots: asyncio.Semaphore,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Transform audio stream into StreamingInput for engine.generate().
 
@@ -65,6 +66,9 @@ class OpenAIServingRealtime(GenerateBaseServing):
                 generation outputs. Used for autoregressive multi-turn
                 processing where each generation's output becomes the context
                 for the next iteration.
+            input_chunk_slots: Acquired before each prompt is pulled from the
+                model and released by the caller when the engine finishes an
+                input chunk, so audio is not read faster than it is consumed.
 
         Yields:
             StreamingInput objects containing audio prompts for the engine
@@ -82,7 +86,12 @@ class OpenAIServingRealtime(GenerateBaseServing):
             ),
         )
 
-        async for prompt in stream_input_iter:
+        while True:
+            await input_chunk_slots.acquire()
+            try:
+                prompt = await anext(stream_input_iter)
+            except StopAsyncIteration:
+                return
             parsed_prompt = parse_model_prompt(model_config, prompt)
             (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
 

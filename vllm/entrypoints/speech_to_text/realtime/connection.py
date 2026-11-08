@@ -18,6 +18,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.serve.exception_handling.utils import sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.utils.mem_constants import MiB_bytes
 
 from .protocol import (
     ErrorEvent,
@@ -30,6 +31,11 @@ from .protocol import (
 from .serving import OpenAIServingRealtime
 
 logger = init_logger(__name__)
+
+_PCM16_SAMPLE_BYTES = 2
+# One chunk being processed by the engine plus one queued behind it.
+_MAX_PENDING_INPUT_CHUNKS = 2
+_WS_CLOSE_MESSAGE_TOO_BIG = 1009
 
 
 class RealtimeConnection:
@@ -55,6 +61,8 @@ class RealtimeConnection:
         self._is_model_validated = False
 
         self._max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+        self._max_buffered_audio_bytes = self._max_audio_filesize_mb * MiB_bytes
+        self._buffered_audio_bytes = 0
 
     async def handle_connection(self):
         """Main connection loop."""
@@ -66,7 +74,7 @@ class RealtimeConnection:
         await self.send(SessionCreated())
 
         try:
-            while True:
+            while self._is_connected:
                 message = await self.websocket.receive_text()
                 try:
                     event = json.loads(message)
@@ -119,27 +127,37 @@ class RealtimeConnection:
             append_event = InputAudioBufferAppend(**event)
             try:
                 audio_bytes = base64.b64decode(append_event.audio)
-                # Convert PCM16 bytes to float32 numpy array
-                audio_array = (
-                    np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-                    / 32768.0
-                )
-
-                if len(audio_array) / 1024**2 > self._max_audio_filesize_mb:
-                    raise VLLMValidationError(
-                        "Maximum file size exceeded",
-                        parameter="audio_filesize_mb",
-                        value=len(audio_array) / 1024**2,
-                    )
-                if len(audio_array) == 0:
+                if len(audio_bytes) == 0:
                     raise VLLMValidationError("Can't process empty audio.")
-
-                # Put audio chunk in queue
-                self.audio_queue.put_nowait(audio_array)
-
             except Exception as e:
                 logger.error("Failed to decode audio: %s", e)
                 await self.send_error("Invalid audio data", "invalid_audio")
+                return
+
+            # The limit applies to the PCM16 bytes still buffered on this
+            # connection and is checked before the float32 copy.
+            remaining = self._max_buffered_audio_bytes - self._buffered_audio_bytes
+            if len(audio_bytes) > remaining:
+                await self.send_error("Maximum file size exceeded", "audio_buffer_full")
+                self._is_connected = False
+                await self.websocket.close(
+                    code=_WS_CLOSE_MESSAGE_TOO_BIG, reason="Maximum file size exceeded"
+                )
+                return
+
+            try:
+                # Convert PCM16 bytes to float32 numpy array
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(
+                    np.float32
+                )
+                audio_array /= 32768.0
+            except Exception as e:
+                logger.error("Failed to decode audio: %s", e)
+                await self.send_error("Invalid audio data", "invalid_audio")
+                return
+
+            self._buffered_audio_bytes += len(audio_bytes)
+            self.audio_queue.put_nowait(audio_array)
 
         elif event_type == "input_audio_buffer.commit":
             if not self._is_model_validated:
@@ -168,7 +186,11 @@ class RealtimeConnection:
             audio_chunk = await self.audio_queue.get()
             if audio_chunk is None:  # Sentinel value to stop
                 break
+            self._release_buffered_audio(audio_chunk)
             yield audio_chunk
+
+    def _release_buffered_audio(self, audio_chunk: np.ndarray) -> None:
+        self._buffered_audio_bytes -= audio_chunk.size * _PCM16_SAMPLE_BYTES
 
     async def start_generation(self):
         """Start the transcription generation task."""
@@ -179,21 +201,23 @@ class RealtimeConnection:
         # Create audio stream generator
         audio_stream = self.audio_stream_generator()
         input_stream = asyncio.Queue[list[int]]()
+        input_chunk_slots = asyncio.Semaphore(_MAX_PENDING_INPUT_CHUNKS)
 
         # Transform to StreamingInput generator
         streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream
+            audio_stream, input_stream, input_chunk_slots
         )
 
         # Start generation task
         self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
+            self._run_generation(streaming_input_gen, input_stream, input_chunk_slots)
         )
 
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        input_chunk_slots: asyncio.Semaphore | None = None,
     ):
         """Run the generation and stream results back to the client.
 
@@ -234,6 +258,11 @@ class RealtimeConnection:
 
             # Stream results back to client as they're generated
             async for output in result_gen:
+                if input_chunk_slots is not None and any(
+                    completion.finished() for completion in output.outputs
+                ):
+                    input_chunk_slots.release()
+
                 if output.outputs and len(output.outputs) > 0:
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
@@ -262,7 +291,8 @@ class RealtimeConnection:
 
             # Clear queue for next utterance
             while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
+                if (audio_chunk := self.audio_queue.get_nowait()) is not None:
+                    self._release_buffered_audio(audio_chunk)
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)

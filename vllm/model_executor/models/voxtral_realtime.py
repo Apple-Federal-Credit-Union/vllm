@@ -146,6 +146,7 @@ class VoxtralRealtimeBuffer:
         config: AudioConfig,
         prompt_tokens: list[int],
         max_model_len: int | None = None,
+        max_queued_audio_chunks: int = 0,
     ) -> None:
         self._config = config
         self._max_model_len = max_model_len
@@ -155,8 +156,10 @@ class VoxtralRealtimeBuffer:
         self._look_ahead_in_samples = self._ms_to_samples(_look_ahead_in_ms)
         self._look_back_in_samples = self._ms_to_samples(_look_back_in_ms)
 
-        # None signals the end
-        self._audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+        # None signals the end. 0 means unbounded.
+        self._audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue(
+            maxsize=max_queued_audio_chunks
+        )
         self._leftover: np.ndarray | None = None
         self._token_queue: asyncio.Queue[int] = asyncio.Queue()
 
@@ -283,8 +286,12 @@ class VoxtralRealtimeGeneration(VoxtralForConditionalGeneration, SupportsRealtim
         # Get left/right padding audio
         left_pad, right_pad = audio_encoder.get_padding_audio()
 
+        # Bounded so the feeder does not drain audio_stream ahead of the model.
         buffer = VoxtralRealtimeBuffer(
-            config, prompt_tokens, max_model_len=model_config.max_model_len
+            config,
+            prompt_tokens,
+            max_model_len=model_config.max_model_len,
+            max_queued_audio_chunks=1,
         )
 
         # Feed audio with padding into buffer in background
