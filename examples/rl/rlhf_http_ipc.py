@@ -17,10 +17,6 @@ The script starts the server itself, then:
   2. Pause generation, sync real weights trainer → server over IPC, resume.
   3. Generate again → sensible output.
 
-IPC handles are pickled for HTTP transport, so both sides need
-`VLLM_ALLOW_INSECURE_SERIALIZATION=1`; this script sets it for itself and for
-the server it spawns.
-
 Run:
     $ python examples/rl/rlhf_http_ipc.py
 """
@@ -53,9 +49,6 @@ TRAINER_DEVICE = "cuda:0"
 # Leave room on the shared GPU for the training model.
 SERVER_GPU_MEMORY_UTILIZATION = 0.5
 
-# Needed to (de)serialize IPC handles across the HTTP boundary.
-os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-
 PROMPTS = [
     "Hello, my name is",
     "The president of the United States is",
@@ -87,7 +80,6 @@ def start_vllm_server() -> subprocess.Popen:
     env = os.environ.copy()
     # Exposes the weight-transfer and pause/resume endpoints.
     env["VLLM_SERVER_DEV_MODE"] = "1"
-    env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     print(f"[server] Launching: {' '.join(serve_args)}")
     proc = subprocess.Popen(
         serve_args,

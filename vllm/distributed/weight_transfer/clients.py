@@ -18,6 +18,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferUpdatePayload,
     WeightTransferUpdateRequest,
 )
+from vllm.distributed.weight_transfer.ipc_engine import ipc_handles_to_json
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -27,24 +28,14 @@ def _json_safe_update_info(update_info: dict[str, Any]) -> dict[str, Any]:
     """Make an update_info dict JSON-serializable for HTTP transport.
 
     CUDA IPC handles (`ipc_handles`) are tuples of non-JSON-native objects, so
-    over HTTP they are pickled+base64-encoded into `ipc_handles_pickled` (which
-    the worker auto-deserializes when `VLLM_ALLOW_INSECURE_SERIALIZATION=1`).
-    Other backends (NCCL) carry only JSON-native metadata and pass through
-    unchanged. Mirrors the old IPC `_do_send` HTTP branch.
+    over HTTP each one is sent in the typed JSON form of `ipc_handles_to_json`,
+    which the worker validates and decodes. Other backends (NCCL) carry only
+    JSON-native metadata and pass through unchanged.
     """
     ipc_handles = update_info.get("ipc_handles")
     if ipc_handles is None:
         return update_info
-
-    import pickle
-
-    import pybase64 as base64
-
-    out = {k: v for k, v in update_info.items() if k != "ipc_handles"}
-    out["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(ipc_handles)).decode(
-        "utf-8"
-    )
-    return out
+    return {**update_info, "ipc_handles": ipc_handles_to_json(ipc_handles)}
 
 
 def _json_safe_update_payload(

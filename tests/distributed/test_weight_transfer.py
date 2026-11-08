@@ -8,6 +8,7 @@ Integration tests for NCCL and IPC weight transfer between processes using Ray.
 
 import builtins
 import importlib.util
+import json
 import pickle
 import runpy
 import threading
@@ -49,6 +50,9 @@ from vllm.distributed.weight_transfer.ipc_engine import (
     IPCWeightTransferEngine,
     IPCWeightTransferInitInfo,
     IPCWeightTransferUpdateInfo,
+    ipc_handle_args_from_json,
+    ipc_handle_args_to_json,
+    ipc_handles_to_json,
 )
 from vllm.distributed.weight_transfer.nccl_common import run_trainer_rendezvous
 from vllm.distributed.weight_transfer.nccl_engine import (
@@ -761,6 +765,27 @@ def test_sparse_nccl_checkpoint_chunks_to_ep_local_experts_cpu(monkeypatch):
 # --- Unit Tests: IPCWeightTransferUpdateInfo Validation ---
 
 
+def _fake_cuda_ipc_args() -> tuple:
+    """`rebuild_cuda_tensor` args shaped like CUDA `reduce_tensor` output."""
+    return (
+        torch.nn.Parameter,
+        torch.Size([2, 3]),
+        (3, 1),
+        0,
+        torch.storage.TypedStorage,
+        torch.bfloat16,
+        0,
+        b"\x00storage-handle\xff",
+        12,
+        0,
+        False,
+        b"/ref-counter",
+        7,
+        None,
+        True,
+    )
+
+
 class TestIPCWeightTransferUpdateInfoValidation:
     """Test IPCWeightTransferUpdateInfo dataclass validation."""
 
@@ -835,60 +860,78 @@ class TestIPCWeightTransferUpdateInfoValidation:
                 ipc_handles=ipc_handles,
             )
 
-    def test_valid_update_info_from_pickled(self, monkeypatch):
+    def test_valid_update_info_from_json(self):
         if torch.accelerator.device_count() < 1:
             pytest.skip("Need at least 1 GPU for this test")
 
-        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
         dummy_tensor = torch.ones(10, 10, device="cuda:0")
-        ipc_handle = reduce_tensor(dummy_tensor)
+        _, ipc_args = reduce_tensor(dummy_tensor)
         gpu_uuid = str(torch.cuda.get_device_properties(0).uuid)
-        ipc_handles = [{gpu_uuid: ipc_handle}]
-
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+        ipc_handles = [{gpu_uuid: ipc_args}]
 
         info = IPCWeightTransferUpdateInfo(
             names=["layer.weight"],
             dtype_names=["float32"],
             shapes=[[10, 10]],
-            ipc_handles_pickled=pickled,
+            ipc_handles=ipc_handles_to_json(ipc_handles),
         )
         assert info.ipc_handles == ipc_handles
-        assert info.ipc_handles_pickled is None
 
-    def test_pickled_requires_insecure_serialization_flag(self, monkeypatch):
-        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    def test_json_handle_roundtrip(self):
+        args = _fake_cuda_ipc_args()
+        encoded = ipc_handle_args_to_json(args)
+        assert json.loads(json.dumps(encoded)) == encoded
+        assert ipc_handle_args_from_json(encoded) == args
 
-        with pytest.raises(ValueError, match="VLLM_ALLOW_INSECURE_SERIALIZATION=1"):
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("tensor_cls", "builtins.eval", "tensor_cls"),
+            ("storage_cls", "os.system", "storage_cls"),
+            ("dtype", "__class__", "dtype"),
+            ("tensor_size", [1, "2"], "tensor_size"),
+            ("tensor_offset", True, "tensor_offset"),
+            ("requires_grad", 0, "requires_grad"),
+            ("storage_handle", "not base64!", "storage_handle"),
+            ("ref_counter_handle", 5, "ref_counter_handle"),
+        ],
+    )
+    def test_json_handle_rejects_invalid_field(self, field, value, match):
+        encoded = ipc_handle_args_to_json(_fake_cuda_ipc_args())
+        encoded[field] = value
+        with pytest.raises(ValueError, match=match):
+            IPCWeightTransferUpdateInfo(
+                names=["w"],
+                dtype_names=["float32"],
+                shapes=[[2, 3]],
+                ipc_handles=[{"gpu-uuid": encoded}],
+            )
+
+    def test_json_handle_rejects_unknown_field(self):
+        encoded = ipc_handle_args_to_json(_fake_cuda_ipc_args())
+        encoded["extra"] = 1
+        with pytest.raises(ValueError, match="exactly the fields"):
+            ipc_handle_args_from_json(encoded)
+
+    def test_pickled_handles_field_rejected(self):
+        """`ipc_handles_pickled` is no longer accepted, so it is never loaded."""
+        loaded: list[str] = []
+
+        class Marker:
+            def __reduce__(self):
+                return (loaded.append, ("loaded",))
+
+        pickled = base64.b64encode(pickle.dumps(Marker())).decode("utf-8")
+        with pytest.raises(TypeError, match="ipc_handles_pickled"):
             IPCWeightTransferUpdateInfo(
                 names=[],
                 dtype_names=[],
                 shapes=[],
-                ipc_handles_pickled=base64.b64encode(pickle.dumps([])).decode("utf-8"),
-            )
-
-    def test_both_handles_and_pickled_raises(self):
-        if torch.accelerator.device_count() < 1:
-            pytest.skip("Need at least 1 GPU for this test")
-
-        dummy_tensor = torch.ones(10, 10, device="cuda:0")
-        ipc_handle = reduce_tensor(dummy_tensor)
-        gpu_uuid = str(torch.cuda.get_device_properties(0).uuid)
-        ipc_handles = [{gpu_uuid: ipc_handle}]
-
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
-
-        with pytest.raises(ValueError, match="Cannot specify both"):
-            IPCWeightTransferUpdateInfo(
-                names=["layer.weight"],
-                dtype_names=["float32"],
-                shapes=[[10, 10]],
-                ipc_handles=ipc_handles,
                 ipc_handles_pickled=pickled,
             )
+        assert loaded == []
 
-    def test_neither_handles_nor_pickled_raises(self):
+    def test_missing_handles_raises(self):
         with pytest.raises(ValueError, match="must be provided"):
             IPCWeightTransferUpdateInfo(
                 names=["layer.weight"],
@@ -949,11 +992,9 @@ class TestIPCEngineParsing:
         assert update_info.shapes == [[100, 100], [50]]
         assert len(update_info.ipc_handles) == 2
 
-    def test_parse_update_info_pickled(self, monkeypatch):
+    def test_parse_update_info_json(self):
         if torch.accelerator.device_count() < 1:
             pytest.skip("Need at least 1 GPU for this test")
-
-        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
         engine = self._make_engine()
 
@@ -964,61 +1005,31 @@ class TestIPCEngineParsing:
         gpu_uuid = str(torch.cuda.get_device_properties(0).uuid)
         ipc_handles = [{gpu_uuid: ipc_args1}, {gpu_uuid: ipc_args2}]
 
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
-
         update_info = engine.parse_update_info(
             {
                 "names": ["w1", "w2"],
                 "dtype_names": ["float32", "bfloat16"],
                 "shapes": [[100, 100], [50]],
-                "ipc_handles_pickled": pickled,
+                "ipc_handles": ipc_handles_to_json(ipc_handles),
             }
         )
 
         assert isinstance(update_info, IPCWeightTransferUpdateInfo)
         assert update_info.names == ["w1", "w2"]
-        assert len(update_info.ipc_handles) == 2
-        assert gpu_uuid in update_info.ipc_handles[0]
-        assert gpu_uuid in update_info.ipc_handles[1]
-
-    def test_parse_update_info_ignores_none_pickled_handles(self):
-        engine = self._make_engine()
-        ipc_handles = [{"gpu-uuid": ("ipc-args",)}]
-
-        update_info = engine.parse_update_info(
-            {
-                "names": ["w1"],
-                "dtype_names": ["float32"],
-                "shapes": [[1]],
-                "ipc_handles": ipc_handles,
-                "ipc_handles_pickled": None,
-            }
-        )
-
-        assert isinstance(update_info, IPCWeightTransferUpdateInfo)
         assert update_info.ipc_handles == ipc_handles
 
-    def test_parse_update_info_both_handles_and_pickled_raises(self):
-        if torch.accelerator.device_count() < 1:
-            pytest.skip("Need at least 1 GPU for this test")
-
+    def test_parse_update_info_rejects_pickled_handles(self):
         engine = self._make_engine()
 
-        dummy_tensor = torch.ones(10, 10, device="cuda:0")
-        _, ipc_handle = reduce_tensor(dummy_tensor)
-        gpu_uuid = str(torch.cuda.get_device_properties(0).uuid)
-        ipc_handles = [{gpu_uuid: ipc_handle}]
-
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
-
-        with pytest.raises(ValueError, match="Cannot specify both"):
+        with pytest.raises(ValueError, match="ipc_handles_pickled"):
             engine.parse_update_info(
                 {
-                    "names": ["layer.weight"],
+                    "names": ["w1"],
                     "dtype_names": ["float32"],
-                    "shapes": [[10, 10]],
-                    "ipc_handles": ipc_handles,
-                    "ipc_handles_pickled": pickled,
+                    "shapes": [[1]],
+                    "ipc_handles_pickled": base64.b64encode(pickle.dumps([])).decode(
+                        "utf-8"
+                    ),
                 }
             )
 
@@ -1068,12 +1079,6 @@ def inference_receive_ipc_tensor(
 ) -> dict:
     """Inference task that receives tensor via IPCWeightTransferEngine."""
     import contextlib
-    import os
-
-    # Worker-side: ipc_handles_pickled is deserialized via pickle.
-    if mode == "http":
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-
     from unittest.mock import MagicMock
 
     import torch
@@ -1128,13 +1133,16 @@ def inference_receive_ipc_tensor(
             "ipc_handles": ipc_handles,
         }
     elif mode == "http":
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
-        update_dict = {
-            "names": ["test.weight"],
-            "dtype_names": [ipc_handle_dict["dtype"]],
-            "shapes": [ipc_handle_dict["shape"]],
-            "ipc_handles_pickled": pickled,
-        }
+        update_dict = json.loads(
+            json.dumps(
+                {
+                    "names": ["test.weight"],
+                    "dtype_names": [ipc_handle_dict["dtype"]],
+                    "shapes": [ipc_handle_dict["shape"]],
+                    "ipc_handles": ipc_handles_to_json(ipc_handles),
+                }
+            )
+        )
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -1318,8 +1326,8 @@ class TestTrainerClients:
         client.shutdown_weight_transfer_engine()
         handle.shutdown_weight_transfer_engine.remote.assert_called_once_with()
 
-    def test_http_client_pickles_ipc_handles_for_json(self, monkeypatch):
-        """HTTP update_weights must encode raw ipc_handles as a base64 pickle."""
+    def test_http_client_encodes_ipc_handles_as_json(self, monkeypatch):
+        """HTTP update_weights must send ipc_handles as typed JSON, not pickle."""
         captured = {}
 
         def fake_post(self, path, json=None):
@@ -1328,20 +1336,19 @@ class TestTrainerClients:
 
         monkeypatch.setattr(HTTPVLLMWeightSyncClient, "_post", fake_post)
         client = HTTPVLLMWeightSyncClient("http://localhost:8000")
-        client.update_weights({"names": ["w"], "ipc_handles": [{"gpu": ("args",)}]})
-        sent = captured["json"]["update_info"]
-        assert "ipc_handles" not in sent
-        assert "ipc_handles_pickled" in sent
-        assert pickle.loads(base64.b64decode(sent["ipc_handles_pickled"])) == [
-            {"gpu": ("args",)}
-        ]
+        args = _fake_cuda_ipc_args()
+        encoded = ipc_handle_args_to_json(args)
 
-        client.update_weights([{"ipc_handles": {"gpu": ("args",)}}, {"names": []}])
+        client.update_weights({"names": ["w"], "ipc_handles": [{"gpu": args}]})
+        sent = captured["json"]["update_info"]
+        assert "ipc_handles_pickled" not in sent
+        assert sent["ipc_handles"] == [{"gpu": encoded}]
+        assert json.loads(json.dumps(sent)) == sent
+
+        client.update_weights([{"ipc_handles": {"gpu": args}}, {"names": []}])
         sent = captured["json"]["update_info"]
         assert sent[1] == {"names": []}
-        assert pickle.loads(base64.b64decode(sent[0]["ipc_handles_pickled"])) == {
-            "gpu": ("args",)
-        }
+        assert sent[0]["ipc_handles"] == {"gpu": encoded}
 
     def test_http_client_passes_through_nccl_update_info(self, monkeypatch):
         """NCCL update_info has only JSON-native fields and passes unchanged."""

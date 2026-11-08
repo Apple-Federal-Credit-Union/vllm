@@ -20,8 +20,11 @@ and it rides the client, so there is no concurrent broadcast to overlap with.
     assumes that group is exactly the set of colocated trainer ranks and that the
     sender is a member. It is a no-op when no distributed group exists.
 
-!!! warning
-    IPC handles involve sending serialized Python objects. When using HTTP transport, you must set `VLLM_ALLOW_INSECURE_SERIALIZATION=1` on both the server and client. This is because IPC handles are pickled and base64-encoded for HTTP transmission.
+!!! note
+    Over HTTP, each IPC handle is sent as a typed JSON object (see
+    [Trainer Without vLLM over HTTP](#trainer-without-vllm-over-http)) that the
+    worker validates field by field. Nothing in the request is unpickled, so the
+    HTTP transport does not need `VLLM_ALLOW_INSECURE_SERIALIZATION`.
 
 ## Inference Side
 
@@ -113,9 +116,7 @@ handled inside `send_weights()`.
 ## Trainer Without vLLM over HTTP
 
 A colocated trainer can speak the [HTTP endpoints](README.md#api-endpoints)
-directly, with only PyTorch and an HTTP client. The server needs
-`VLLM_ALLOW_INSECURE_SERIALIZATION=1`; without it, init and start return 200 and
-the first `/update_weights` returns 500. Reference:
+directly, with only PyTorch and an HTTP client. Reference:
 [`rlhf_http_ipc_no_vllm.py`](../../../examples/rl/rlhf_http_ipc_no_vllm.py).
 
 `POST /init_weight_transfer_engine` body: `{"init_info": {"packed": false}}`.
@@ -125,16 +126,25 @@ the first `/update_weights` returns 500. Reference:
 | Field | Meaning |
 | ----- | ------- |
 | `names`, `dtype_names`, `shapes` | Checkpoint names, `torch` dtype attribute names (`"bfloat16"`), full shapes |
-| `ipc_handles_pickled` | `base64(pickle.dumps(handles))`. Unpacked: a list with one dict per name. Packed: one dict for the shared buffer |
+| `ipc_handles` | Unpacked: a list with one handle dict per name. Packed: one handle dict for the shared buffer |
 | `tensor_sizes` | Packed only: byte size of each tensor in the chunk, in `names` order |
 
-- A handle dict is `{gpu_uuid: reduce_tensor(t)[1]}` with one entry per GPU the
-  server uses (`torch.multiprocessing.reductions.reduce_tensor`).
+- A handle dict is `{gpu_uuid: handle}` with one entry per GPU the server uses.
   `gpu_uuid = str(torch.cuda.get_device_properties(i).uuid)`, **without** the
-  `GPU-` prefix that `nvidia-smi` prints. The worker overwrites `args[6]`
-  (device index) with its own.
-- `ipc_handles` (unpickled) is not JSON-serializable; over HTTP use
-  `ipc_handles_pickled`.
+  `GPU-` prefix that `nvidia-smi` prints.
+- `handle` is a JSON object whose keys are the parameter names of
+  `torch.multiprocessing.reductions.rebuild_cuda_tensor`, holding the values
+  of `reduce_tensor(t)[1]` in that order, with exactly these encodings:
+    - `tensor_cls`: `"Tensor"` or `"Parameter"`; `storage_cls`:
+      `"TypedStorage"` or `"UntypedStorage"` (the class `__name__`).
+    - `dtype`: `torch` dtype attribute name, e.g. `"bfloat16"`.
+    - `tensor_size`, `tensor_stride`: lists of ints.
+    - `storage_handle`, `ref_counter_handle`, `event_handle`: base64 strings,
+      or `null` where `reduce_tensor` returned `None`.
+    - All other fields: the JSON int or bool as returned. The worker overwrites
+      `storage_device` (device index) with its own.
+
+  Unknown or missing keys and values of the wrong type are rejected.
 - Packed: export one `uint8` buffer once and reuse it for every chunk. Copy
   `t.contiguous().view(-1).view(torch.uint8)` in `names` order and close a chunk
   **before** the next tensor would overflow it (unlike NCCL, which closes after).
@@ -170,5 +180,5 @@ worker to participate.
 ## Examples
 
 - [RLHF with IPC weight syncing (`vllm serve`, HTTP)](../../../examples/rl/rlhf_http_ipc.py) - **Start here.** Server and training model share a single GPU; HTTP control plane, CUDA IPC data plane. Launches and tears down its own server
-- [IPC weight syncing from a trainer that does not import vLLM](../../../examples/rl/rlhf_http_ipc_no_vllm.py) - `torch` + `requests` only, `ipc_handles_pickled` over HTTP; see [Trainer Without vLLM over HTTP](#trainer-without-vllm-over-http)
+- [IPC weight syncing from a trainer that does not import vLLM](../../../examples/rl/rlhf_http_ipc_no_vllm.py) - `torch` + `requests` only, typed JSON `ipc_handles` over HTTP; see [Trainer Without vLLM over HTTP](#trainer-without-vllm-over-http)
 - [RLHF with IPC + FSDP2 and expert parallelism](../../../examples/rl/rlhf_ipc_fsdp_ep.py) - Multi-rank trainer colocated with a `--data-parallel-size 4` server on the same 4 GPUs: every FSDP rank builds an engine and joins the handle all-gather, with packed chunking and sleep/wake around the transfer
