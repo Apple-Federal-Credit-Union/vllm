@@ -183,6 +183,8 @@ The Realtime API provides WebSocket-based streaming audio transcription, allowin
 
 Audio must be sent as base64-encoded PCM16 audio at 16kHz sample rate, mono channel.
 
+Each connection may buffer at most `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` MiB of decoded PCM16 audio that the model has not consumed yet, counting audio appended before `session.update` or `input_audio_buffer.commit`. An append that would exceed this limit is rejected with an `error` event and the WebSocket is closed with code 1009.
+
 ### Protocol Overview
 
 1. Client connects to `ws://host/v1/realtime`

@@ -1006,7 +1006,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Maximum filesize in MB for a single audio file. Enforced on all
     # audio inputs (multimodal chat, speech-to-text uploads, data: URLs,
     # and local file:// paths). Files larger than this will be rejected
-    # before decoding. Default is 25 MB.
+    # before decoding. On /v1/realtime it also caps the decoded PCM16
+    # audio each connection may hold unconsumed. Default is 25 MB.
     "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")
     ),
