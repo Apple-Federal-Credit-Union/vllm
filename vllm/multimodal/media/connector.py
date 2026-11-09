@@ -144,6 +144,45 @@ def _opened_file_path(fd: int) -> Path | None:
     return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
 
 
+def _resolved_path_still_authorized(
+    resolved: Path,
+    allowed: Path,
+    authorized: os.stat_result,
+) -> bool:
+    """Return whether ``resolved`` still names ``authorized`` inside ``allowed``."""
+    try:
+        current = resolved.resolve()
+        current_stat = current.stat()
+    except OSError:
+        return False
+    return allowed in current.parents and os.path.samestat(authorized, current_stat)
+
+
+def _opened_file_is_authorized(
+    opened_path: Path | None,
+    allowed: Path,
+    authorized: os.stat_result,
+    resolved: Path,
+) -> bool:
+    """Return whether an opened fd is still the file authorized under ``allowed``.
+
+    The kernel name of a descriptor (``/proc/self/fd`` or ``F_GETPATH``) is not
+    always a path in this mount namespace. virtiofs and some bind mounts report
+    a host path for the inode opened inside ``allowed``; that alias is not a
+    swapped file. A name that exists here and refers to a different file is.
+    """
+    if opened_path is not None and allowed in opened_path.parents:
+        return True
+    if opened_path is not None:
+        try:
+            if not os.path.samestat(authorized, opened_path.stat()):
+                return False
+        except OSError:
+            # Kernel name is not present in this mount namespace.
+            pass
+    return _resolved_path_still_authorized(resolved, allowed, authorized)
+
+
 def merge_media_io_kwargs(
     defaults: dict[str, dict[str, Any]] | None,
     overrides: dict[str, dict[str, Any]] | None,
@@ -384,11 +423,15 @@ class MediaConnector:
         authorized = resolved.stat()
         with resolved.open("rb") as f:
             opened = os.fstat(f.fileno())
-            opened_path = _opened_file_path(f.fileno()) or resolved
-            if (
-                not os.path.samestat(authorized, opened)
-                or allowed_local_media_path not in opened_path.parents
-            ):
+            opened_is_authorized = os.path.samestat(authorized, opened) and (
+                _opened_file_is_authorized(
+                    _opened_file_path(f.fileno()),
+                    allowed_local_media_path,
+                    authorized,
+                    resolved,
+                )
+            )
+            if not opened_is_authorized:
                 raise ValueError(
                     f"The file path {filepath} changed while it was being opened."
                 )

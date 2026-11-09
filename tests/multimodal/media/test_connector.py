@@ -6,6 +6,7 @@ import os
 import shutil
 import time
 from io import BytesIO
+from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import aiohttp
@@ -20,6 +21,7 @@ from vllm.assets.base import VLLM_S3_BUCKET_URL
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.multimodal.media import MediaConnector
+from vllm.multimodal.media.connector import _opened_file_is_authorized
 
 # Test different image extensions (JPG/PNG) and formats (gray/RGB/RGBA)
 TEST_IMAGE_ASSETS = [
@@ -195,6 +197,98 @@ async def test_fetch_image_local_files_relative_allowed_path(tmp_path, monkeypat
 
     assert image_sync.size == (1, 1)
     assert not ImageChops.difference(image_sync, image_async).getbbox()
+
+
+def test_file_url_accepts_virtiofs_kernel_path(tmp_path, monkeypatch):
+    """Host fd names from virtiofs must not reject an authorized inode.
+
+    Docker Desktop's virtiofs mount reports ``/proc/self/fd/N`` as a host path
+    such as ``/run/host_virtiofs/...``. That path is outside
+    ``--allowed-local-media-path`` even though ``fstat`` still matches the file
+    that passed the directory check.
+    """
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    image_path = media_dir / "image.png"
+    Image.new("RGB", (1, 1), color=(255, 0, 0)).save(image_path)
+    host_path = Path("/run/host_virtiofs/Users/media") / image_path.name
+    assert not host_path.exists()
+
+    monkeypatch.setattr(
+        "vllm.multimodal.media.connector._opened_file_path",
+        lambda _fd: host_path,
+    )
+    connector = MediaConnector(allowed_local_media_path=str(media_dir))
+
+    image = connector.fetch_image(image_path.as_uri())
+
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_file_url_rejects_kernel_path_to_other_file(tmp_path, monkeypatch):
+    """A kernel path that names a different file outside the allowlist is a swap."""
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    image_path = media_dir / "image.png"
+    Image.new("RGB", (1, 1), color=(0, 255, 0)).save(image_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"not-the-opened-image")
+
+    monkeypatch.setattr(
+        "vllm.multimodal.media.connector._opened_file_path",
+        lambda _fd: outside,
+    )
+    connector = MediaConnector(allowed_local_media_path=str(media_dir))
+
+    with pytest.raises(ValueError, match="changed while it was being opened"):
+        connector.fetch_image(image_path.as_uri())
+
+
+def test_file_url_accepts_same_inode_kernel_alias(tmp_path, monkeypatch):
+    """A bind-mount alias of the authorized inode is still that file."""
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    image_path = media_dir / "image.png"
+    Image.new("RGB", (1, 1), color=(0, 0, 255)).save(image_path)
+    alias = tmp_path / "alias.png"
+    os.link(image_path, alias)
+
+    monkeypatch.setattr(
+        "vllm.multimodal.media.connector._opened_file_path",
+        lambda _fd: alias,
+    )
+    connector = MediaConnector(allowed_local_media_path=str(media_dir))
+
+    image = connector.fetch_image(image_path.as_uri())
+
+    assert image.getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_foreign_kernel_path_rejects_retargeted_directory(tmp_path):
+    """A missing host fd name must not hide a directory swapped out of the allowlist."""
+    allowed = (tmp_path / "allowed").resolve()
+    nested = allowed / "nested"
+    nested.mkdir(parents=True)
+    media = nested / "img.bin"
+    media.write_bytes(b"ok")
+    resolved = media.resolve()
+
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    secret = outside / "img.bin"
+    secret.write_bytes(b"secret")
+    media.unlink()
+    nested.rmdir()
+    nested.symlink_to(outside)
+
+    # stat and open both ran after the swap, so the authorized inode is the
+    # file outside the allowlist. The kernel only has a virtiofs name for it.
+    assert not _opened_file_is_authorized(
+        Path("/run/host_virtiofs/Users/me/secret/img.bin"),
+        allowed,
+        secret.stat(),
+        resolved,
+    )
 
 
 @pytest.mark.asyncio
