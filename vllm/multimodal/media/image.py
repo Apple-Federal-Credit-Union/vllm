@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 
 import vllm.envs as envs
+from vllm.connections import read_media_file
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import (
     check_sparse_tensor_invariants_threadsafe,
@@ -110,7 +111,10 @@ class ImageMediaIO(MediaIO[Image.Image]):
         return self.load_bytes(pybase64.b64decode(data, validate=True))
 
     def load_file(self, filepath: Path) -> MediaWithBytes[Image.Image]:
-        return self.load_bytes(filepath.read_bytes())
+        with filepath.open("rb") as f:
+            data = read_media_file(f, self.get_max_bytes())
+
+        return self.load_bytes(data)
 
     def encode_base64(
         self,

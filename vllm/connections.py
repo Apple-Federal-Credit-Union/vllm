@@ -3,11 +3,12 @@
 
 import asyncio
 import functools
+import os
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, BinaryIO, ParamSpec, TypeVar
 
 import aiohttp
 import requests
@@ -46,15 +47,14 @@ class HTTPResponseSizeExceededError(VLLMValidationError):
 
 
 class MediaDownloadSizeExceededError(ValueError):
-    """Raised when a remote media download exceeds the configured byte limit."""
+    """Raised when a media download or local media file exceeds the byte limit."""
 
     def __init__(self, max_bytes: int, received_bytes: int | None = None) -> None:
         self.max_bytes = max_bytes
         self.received_bytes = received_bytes
         max_size_mb = max_bytes / MiB_bytes
         message = (
-            "Remote media download exceeds "
-            f"VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB={max_size_mb:g}"
+            f"Media download exceeds VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB={max_size_mb:g}"
         )
         if received_bytes is not None:
             message += f" (received at least {received_bytes} bytes)"
@@ -170,6 +170,39 @@ def _read_response_bytes(
             max_bytes,
             media_download_limit,
             request_budget,
+        )
+    return b"".join(chunks)
+
+
+def read_media_file(file: BinaryIO, max_bytes: int | None = None) -> bytes:
+    """Read a local media file under the same ceiling as a media download.
+
+    The reported size is checked before the body is read, and the read stops
+    once it passes the ceiling, so files whose reported size is wrong (FIFOs,
+    device nodes) are bounded as well.
+    """
+    max_bytes, media_download_limit = _get_response_size_limit(max_bytes)
+    if max_bytes is None:
+        return file.read()
+
+    chunks: list[bytes] = []
+    received_bytes = os.fstat(file.fileno()).st_size
+    if received_bytes <= max_bytes:
+        received_bytes = 0
+        while received_bytes <= max_bytes and (
+            chunk := file.read(_RESPONSE_READ_CHUNK_SIZE)
+        ):
+            received_bytes += len(chunk)
+            chunks.append(chunk)
+
+    if received_bytes > max_bytes:
+        if media_download_limit:
+            raise MediaDownloadSizeExceededError(max_bytes, received_bytes)
+        raise VLLMValidationError(
+            "Maximum file size exceeded: local media file exceeded maximum size "
+            f"of {max_bytes} bytes (read at least {received_bytes} bytes)",
+            parameter="audio_filesize_mb",
+            value=received_bytes / MiB_bytes,
         )
     return b"".join(chunks)
 
