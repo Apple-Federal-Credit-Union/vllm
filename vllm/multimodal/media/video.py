@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 
 from vllm import envs
+from vllm.connections import read_media_file_bytes
 from vllm.logger import init_logger
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import (
@@ -208,7 +209,7 @@ class VideoMediaIO(MediaIO[MediaWithBytes[tuple[DecodedFrames, dict[str, Any]]]]
         self, filepath: Path
     ) -> MediaWithBytes[tuple[DecodedFrames, dict[str, Any]]]:
         with filepath.open("rb") as f:
-            data = f.read()
+            data = read_media_file_bytes(f, self.get_max_bytes())
 
         return self.load_bytes(data)
 

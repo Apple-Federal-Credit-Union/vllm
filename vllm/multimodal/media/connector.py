@@ -6,6 +6,7 @@ import atexit
 import contextlib
 import hashlib
 import os
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,7 @@ from vllm.connections import (
     MediaRequestDownloadBudget,
     MediaRequestDownloadSizeExceededError,
     global_http_connection,
+    read_media_file_bytes,
 )
 from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
 from vllm.logger import init_logger
@@ -39,9 +41,24 @@ from .base import MediaDecodedBudget, MediaIO, MediaWithBytes
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoEmbeddingMediaIO, VideoMediaIO
 
+if sys.platform == "darwin":
+    import fcntl
+
 logger = init_logger(__name__)
 
 _M = TypeVar("_M")
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DARWIN_MAXPATHLEN = 1024
+
+
+def _opened_path(fd: int) -> Path:
+    """Return the path the kernel opened ``fd`` at, with symlinks resolved."""
+    if sys.platform == "darwin":
+        buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(_DARWIN_MAXPATHLEN))
+        return Path(os.fsdecode(buf.split(b"\0", 1)[0]))
+    return Path(os.readlink(f"/proc/self/fd/{fd}"))
+
 
 global_thread_pool = ThreadPoolExecutor(
     max_workers=envs.VLLM_MEDIA_LOADING_THREAD_COUNT
@@ -359,13 +376,28 @@ class MediaConnector:
         url_spec_path = url_spec.path or ""
         url_spec_netloc = url_spec.netloc or ""
         filepath = Path(url2pathname(url_spec_netloc + url_spec_path))
-        if allowed_local_media_path not in filepath.resolve().parents:
+        self._assert_in_allowed_local_media_path(filepath, filepath.resolve())
+
+        # The name can be retargeted after the check above, so authorize the
+        # object that was actually opened and read only from it.
+        fd = os.open(filepath, os.O_RDONLY | _O_CLOEXEC)
+        with open(fd, "rb", buffering=0) as file:
+            self._assert_in_allowed_local_media_path(filepath, _opened_path(fd))
+            data = read_media_file_bytes(
+                file, media_io.get_max_bytes(), self.download_budget
+            )
+
+        return media_io.load_bytes(data)
+
+    def _assert_in_allowed_local_media_path(
+        self, filepath: Path, resolved: Path
+    ) -> None:
+        allowed_local_media_path = self.allowed_local_media_path
+        if allowed_local_media_path not in resolved.parents:
             raise ValueError(
                 f"The file path {filepath} must be a subpath "
                 f"of `--allowed-local-media-path {allowed_local_media_path}`."
             )
-
-        return media_io.load_file(filepath)
 
     def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
         if (
