@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copyreg
 import functools
+import hmac
 import io
 import os
 import pickle
@@ -30,6 +31,7 @@ from zmq import (  # type: ignore
     XPUB_VERBOSE,
     Context,
 )
+from zmq.auth.thread import ThreadAuthenticator
 
 import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup, sched_yield
@@ -484,11 +486,32 @@ class Handle:
     remote_subscribe_addr: str | None = None
     remote_addr_ipv6: bool = False
     tensor_arena_handle: tuple[int, int, int, str] | None = None
+    # CURVE keys (z85) for the remote socket. The handle only travels over the
+    # process group or to child processes, so holding it authorizes a reader.
+    remote_curve_server_key: bytes | None = field(default=None, repr=False)
+    remote_curve_client_public_key: bytes | None = field(default=None, repr=False)
+    remote_curve_client_secret_key: bytes | None = field(default=None, repr=False)
 
 
-def _close_zmq(context: zmq.Context, sockets: list[zmq.Socket]) -> None:
+class _CurveClientKeyAllowlist:
+    """ZAP credentials provider that admits only the handle's client key."""
+
+    def __init__(self, client_public_key: bytes):
+        self.client_public_key = client_public_key
+
+    def callback(self, domain: str, key: bytes) -> bool:
+        return hmac.compare_digest(key, self.client_public_key)
+
+
+def _close_zmq(
+    context: zmq.Context,
+    sockets: list[zmq.Socket],
+    authenticator: ThreadAuthenticator | None = None,
+) -> None:
     for socket in sockets:
         socket.close(linger=0)
+    if authenticator is not None:
+        authenticator.stop()
     context.term()
 
 
@@ -559,12 +582,27 @@ class MessageQueue:
             self._spin_condition = None  # type: ignore
 
         remote_addr_ipv6 = False
+        self._authenticator: ThreadAuthenticator | None = None
+        server_public_key = client_public_key = client_secret_key = None
         if n_remote_reader > 0:
             # for remote readers, we will:
-            # create a publish-subscribe socket to communicate large data
+            # create a publish-subscribe socket to communicate large data.
+            # The socket is a CURVE server that only accepts the client key
+            # carried in the handle, so peers without the handle can neither
+            # subscribe nor read the (encrypted) traffic.
             if not connect_ip:
                 connect_ip = get_ip()
+            server_public_key, server_secret_key = zmq.curve_keypair()
+            client_public_key, client_secret_key = zmq.curve_keypair()
+            self._authenticator = ThreadAuthenticator(context)
+            self._authenticator.start()
+            self._authenticator.configure_curve_callback(
+                credentials_provider=_CurveClientKeyAllowlist(client_public_key)
+            )
             self.remote_socket = context.socket(XPUB)
+            self.remote_socket.curve_secretkey = server_secret_key
+            self.remote_socket.curve_publickey = server_public_key
+            self.remote_socket.curve_server = True
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
             if is_valid_ipv6_address(connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
@@ -594,6 +632,9 @@ class MessageQueue:
             tensor_arena_handle=(
                 self.tensor_arena.handle() if self.tensor_arena is not None else None
             ),
+            remote_curve_server_key=server_public_key,
+            remote_curve_client_public_key=client_public_key,
+            remote_curve_client_secret_key=client_secret_key,
         )
         self._close_zmq_on_collect(context)
 
@@ -611,7 +652,11 @@ class MessageQueue:
                 self._spin_condition.write_cancel_socket,
             ]
         finalizer = weakref.finalize(
-            self, _close_zmq, context, [s for s in sockets if s is not None]
+            self,
+            _close_zmq,
+            context,
+            [s for s in sockets if s is not None],
+            self._authenticator,
         )
         finalizer.atexit = False  # type: ignore[misc]
 
@@ -623,6 +668,7 @@ class MessageQueue:
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
+        self._authenticator = None
 
         context = Context()
 
@@ -672,7 +718,15 @@ class MessageQueue:
 
             self.local_socket = None
 
+            assert (
+                handle.remote_curve_server_key is not None
+                and handle.remote_curve_client_public_key is not None
+                and handle.remote_curve_client_secret_key is not None
+            ), "Remote reader handle is missing its CURVE keys"
             self.remote_socket = context.socket(SUB)
+            self.remote_socket.curve_serverkey = handle.remote_curve_server_key
+            self.remote_socket.curve_publickey = handle.remote_curve_client_public_key
+            self.remote_socket.curve_secretkey = handle.remote_curve_client_secret_key
             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
             if handle.remote_addr_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
