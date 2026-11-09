@@ -126,7 +126,6 @@ class ExternalElasticEPScaleUpHandshakeServer:
                     zmq.ROUTER,
                     bind=True,
                     linger=0,
-                    router_handover=True,
                 ) as handshake_socket,
             ):
                 self.started_event.set()
