@@ -4,13 +4,16 @@
 import asyncio
 import atexit
 import contextlib
+import errno
 import hashlib
 import os
+import stat
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, BinaryIO, TypeVar
 from urllib.request import url2pathname
 
 import aiohttp
@@ -38,6 +41,11 @@ from .audio import AudioEmbeddingMediaIO, AudioMediaIO
 from .base import MediaDecodedBudget, MediaIO, MediaWithBytes
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoEmbeddingMediaIO, VideoMediaIO
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 logger = init_logger(__name__)
 
@@ -150,6 +158,54 @@ def merge_media_io_kwargs(
             (overrides or {}).get(key),
         )
     return merged or None
+
+
+def _opened_file_path(fd: int) -> Path:
+    if sys.platform.startswith("linux"):
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    if sys.platform == "darwin" and fcntl is not None:
+        buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+        return Path(os.fsdecode(buf.split(b"\0", 1)[0]))
+    raise RuntimeError(f"Loading local media files is not supported on {sys.platform}.")
+
+
+def open_local_media_file(
+    filepath: Path,
+    allowed_local_media_path: Path,
+) -> BinaryIO:
+    """Open a regular file located under `allowed_local_media_path`.
+
+    Confinement is verified on the opened file descriptor, so retargeting a
+    symlink anywhere along `filepath` after it is resolved cannot redirect
+    the read outside the allowed directory.
+    """
+    outside_error = ValueError(
+        f"The file path {filepath} must be a subpath "
+        f"of `--allowed-local-media-path {allowed_local_media_path}`."
+    )
+
+    resolved = filepath.resolve()
+    if allowed_local_media_path not in resolved.parents:
+        raise outside_error
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise outside_error from e
+        raise
+
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"The file path {filepath} is not a regular file.")
+        if allowed_local_media_path not in _opened_file_path(fd).parents:
+            raise outside_error
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @MEDIA_CONNECTOR_REGISTRY.register("http")
@@ -359,13 +415,11 @@ class MediaConnector:
         url_spec_path = url_spec.path or ""
         url_spec_netloc = url_spec.netloc or ""
         filepath = Path(url2pathname(url_spec_netloc + url_spec_path))
-        if allowed_local_media_path not in filepath.resolve().parents:
-            raise ValueError(
-                f"The file path {filepath} must be a subpath "
-                f"of `--allowed-local-media-path {allowed_local_media_path}`."
-            )
+        max_bytes = media_io.get_max_bytes()
+        with open_local_media_file(filepath, allowed_local_media_path) as f:
+            data = f.read() if max_bytes is None else f.read(max_bytes + 1)
 
-        return media_io.load_file(filepath)
+        return media_io.load_bytes(data)
 
     def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
         if (

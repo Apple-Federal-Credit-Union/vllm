@@ -21,10 +21,18 @@ Architecture notes:
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import hashlib
 import importlib
-from collections.abc import Callable, Iterable, Mapping, Sequence, Sized
+import os
+import shutil
+import tempfile
+import threading
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from functools import lru_cache
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -88,6 +96,7 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
+from vllm.multimodal.media.connector import open_local_media_file
 from vllm.multimodal.parse import (
     DictEmbeddingItems,
     ImageSize,
@@ -219,11 +228,9 @@ def _validate_video_source(path: str, model_config) -> str:
     ``VIDEO_LOADER_REGISTRY`` loader), which rides vLLM's connector and its
     domain/redirect gates.
 
-    Returns the *resolved* absolute path so the codec module opens exactly the
-    file that was validated, closing the validate-vs-open (symlink-retarget)
-    window. Mirrors the confinement in ``MediaConnector._load_file_url``.
+    Returns the *resolved* absolute path. The codec module must not be given
+    this path directly; see ``_staged_codec_videos``.
     """
-    from pathlib import Path
     from urllib.request import url2pathname
 
     from urllib3.util import parse_url
@@ -276,10 +283,74 @@ def _validate_video_source(path: str, model_config) -> str:
     return str(resolved)
 
 
-def _validate_video_sources(paths, model_config) -> list[str]:
-    # Return the resolved paths so the codec module opens exactly what was
-    # validated (no validate-vs-open / symlink-retarget differential).
-    return [_validate_video_source(path, model_config) for path in paths]
+_CODEC_STAGING_LOCK = threading.Lock()
+_CODEC_STAGING_REFS: Counter[str] = Counter()
+_codec_staging_dir: tuple[int, str] | None = None
+
+
+def _get_codec_staging_dir() -> str:
+    global _codec_staging_dir
+    with _CODEC_STAGING_LOCK:
+        if _codec_staging_dir is None or _codec_staging_dir[0] != os.getpid():
+            staging_dir = tempfile.mkdtemp(prefix="vllm-ov2-codec-")
+            atexit.register(shutil.rmtree, staging_dir, ignore_errors=True)
+            _codec_staging_dir = (os.getpid(), staging_dir)
+        return _codec_staging_dir[1]
+
+
+def _stage_codec_video(path: str, model_config) -> str:
+    resolved = Path(_validate_video_source(path, model_config))
+    allowed_root = Path(model_config.allowed_local_media_path).resolve()
+    staging_dir = _get_codec_staging_dir()
+
+    digest = hashlib.sha256()
+    fd, tmp_path = tempfile.mkstemp(dir=staging_dir, suffix=".partial")
+    try:
+        with (
+            os.fdopen(fd, "wb") as dst,
+            open_local_media_file(resolved, allowed_root) as src,
+        ):
+            while chunk := src.read(1 << 20):
+                digest.update(chunk)
+                dst.write(chunk)
+        # Content-addressed so the codec module's path-keyed caches stay
+        # correct across requests.
+        staged = os.path.join(staging_dir, digest.hexdigest() + resolved.suffix)
+        with _CODEC_STAGING_LOCK:
+            os.replace(tmp_path, staged)
+            _CODEC_STAGING_REFS[staged] += 1
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)
+        raise
+    return staged
+
+
+def _release_codec_video(staged: str) -> None:
+    with _CODEC_STAGING_LOCK:
+        _CODEC_STAGING_REFS[staged] -= 1
+        if _CODEC_STAGING_REFS[staged] <= 0:
+            del _CODEC_STAGING_REFS[staged]
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(staged)
+
+
+@contextlib.contextmanager
+def _staged_codec_videos(paths, model_config) -> Iterator[list[str]]:
+    """Yield private copies of the confined codec videos.
+
+    The codec module reopens its input by path (in-process and from a
+    subprocess), so it is handed a copy read through a descriptor that was
+    verified to lie under ``--allowed-local-media-path``.
+    """
+    staged: list[str] = []
+    try:
+        for path in paths:
+            staged.append(_stage_codec_video(path, model_config))
+        yield staged
+    finally:
+        for staged_path in staged:
+            _release_codec_video(staged_path)
 
 
 # Design note: the two video backends take deliberately different paths.
@@ -1631,38 +1702,40 @@ class LlavaOnevision2MultiModalProcessor(
 
         if is_codec:
             # Confine codec paths to --allowed-local-media-path (local-only;
-            # SSRF / local-file-read protection) and use the *resolved* paths
-            # downstream so the codec module opens exactly the file that was
-            # validated (no symlink-retarget / validate-vs-open gap).
-            codec_video_paths = _validate_video_sources(
+            # SSRF / local-file-read protection) and hand the codec module
+            # private copies of the confined files.
+            with _staged_codec_videos(
                 codec_video_paths, self.info.ctx.model_config
-            )
-            # Codec backend: HF processor consumes the path string directly and
-            # performs decode + canvas-packing internally. The dummy ndarray
-            # we attached during prepare_codec_video_input is discarded here.
-            hf_data["videos"] = (
-                codec_video_paths
-                if len(codec_video_paths) > 1
-                else codec_video_paths[0]
-            )
-            # Route through ``ctx.call_hf_processor`` so float-tensor
-            # dtype postprocessing is applied automatically; inject
-            # ``video_backend="codec"`` via mm_kwargs so the wrapped processor
-            # dispatches to its codec branch.
-            output = self.info.ctx.call_hf_processor(
-                self.info.get_hf_processor(**{**hf_kwargs, "video_backend": "codec"}),
-                dict(text=prompt_text, **hf_data),
-                {**hf_kwargs, "video_backend": "codec"},
-            )
-            data = dict(output)
-            processed_data = BatchFeature(
-                self._rename_codec_outputs_to_video(
-                    data, codec_video_paths, hf_processor
+            ) as codec_video_paths:
+                # Codec backend: HF processor consumes the path string directly
+                # and performs decode + canvas-packing internally. The dummy
+                # ndarray we attached during prepare_codec_video_input is
+                # discarded here.
+                hf_data["videos"] = (
+                    codec_video_paths
+                    if len(codec_video_paths) > 1
+                    else codec_video_paths[0]
                 )
-            )
-            return self._finalize_hf_mm_data(
-                hf_data, hf_kwargs, passthrough_data, processed_data
-            )
+                # Route through ``ctx.call_hf_processor`` so float-tensor
+                # dtype postprocessing is applied automatically; inject
+                # ``video_backend="codec"`` via mm_kwargs so the wrapped
+                # processor dispatches to its codec branch.
+                output = self.info.ctx.call_hf_processor(
+                    self.info.get_hf_processor(
+                        **{**hf_kwargs, "video_backend": "codec"}
+                    ),
+                    dict(text=prompt_text, **hf_data),
+                    {**hf_kwargs, "video_backend": "codec"},
+                )
+                data = dict(output)
+                processed_data = BatchFeature(
+                    self._rename_codec_outputs_to_video(
+                        data, codec_video_paths, hf_processor
+                    )
+                )
+                return self._finalize_hf_mm_data(
+                    hf_data, hf_kwargs, passthrough_data, processed_data
+                )
 
         # ---- Frame backend (registered LlavaOnevision2VideoBackend) ------
         # Every non-codec video reaches here as a ``(frames_ndarray, metadata)``
