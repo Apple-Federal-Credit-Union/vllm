@@ -635,10 +635,6 @@ class MPClient(EngineCoreClient):
             # State used for data parallel.
             self.engines_running = False
             parallel_config = vllm_config.parallel_config
-            # Elastic EP can remove a rank and later add it back with the same
-            # identity. The client input ROUTER needs handover to allow the new
-            # engine to replace the dead connection.
-            enable_input_socket_handover = parallel_config.enable_elastic_ep
 
             self.stats_update_address: str | None = None
             self.coordinator_input_address: str | None = None
@@ -658,7 +654,6 @@ class MPClient(EngineCoreClient):
                     input_address,
                     zmq.ROUTER,
                     bind=True,
-                    router_handover=enable_input_socket_handover,
                     listener=input_listener,
                 )
                 self.resources.output_socket = make_zmq_socket(
@@ -679,7 +674,6 @@ class MPClient(EngineCoreClient):
                     bind_addresses.inputs[0],
                     zmq.ROUTER,
                     bind=True,
-                    router_handover=enable_input_socket_handover,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, bind_addresses.outputs[0], zmq.PULL
