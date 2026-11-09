@@ -4,6 +4,7 @@
 import asyncio
 import atexit
 import contextlib
+import fcntl
 import hashlib
 import os
 import tempfile
@@ -28,6 +29,7 @@ from vllm.connections import (
     MediaRequestDownloadBudget,
     MediaRequestDownloadSizeExceededError,
     global_http_connection,
+    read_media_file,
 )
 from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
 from vllm.logger import init_logger
@@ -127,6 +129,19 @@ def _wrap_media_fetch_error(
             value=url,
         )
     return exc
+
+
+def _opened_file_path(fd: int) -> Path | None:
+    """Return the path the kernel reports for an open file, if available."""
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        pass
+    f_getpath = getattr(fcntl, "F_GETPATH", None)
+    if f_getpath is None:
+        return None
+    raw = fcntl.fcntl(fd, f_getpath, bytes(1024))
+    return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
 
 
 def merge_media_io_kwargs(
@@ -359,13 +374,27 @@ class MediaConnector:
         url_spec_path = url_spec.path or ""
         url_spec_netloc = url_spec.netloc or ""
         filepath = Path(url2pathname(url_spec_netloc + url_spec_path))
-        if allowed_local_media_path not in filepath.resolve().parents:
+        resolved = filepath.resolve()
+        if allowed_local_media_path not in resolved.parents:
             raise ValueError(
                 f"The file path {filepath} must be a subpath "
                 f"of `--allowed-local-media-path {allowed_local_media_path}`."
             )
 
-        return media_io.load_file(filepath)
+        authorized = resolved.stat()
+        with resolved.open("rb") as f:
+            opened = os.fstat(f.fileno())
+            opened_path = _opened_file_path(f.fileno()) or resolved
+            if (
+                not os.path.samestat(authorized, opened)
+                or allowed_local_media_path not in opened_path.parents
+            ):
+                raise ValueError(
+                    f"The file path {filepath} changed while it was being opened."
+                )
+            data = read_media_file(f, media_io.get_max_bytes())
+
+        return media_io.load_bytes(data)
 
     def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
         if (

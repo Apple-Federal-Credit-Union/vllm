@@ -986,9 +986,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEDIA_FETCH_MAX_RETRIES": lambda: int(
         os.getenv("VLLM_MEDIA_FETCH_MAX_RETRIES", "3")
     ),
-    # Maximum size in MB for a single remote media download. The limit is
-    # enforced while streaming the response body so oversized or infinite
-    # responses cannot grow the API server heap without bound. Default is 256.
+    # Maximum size in MB for a single remote media download or local media
+    # file. The limit is enforced while streaming the body so oversized or
+    # infinite inputs cannot grow the API server heap without bound.
+    # Default is 256.
     "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", "256")
     ),
