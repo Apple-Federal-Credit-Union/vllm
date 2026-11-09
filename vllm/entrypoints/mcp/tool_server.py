@@ -90,7 +90,7 @@ class ToolServer(ABC):
 
     @abstractmethod
     def new_session(
-        self, tool_name: str, session_id: str, headers: dict[str, str] | None = None
+        self, tool_name: str, session_id: str
     ) -> AbstractAsyncContextManager[Any]:
         """Create a session for the tool."""
         ...
@@ -171,20 +171,15 @@ class MCPToolServer(ToolServer):
         )
 
     @asynccontextmanager
-    async def new_session(
-        self, tool_name: str, session_id: str, headers: dict[str, str] | None = None
-    ):
+    async def new_session(self, tool_name: str, session_id: str):
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 
         url = self.urls.get(tool_name)
-        request_headers = {"x-session-id": session_id}
-        if headers is not None:
-            request_headers.update(headers)
         if not url:
             raise KeyError(f"Tool '{tool_name}' is not supported")
         async with (
-            sse_client(url=url, headers=request_headers) as streams,
+            sse_client(url=url, headers={"x-session-id": session_id}) as streams,
             ClientSession(*streams) as session,
         ):
             await session.initialize()
@@ -223,9 +218,7 @@ class DemoToolServer(ToolServer):
             raise ValueError(f"Unknown tool {tool_name}")
 
     @asynccontextmanager
-    async def new_session(
-        self, tool_name: str, session_id: str, headers: dict[str, str] | None = None
-    ):
+    async def new_session(self, tool_name: str, session_id: str):
         if tool_name not in self.tools:
             raise KeyError(f"Tool '{tool_name}' is not supported")
         yield self.tools[tool_name]

@@ -17,7 +17,6 @@ from openai.types.responses.response_function_tool_call_output_item import (
 from openai.types.responses.response_output_item import McpCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
-from openai.types.responses.tool import Mcp
 from openai_harmony import Author, Message, Role, TextContent
 
 from vllm import envs
@@ -52,25 +51,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# This is currently needed as the tool type doesn't 1:1 match the
-# tool namespace, which is what is used to look up the
-# connection to the tool server
-_TOOL_NAME_TO_TYPE_MAP = {
-    "browser": "web_search_preview",
-    "python": "code_interpreter",
-    "container": "container",
-}
 MCP_PREFIX = "mcp_"
-
-
-def _map_tool_name_to_tool_type(tool_name: str) -> str:
-    if tool_name not in _TOOL_NAME_TO_TYPE_MAP:
-        available_tools = ", ".join(_TOOL_NAME_TO_TYPE_MAP.keys())
-        raise ValueError(
-            f"Built-in tool name '{tool_name}' not defined in mapping. "
-            f"Available tools: {available_tools}"
-        )
-    return _TOOL_NAME_TO_TYPE_MAP[tool_name]
 
 
 class TurnMetrics:
@@ -139,7 +120,6 @@ class ConversationContext(ABC):
         tool_server: ToolServer | None,
         exit_stack: AsyncExitStack,
         request_id: str,
-        mcp_tools: dict[str, Mcp],
     ) -> None:
         pass
 
@@ -291,7 +271,6 @@ class SimpleContext(ConversationContext):
         tool_server: ToolServer | None,
         exit_stack: AsyncExitStack,
         request_id: str,
-        mcp_tools: dict[str, Mcp],
     ) -> None:
         pass
 
@@ -590,7 +569,6 @@ class ParsableContext(ConversationContext):
         tool_server: ToolServer | None,
         exit_stack: AsyncExitStack,
         request_id: str,
-        mcp_tools: dict[str, Mcp],
     ):
         if tool_server:
             initialized_session = False
@@ -598,12 +576,8 @@ class ParsableContext(ConversationContext):
                 if tool_name in self._tool_sessions:
                     continue
 
-                tool_type = _map_tool_name_to_tool_type(tool_name)
-                headers = (
-                    mcp_tools[tool_type].headers if tool_type in mcp_tools else None
-                )
                 tool_session = await exit_stack.enter_async_context(
-                    tool_server.new_session(tool_name, request_id, headers)
+                    tool_server.new_session(tool_name, request_id)
                 )
                 self._tool_sessions[tool_name] = tool_session
                 initialized_session = True
@@ -903,18 +877,13 @@ class HarmonyContext(ConversationContext):
         tool_server: ToolServer | None,
         exit_stack: AsyncExitStack,
         request_id: str,
-        mcp_tools: dict[str, Mcp],
     ):
         if tool_server:
             initialized_session = False
             for tool_name in self.available_tools:
                 if tool_name not in self._tool_sessions:
-                    tool_type = _map_tool_name_to_tool_type(tool_name)
-                    headers = (
-                        mcp_tools[tool_type].headers if tool_type in mcp_tools else None
-                    )
                     tool_session = await exit_stack.enter_async_context(
-                        tool_server.new_session(tool_name, request_id, headers)
+                        tool_server.new_session(tool_name, request_id)
                     )
                     self._tool_sessions[tool_name] = tool_session
                     initialized_session = True

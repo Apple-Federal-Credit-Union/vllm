@@ -116,9 +116,9 @@ class MockConversationContext(ConversationContext):
     def render_for_completion(self):
         return []
 
-    async def init_tool_sessions(self, tool_server, exit_stack, request_id, mcp_tools):
+    async def init_tool_sessions(self, tool_server, exit_stack, request_id):
         self.init_tool_sessions_called = True
-        self.init_tool_sessions_args = (tool_server, exit_stack, request_id, mcp_tools)
+        self.init_tool_sessions_args = (tool_server, exit_stack, request_id)
 
     async def cleanup_session(self) -> None:
         pass
@@ -830,9 +830,9 @@ class TestInitializeToolSessions:
         tool_server.new_session.side_effect = new_session
         tool_context.available_tools = available_tools
         async with AsyncExitStack() as stack:
-            await tool_context.init_tool_sessions(tool_server, stack, "req", {})
+            await tool_context.init_tool_sessions(tool_server, stack, "req")
             # Reinitializing existing sessions must not duplicate cleanup either.
-            await tool_context.init_tool_sessions(tool_server, stack, "req", {})
+            await tool_context.init_tool_sessions(tool_server, stack, "req")
             tool_context.called_tools.update(called_tools)
 
         for name, session in sessions.items():
@@ -863,7 +863,7 @@ class TestInitializeToolSessions:
         tool_server.new_session.side_effect = new_session
         with pytest.raises(RuntimeError, match="session initialization failed"):
             async with AsyncExitStack() as stack:
-                await tool_context.init_tool_sessions(tool_server, stack, "req", {})
+                await tool_context.init_tool_sessions(tool_server, stack, "req")
 
         assert closed == ["browser"]
         session.call_tool.assert_not_awaited()

@@ -366,6 +366,8 @@ Built-in demo tools are controlled by two settings:
 
    If this variable is not set or is empty, no built-in tools requested via MCP tool type will be enabled.
 
+   An `mcp` tool in the request only selects which built-in tools to enable. Its `server_url`, `headers`, and `authorization` fields are not used: vLLM opens each session to the tool server configured with `--tool-server` and sends only an `x-session-id` header set to the request's `request_id`. Callers can set `request_id`, so a tool server should not treat `x-session-id` as a tenant boundary; see [Multi-Tenant Deployments](#multi-tenant-deployments).
+
 To disable the Python code interpreter specifically, omit `code_interpreter` from `VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS`.
 
 **Consider a custom implementation**: The GPT-OSS Python tool is a reference implementation. For production deployments, consider implementing a custom code execution sandbox with stricter isolation guarantees. See the [GPT-OSS documentation](https://github.com/openai/gpt-oss?tab=readme-ov-file#python) for guidance.

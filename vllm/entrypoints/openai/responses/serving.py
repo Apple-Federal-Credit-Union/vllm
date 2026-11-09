@@ -760,11 +760,8 @@ class OpenAIServingResponses(GenerateBaseServing):
         # we should only initialize the tool session if the request needs tools
         if len(request.tools) == 0:
             return
-        mcp_tools = {
-            tool.server_label: tool for tool in request.tools if tool.type == "mcp"
-        }
         await context.init_tool_sessions(
-            self.tool_server, exit_stack, request.request_id, mcp_tools
+            self.tool_server, exit_stack, request.request_id
         )
 
     async def responses_full_generator(
