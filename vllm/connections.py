@@ -3,11 +3,12 @@
 
 import asyncio
 import functools
+import os
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, BinaryIO, ParamSpec, TypeVar
 
 import aiohttp
 import requests
@@ -187,6 +188,38 @@ async def _async_read_response_bytes(
     chunks: list[bytes] = []
     received_bytes = 0
     async for chunk in response.content.iter_chunked(_RESPONSE_READ_CHUNK_SIZE):
+        received_bytes = _append_chunk(
+            chunks,
+            chunk,
+            received_bytes,
+            max_bytes,
+            media_download_limit,
+            request_budget,
+        )
+    return b"".join(chunks)
+
+
+def read_media_file_bytes(
+    file: BinaryIO,
+    max_bytes: int | None = None,
+    request_budget: MediaRequestDownloadBudget | None = None,
+) -> bytes:
+    """Read an open local media file under the HTTP media download limits.
+
+    The stat size is checked first, then the read stops once the bytes
+    actually read exceed the limit, since FIFOs and files that grow during the
+    read report a smaller size.
+    """
+    max_bytes, media_download_limit = _get_response_size_limit(max_bytes)
+    if max_bytes is None and request_budget is None:
+        return file.read()
+
+    _check_content_length(
+        os.fstat(file.fileno()).st_size, max_bytes, media_download_limit
+    )
+    chunks: list[bytes] = []
+    received_bytes = 0
+    while chunk := file.read(_RESPONSE_READ_CHUNK_SIZE):
         received_bytes = _append_chunk(
             chunks,
             chunk,
