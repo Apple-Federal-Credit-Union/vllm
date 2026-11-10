@@ -9398,3 +9398,6 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
 
     engine_task.abort_and_join().await;
 }
+
+#[path = "auth_bypass_tests.rs"]
+mod auth_bypass_tests;
