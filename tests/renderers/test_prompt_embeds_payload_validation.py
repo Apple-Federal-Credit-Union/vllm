@@ -151,7 +151,7 @@ def test_a_long_reason_is_truncated_and_says_how_much_was_left_out(model_config)
         ),
         pytest.raises(VLLMValidationError) as excinfo,
     ):
-        safe_load_prompt_embeds(model_config, _encode(b"ignored"))
+        safe_load_prompt_embeds(model_config, _encode(_saved_tensor(torch.zeros(1))))
 
     message = str(excinfo.value)
     assert "E" * _MAX_EMBED_ERROR_REASON_CHARS in message
@@ -171,7 +171,7 @@ def test_a_short_reason_is_passed_through_whole(model_config):
         ),
         pytest.raises(VLLMValidationError) as excinfo,
     ):
-        safe_load_prompt_embeds(model_config, _encode(b"ignored"))
+        safe_load_prompt_embeds(model_config, _encode(_saved_tensor(torch.zeros(1))))
 
     message = str(excinfo.value)
     assert reason in message

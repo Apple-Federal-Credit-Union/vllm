@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from io import BytesIO
 from typing import TYPE_CHECKING, Final
 
 import pybase64
@@ -9,6 +8,7 @@ import torch
 from vllm.exceptions import VLLMValidationError
 from vllm.utils.async_utils import make_async
 from vllm.utils.sparse_utils import (
+    bounded_torch_checkpoint,
     check_sparse_tensor_invariants_threadsafe,
     safe_to_dense,
 )
@@ -51,11 +51,12 @@ def safe_load_prompt_embeds(
     # Decoded outside the try below so that a body which is not base64 keeps
     # raising binascii.Error, which is a ValueError and already answered 400.
     payload: Final = pybase64.b64decode(embed, validate=True)
+    checkpoint: Final = bounded_torch_checkpoint(payload, parameter="prompt_embeds")
 
     with check_sparse_tensor_invariants_threadsafe():
         try:
             tensor = torch.load(
-                BytesIO(payload),
+                checkpoint,
                 weights_only=True,
                 map_location=torch.device("cpu"),
             )
