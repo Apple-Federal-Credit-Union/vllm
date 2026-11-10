@@ -32,6 +32,7 @@ from vllm.connections import (
 from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
 from vllm.logger import init_logger
 from vllm.multimodal.video import get_video_loader_backend_for_processor
+from vllm.utils.mem_constants import MiB_bytes
 from vllm.utils.registry import ExtensionManager
 
 from .audio import AudioEmbeddingMediaIO, AudioMediaIO
@@ -343,7 +344,40 @@ class MediaConnector:
             raise NotImplementedError(msg)
 
         media_type = media_type.partition(";")[0]
+        self._validate_data_url_size(data, media_io)
         return media_io.load_base64(media_type, data)
+
+    @staticmethod
+    def _validate_data_url_size(data: str, media_io: MediaIO) -> None:
+        download_limit_mb = envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB
+        download_limit = (
+            download_limit_mb * MiB_bytes if download_limit_mb > 0 else None
+        )
+        limits = [
+            limit
+            for limit in (download_limit, media_io.get_max_bytes())
+            if limit is not None
+        ]
+        if not limits:
+            return
+        max_bytes = min(limits)
+
+        # Each base64 alphabet character carries 6 bits, so this bounds the
+        # decoded size of the whole payload, including every frame of a
+        # comma-separated video/jpeg data URL.
+        decoded_bytes = (len(data) - data.count(",") - data.count("=")) * 3 // 4
+        if decoded_bytes > max_bytes:
+            msg = (
+                "Maximum file size exceeded: data URL payload decodes to "
+                f"{decoded_bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            )
+            if max_bytes == download_limit:
+                msg += f" (VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB={download_limit_mb})"
+            raise VLLMValidationError(
+                msg,
+                parameter="media_filesize_mb",
+                value=decoded_bytes / MiB_bytes,
+            )
 
     def _load_file_url(
         self,
