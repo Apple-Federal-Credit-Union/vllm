@@ -1,17 +1,100 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 if TYPE_CHECKING:
     import torch
 
     from .inc import INCConfig
+
+logger = init_logger(__name__)
+
+_REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
+_MAX_PATTERN_LENGTH = 1024
+# The regex module unrolls counted repeats when compiling, so their bounds
+# multiply into compile time and memory.
+_COUNTED_REPEAT = re.compile(r"\{\s*(\d*)\s*(?:,\s*(\d*)\s*)?\}")
+_MAX_COUNTED_REPEAT_PRODUCT = 1000
+_PATTERN_SEARCH_TIMEOUT_S = 0.1
+_PATTERN_BUDGET_S = 5.0
+
+
+def _exceeds_counted_repeat_limit(pattern: str) -> bool:
+    product = 1
+    for low, high in _COUNTED_REPEAT.findall(pattern):
+        product *= max(int(low or 0), int(high or 0), 1)
+        if product > _MAX_COUNTED_REPEAT_PRODUCT:
+            return True
+    return False
+
+
+class _ExtraConfigPatterns:
+    """Regex keys of one extra_config, compiled once.
+
+    Keys come from the checkpoint, so their size is capped, every search has a
+    timeout, and compiling and searching share one time budget. A key that
+    times out is dropped; exhausting the budget aborts loading.
+    """
+
+    def __init__(self, extra_config: dict[str, Any]) -> None:
+        self._patterns: dict[str, re.Pattern] = {}
+        self._budget_s = _PATTERN_BUDGET_S
+        for key in extra_config:
+            if not isinstance(key, str) or not any(
+                c in _REGEX_SPECIAL_CHARS for c in key
+            ):
+                continue
+            if len(key) > _MAX_PATTERN_LENGTH or _exceeds_counted_repeat_limit(key):
+                logger.warning(
+                    "Ignoring INC extra_config regex key: it is longer than %d "
+                    "characters or its counted repeats exceed %d.",
+                    _MAX_PATTERN_LENGTH,
+                    _MAX_COUNTED_REPEAT_PRODUCT,
+                )
+                continue
+            start = time.perf_counter()
+            with contextlib.suppress(re.error, RecursionError, MemoryError):
+                self._patterns[key] = re.compile(key)
+            self._charge(time.perf_counter() - start)
+
+    def _charge(self, elapsed_s: float) -> None:
+        self._budget_s -= elapsed_s
+        if self._budget_s <= 0:
+            raise ValueError(
+                "Compiling and matching INC extra_config regex keys exceeded "
+                f"{_PATTERN_BUDGET_S}s. Use exact layer names or simpler "
+                "patterns in extra_config."
+            )
+
+    def first_match(self, name: str) -> str | None:
+        for key, pattern in list(self._patterns.items()):
+            timeout = min(_PATTERN_SEARCH_TIMEOUT_S, self._budget_s)
+            start = time.perf_counter()
+            try:
+                matched = pattern.search(name, timeout=timeout) is not None
+            except TimeoutError:
+                matched = False
+                del self._patterns[key]
+                logger.warning(
+                    "Ignoring INC extra_config key %r: matching it against "
+                    "%r exceeded %.2fs.",
+                    key,
+                    name,
+                    timeout,
+                )
+            self._charge(time.perf_counter() - start)
+            if matched:
+                return key
+        return None
 
 
 @dataclass(frozen=True)
@@ -60,6 +143,16 @@ class INCLayerConfig:
 class INCConfigParser:
     def __init__(self, config: "INCConfig") -> None:
         self._config = config
+        self._patterns_source: dict[str, Any] | None = None
+        self._patterns = _ExtraConfigPatterns({})
+
+    def _extra_config_patterns(self) -> _ExtraConfigPatterns:
+        # apply_vllm_mapper replaces extra_config after construction.
+        extra_config = self._config.extra_config
+        if extra_config is not self._patterns_source:
+            self._patterns = _ExtraConfigPatterns(extra_config or {})
+            self._patterns_source = extra_config
+        return self._patterns
 
     def resolve(self, layer: "torch.nn.Module", layer_name: str) -> INCLayerConfig:
         bits, group_size, sym = self._resolve_raw(layer, layer_name)
@@ -82,7 +175,7 @@ class INCConfigParser:
     def _resolve_raw(
         self, layer: "torch.nn.Module", layer_name: str
     ) -> tuple[int, int | tuple[int, int], bool]:
-        REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
+        patterns = self._extra_config_patterns()
 
         def is_explicitly_configured(name: str) -> bool:
             """Return True if *name* has an explicit entry in extra_config,
@@ -91,17 +184,7 @@ class INCConfigParser:
                 return False
             if name in self._config.extra_config:
                 return True
-            for pattern in self._config.extra_config:
-                if not isinstance(pattern, str) or not any(
-                    c in REGEX_SPECIAL_CHARS for c in pattern
-                ):
-                    continue
-                try:
-                    if re.search(re.compile(pattern), name) is not None:
-                        return True
-                except re.error:
-                    continue
-            return False
+            return patterns.first_match(name) is not None
 
         def get_config(
             name: str, quantized: bool = True
@@ -126,30 +209,19 @@ class INCConfigParser:
                     cfg.get("sym", self._config.sym if quantized else True),
                 )
 
-            regex_special_chars = set(r"*+?^$()[]{}|\\")
-            for pattern, cfg in self._config.extra_config.items():
-                if not isinstance(pattern, str) or not any(
-                    c in regex_special_chars for c in pattern
-                ):
-                    continue
-
-                try:
-                    if re.search(re.compile(pattern), name) is not None:
-                        return (
-                            cfg.get(
-                                "bits",
-                                self._config.weight_bits if quantized else 16,
-                            ),
-                            self._normalize_group_size(
-                                cfg.get(
-                                    "group_size",
-                                    self._config.group_size if quantized else -1,
-                                )
-                            ),
-                            cfg.get("sym", self._config.sym if quantized else True),
+            pattern = patterns.first_match(name)
+            if pattern is not None:
+                cfg = self._config.extra_config[pattern]
+                return (
+                    cfg.get("bits", self._config.weight_bits if quantized else 16),
+                    self._normalize_group_size(
+                        cfg.get(
+                            "group_size",
+                            self._config.group_size if quantized else -1,
                         )
-                except re.error:
-                    continue
+                    ),
+                    cfg.get("sym", self._config.sym if quantized else True),
+                )
 
             return (
                 self._config.weight_bits if quantized else 16,
