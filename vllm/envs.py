@@ -988,7 +988,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum size in MB for a single remote media download. The limit is
     # enforced while streaming the response body so oversized or infinite
-    # responses cannot grow the API server heap without bound. Default is 256.
+    # responses cannot grow the API server heap without bound. Also caps the
+    # decoded size of data: URL payloads before base64 decoding. Default is 256.
     "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", "256")
     ),
