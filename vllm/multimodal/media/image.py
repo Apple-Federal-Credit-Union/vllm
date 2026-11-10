@@ -4,7 +4,6 @@
 from io import BytesIO
 from pathlib import Path
 
-import numpy as np
 import pybase64
 import torch
 from PIL import Image
@@ -12,7 +11,9 @@ from PIL import Image
 import vllm.envs as envs
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import (
+    bounded_torch_checkpoint,
     check_sparse_tensor_invariants_threadsafe,
+    load_numpy_embed,
     safe_to_dense,
 )
 
@@ -139,19 +140,15 @@ class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):
     def __init__(self) -> None:
         super().__init__()
 
-    def _load_pickled_torch(self, data: bytes) -> torch.Tensor:
-        buffer = BytesIO(data)
+    def _load_pickled_torch(self, source: bytes | Path) -> torch.Tensor:
+        checkpoint = bounded_torch_checkpoint(source, parameter="image_embeds")
         with check_sparse_tensor_invariants_threadsafe():
-            tensor = torch.load(buffer, weights_only=True)
+            tensor = torch.load(checkpoint, weights_only=True)
             return safe_to_dense(tensor, parameter="image_embeds")
-
-    def _load_numpy(self, data: bytes) -> torch.Tensor:
-        with BytesIO(data) as buffer:
-            return torch.from_numpy(np.load(buffer))
 
     def load_bytes(self, data: bytes) -> torch.Tensor:
         if data[:6] == MAGIC_NUMPY_PREFIX:
-            return self._load_numpy(data)
+            return load_numpy_embed(data, parameter="image_embeds")
 
         return self._load_pickled_torch(data)
 
@@ -160,11 +157,9 @@ class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):
 
     def load_file(self, filepath: Path) -> torch.Tensor:
         if filepath.suffix == ".npy":
-            return torch.from_numpy(np.load(filepath))
+            return load_numpy_embed(filepath.read_bytes(), parameter="image_embeds")
 
-        with check_sparse_tensor_invariants_threadsafe():
-            tensor = torch.load(filepath, weights_only=True)
-            return safe_to_dense(tensor, parameter="image_embeds")
+        return self._load_pickled_torch(filepath)
 
     def encode_base64(self, media: torch.Tensor) -> str:
         return tensor2base64(media)
