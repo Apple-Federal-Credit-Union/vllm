@@ -132,6 +132,10 @@ def checkpoint_regex_size(pattern: str) -> int:
         elif ch == ")":
             if not open_groups:
                 raise ValueError(f"unbalanced ')' at position {i}")
+            # A group compiles to nodes even when its body is empty, and
+            # ``regex`` copies a counted repeat's minimum out in full. Count
+            # the group so ``(){N}`` cannot skip the size cap.
+            size += 1
             last = _NESTED if has_repeat else _ATOM
             last_size = size
             outer_has_repeat, outer_size = open_groups.pop()
