@@ -1097,7 +1097,11 @@ class precompiled_wheel_utils:
         try:
             if not os.path.isfile(wheel_url_or_path):
                 # use provided filename first, then derive from URL
-                wheel_filename = download_filename or wheel_url_or_path.split("/")[-1]
+                wheel_filename = os.path.basename(
+                    download_filename or wheel_url_or_path.split("/")[-1]
+                )
+                if wheel_filename in ("", ".", ".."):
+                    wheel_filename = "vllm.whl"
                 temp_dir = tempfile.mkdtemp(prefix="vllm-wheels")
                 wheel_path = os.path.join(temp_dir, wheel_filename)
                 print(f"Downloading wheel from {wheel_url_or_path} to {wheel_path}")
@@ -1151,12 +1155,26 @@ class precompiled_wheel_utils:
                 flashmla_regex = re.compile(
                     r"vllm/third_party/flashmla/(?:[^/.][^/]*/)*(?!\.)[^/]*\.py"
                 )
+                # Any path component except "." and "..".
+                component = r"(?!\.\.?(?:/|$))[^/]+"
                 # DeepGEMM: extract all files (.py, .so, .cuh, .h, .hpp, etc.)
-                deep_gemm_regex = re.compile(r"vllm/third_party/deep_gemm/.*")
-                fmha_sm100_regex = re.compile(r"vllm/third_party/fmha_sm100/.*")
-                tml_fa4_regex = re.compile(r"vllm/third_party/tml_fa4/.*")
+                deep_gemm_regex = re.compile(
+                    rf"vllm/third_party/deep_gemm/(?:{component}/)*{component}"
+                )
+                fmha_sm100_regex = re.compile(
+                    rf"vllm/third_party/fmha_sm100/(?:{component}/)*{component}"
+                )
+                tml_fa4_regex = re.compile(
+                    rf"vllm/third_party/tml_fa4/(?:{component}/)*{component}"
+                )
                 file_members = []
                 for member in wheel.filelist:
+                    if any(
+                        part in ("", ".", "..") or "\\" in part
+                        for part in member.filename.split("/")
+                    ):
+                        print(f"[extract] skipping unsafe member {member.filename!r}")
+                        continue
                     if member.filename in exact_members:
                         file_members.append(member)
                         continue
@@ -1174,14 +1192,14 @@ class precompiled_wheel_utils:
 
                     if (
                         (
-                            flash_attn_regex.match(member.filename)
+                            flash_attn_regex.fullmatch(member.filename)
                             and member.filename not in flash_attn_files_to_skip
                         )
-                        or triton_kernels_regex.match(member.filename)
-                        or flashmla_regex.match(member.filename)
-                        or deep_gemm_regex.match(member.filename)
-                        or tml_fa4_regex.match(member.filename)
-                        or fmha_sm100_regex.match(member.filename)
+                        or triton_kernels_regex.fullmatch(member.filename)
+                        or flashmla_regex.fullmatch(member.filename)
+                        or deep_gemm_regex.fullmatch(member.filename)
+                        or tml_fa4_regex.fullmatch(member.filename)
+                        or fmha_sm100_regex.fullmatch(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1189,14 +1207,12 @@ class precompiled_wheel_utils:
                     print(f"[extract] {file.filename}")
                     target_path = os.path.join(".", file.filename)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    with (
-                        wheel.open(file.filename) as src,
-                        open(target_path, "wb") as dst,
-                    ):
+                    with wheel.open(file) as src, open(target_path, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-                    mode = file.external_attr >> 16
-                    if mode:
-                        os.chmod(target_path, mode)
+                        # Drop setuid/setgid/sticky bits from the archive mode.
+                        mode = (file.external_attr >> 16) & 0o777
+                        if mode:
+                            os.fchmod(dst.fileno(), mode)
 
                     pkg = os.path.dirname(file.filename).replace("/", ".")
                     package_data_patch.setdefault(pkg, []).append(
