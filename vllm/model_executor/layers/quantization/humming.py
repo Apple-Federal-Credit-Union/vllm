@@ -4,7 +4,6 @@ from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, Any
 
-import regex as re
 import torch
 
 import vllm.utils.humming as _hm
@@ -34,6 +33,7 @@ from vllm.model_executor.layers.quantization.utils.humming import (
     convert_to_humming_moe_kernel_format,
     get_humming_linear_compute_config,
     get_humming_moe_quant_config,
+    humming_pattern_match,
     humming_update_schema_hadamard_block_size,
     input_schema_to_quant_key,
     make_humming_moe_kernel,
@@ -206,7 +206,7 @@ class HummingConfig(QuantizationConfig):
             # so ignored layers get silently quantized. Non-"re:" entries keep the
             # existing substring behavior (e.g. bitsandbytes modules_to_not_convert).
             if module_name.startswith("re:"):
-                if re.match(module_name[3:], prefix):
+                if humming_pattern_match(module_name[3:], prefix):
                     return True
             elif module_name in prefix:
                 return True
@@ -216,7 +216,7 @@ class HummingConfig(QuantizationConfig):
         for regex in config.get("dynamic", {}):
             if regex[:1] != "-":
                 continue
-            if re.match(regex[2:], prefix):
+            if humming_pattern_match(regex[2:], prefix):
                 return True
 
         return False
