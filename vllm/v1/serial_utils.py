@@ -143,12 +143,16 @@ class MsgpackEncoder:
 
     When a ``oob_tensor_consumer`` is provided, tensors (CUDA and CPU) will be
     offered to it for out-of-band handling.
+
+    ``allow_pickle=False`` disables the pickle fallback regardless of
+    ``VLLM_ALLOW_INSECURE_SERIALIZATION``.
     """
 
     def __init__(
         self,
         size_threshold: int | None = None,
         oob_tensor_consumer: OOBTensorConsumer | None = None,
+        allow_pickle: bool = True,
     ):
         if size_threshold is None:
             size_threshold = envs.VLLM_MSGPACK_ZERO_COPY_THRESHOLD
@@ -159,7 +163,8 @@ class MsgpackEncoder:
         self.aux_buffers: list[bytestr] | None = None
         self.size_threshold = size_threshold
         self.oob_tensor_consumer = oob_tensor_consumer
-        if envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+        self.allow_pickle = allow_pickle
+        if allow_pickle and envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             _log_insecure_serialization_warning()
 
     def encode(self, obj: Any) -> Sequence[bytestr]:
@@ -216,6 +221,9 @@ class MsgpackEncoder:
             # encode type information for nested structures of lists/dicts
             # to help with correct msgspec deserialization.
             return _encode_type_info_recursive(result), result
+
+        if not self.allow_pickle:
+            raise TypeError(f"Object of type {type(obj)} is not serializable")
 
         if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             raise TypeError(
@@ -317,6 +325,9 @@ class MsgpackDecoder:
 
     ``oob_tensor_provider`` must be used when an OOBTensorConsumer is used on the
     encoder side.
+
+    ``allow_pickle=False`` rejects pickle/cloudpickle extension types regardless
+    of ``VLLM_ALLOW_INSECURE_SERIALIZATION``; use it for untrusted input.
     """
 
     def __init__(
@@ -324,6 +335,7 @@ class MsgpackDecoder:
         t: Any | None = None,
         share_mem: bool = True,
         oob_tensor_provider: OOBTensorProvider | None = None,
+        allow_pickle: bool = True,
     ):
         self.share_mem = share_mem
         self.pin_tensors = PIN_MEMORY
@@ -333,7 +345,8 @@ class MsgpackDecoder:
         )
         self.aux_buffers: Sequence[bytestr] = ()
         self.oob_tensor_provider = oob_tensor_provider
-        if envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+        self.allow_pickle = allow_pickle
+        if allow_pickle and envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             _log_insecure_serialization_warning()
 
     def decode(self, bufs: bytestr | Sequence[bytestr]) -> Any:
@@ -473,7 +486,7 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_RAW_VIEW:
             return data
 
-        if envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+        if self.allow_pickle and envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             if code == CUSTOM_TYPE_PICKLE:
                 return pickle.loads(data)
             if code == CUSTOM_TYPE_CLOUDPICKLE:

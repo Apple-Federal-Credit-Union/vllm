@@ -10,8 +10,12 @@ import pybase64
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-_encoder = MsgpackEncoder(size_threshold=2**62)  # force all tensors inline
-_decoder = MsgpackDecoder(t=MultiModalKwargsItem)
+# Payloads cross the HTTP boundary, so pickle is never allowed here.
+_encoder = MsgpackEncoder(
+    size_threshold=2**62,  # force all tensors inline
+    allow_pickle=False,
+)
+_decoder = MsgpackDecoder(t=MultiModalKwargsItem, allow_pickle=False)
 
 
 def encode_mm_kwargs_item(item: MultiModalKwargsItem) -> str:
