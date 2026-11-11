@@ -793,36 +793,54 @@ def recipe_argv(recipe: dict[str, Any]) -> list[Any]:
     raise ValueError("Recipe JSON does not contain an `argv` field")
 
 
-def write_config(
-    path: str,
-    source: str,
-    recipe: dict[str, Any],
-    config: dict[str, Any],
-) -> None:
-    metadata = [
-        "# Generated from vLLM Recipes JSON.",
-        f"# Source: {source}",
-    ]
-    for key in ("hardware", "strategy", "variant", "deploy_type"):
-        if recipe.get(key) is not None:
-            metadata.append(f"# {key}: {recipe[key]}")
+def comment_text(value: object) -> str:
+    """Escape non-printable characters, including every YAML and shell line
+    break, so the value stays inside a single `#` comment line."""
+    return "".join(
+        char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
+        for char in str(value)
+    )
 
-    body = yaml.safe_dump(
+
+def dump_config(config: dict[str, Any]) -> str:
+    return yaml.safe_dump(
         config,
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,
     )
-    Path(path).write_text("\n".join(metadata) + "\n" + body, encoding="utf-8")
 
 
-def write_env(
-    path: str,
+def render_config(
+    source: str,
+    recipe: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    metadata = [
+        "# Generated from vLLM Recipes JSON.",
+        f"# Source: {comment_text(source)}",
+    ]
+    for key in ("hardware", "strategy", "variant", "deploy_type"):
+        if recipe.get(key) is not None:
+            metadata.append(f"# {key}: {comment_text(recipe[key])}")
+
+    body = dump_config(config)
+    text = "\n".join(metadata) + "\n" + body
+
+    loaded = yaml.safe_load(text)
+    if not isinstance(loaded, dict) or dump_config(loaded) != body:
+        raise ValueError(
+            "Generated config.yml does not load as the recipe argv translation."
+        )
+    return text
+
+
+def render_env(
     source: str,
     recipe: dict[str, Any],
     *,
     env_overrides: dict[str, object] | None = None,
-) -> None:
+) -> str:
     recipe_env = recipe.get("env") or {}
     if not isinstance(recipe_env, dict):
         raise ValueError(
@@ -836,7 +854,7 @@ def write_env(
     lines = [
         "#!/usr/bin/env bash",
         "# Generated from vLLM Recipes JSON.",
-        f"# Source: {source}",
+        f"# Source: {comment_text(source)}",
         "",
     ]
 
@@ -850,8 +868,7 @@ def write_env(
         lines.append("# No recipe-specific environment variables.")
 
     lines.append("")
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
-    Path(path).chmod(Path(path).stat().st_mode | 0o111)
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -1011,13 +1028,12 @@ def main() -> int:
             sweep_config = dict(config)
             sweep_config.update(tuning.sweep_overrides)
 
-        write_config(args.config_out, source, recipe, config)
-        write_env(
-            args.env_out,
-            source,
-            recipe,
-            env_overrides=env_overrides,
-        )
+        config_text = render_config(source, recipe, config)
+        env_text = render_env(source, recipe, env_overrides=env_overrides)
+        Path(args.config_out).write_text(config_text, encoding="utf-8")
+        env_path = Path(args.env_out)
+        env_path.write_text(env_text, encoding="utf-8")
+        env_path.chmod(env_path.stat().st_mode | 0o111)
 
         sweep_files: list[Path] = []
         if args.generate_full_sweep:
