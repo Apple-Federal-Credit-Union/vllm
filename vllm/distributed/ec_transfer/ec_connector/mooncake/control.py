@@ -5,19 +5,28 @@
 Tensor bytes never travel through this module.  It coordinates destination
 reservations, completion/cancellation, TP-shard discovery, and readiness
 notifications while :mod:`transfer` owns the Mooncake data plane.
+
+Every channel is ZeroMQ CURVE: the Consumer accepts only clients holding the
+client key derived from the shared control secret, and clients only talk to a
+server holding the matching server key.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Executor, Future
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import zmq
+from zmq.auth.thread import ThreadAuthenticator
+from zmq.utils import z85
 
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
@@ -26,17 +35,75 @@ logger = init_logger(__name__)
 
 _MAX_PENDING_EVENTS = 4096
 _RESERVATION_REAP_INTERVAL_SECONDS = 1
+_ZAP_DOMAIN = "vllm-ec-mooncake"
+_KEY_DERIVATION_LABEL = b"vllm-ec-mooncake-control/"
 
 
 ControlRequest = dict[str, Any]
 ControlResponse = dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ControlKeys:
+    """CURVE key pairs of the Consumer server and its authorized clients."""
+
+    server_public: bytes
+    server_secret: bytes = field(repr=False)
+    client_public: bytes
+    client_secret: bytes = field(repr=False)
+
+    @classmethod
+    def from_secret(cls, secret: str) -> ControlKeys:
+        def keypair(role: bytes) -> tuple[bytes, bytes]:
+            seed = hmac.new(
+                secret.encode(), _KEY_DERIVATION_LABEL + role, hashlib.sha256
+            ).digest()
+            secret_key = z85.encode(seed)
+            return zmq.curve_public(secret_key), secret_key
+
+        server_public, server_secret = keypair(b"server")
+        client_public, client_secret = keypair(b"client")
+        return cls(server_public, server_secret, client_public, client_secret)
+
+    @classmethod
+    def unshared(cls) -> ControlKeys:
+        """Keys no peer holds, so a server using them admits no client."""
+        server_public, server_secret = zmq.curve_keypair()
+        client_public, client_secret = zmq.curve_keypair()
+        return cls(server_public, server_secret, client_public, client_secret)
+
+
+def _secure_client(socket: zmq.Socket, keys: ControlKeys | None) -> None:
+    if keys is None:
+        return
+    socket.curve_secretkey = keys.client_secret
+    socket.curve_publickey = keys.client_public
+    socket.curve_serverkey = keys.server_public
+
+
+def _secure_server(socket: zmq.Socket, keys: ControlKeys) -> None:
+    socket.curve_server = True
+    socket.curve_secretkey = keys.server_secret
+    socket.curve_publickey = keys.server_public
+    socket.zap_domain = _ZAP_DOMAIN.encode()
+
+
+class _ClientKeyPolicy:
+    """ZAP credentials provider admitting only the derived client key."""
+
+    def __init__(self, client_public: bytes) -> None:
+        self._client_public = client_public
+
+    def callback(self, domain: str, key: bytes) -> bool:
+        return domain == _ZAP_DOMAIN and hmac.compare_digest(key, self._client_public)
+
+
 class ControlClient:
     """Send control requests through reusable, thread-local REQ sockets."""
 
-    def __init__(self, timeout_ms: int) -> None:
+    def __init__(self, timeout_ms: int, keys: ControlKeys | None = None) -> None:
         self._context = zmq.Context()
+        self.keys = keys
         self._timeout_ms = timeout_ms
         self._local = threading.local()
         self._topologies: dict[str, list[str]] = {}
@@ -63,6 +130,7 @@ class ControlClient:
             socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
             socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
             socket.setsockopt(zmq.LINGER, 0)
+            _secure_client(socket, self.keys)
             socket.connect(addr)
             sockets[addr] = socket
         try:
@@ -197,6 +265,7 @@ class EventInbox:
         context = zmq.Context()
         socket = context.socket(zmq.PULL)
         socket.setsockopt(zmq.IPV6, 1)
+        _secure_client(socket, self._client.keys)
         for endpoint in endpoints:
             socket.connect(endpoint)
         self._context = context
@@ -242,7 +311,7 @@ class ConsumerControlServer:
 
     One server runs on every receiving TP rank.  The REP channel handles
     reservation operations, while a PUSH channel publishes newly ready items
-    to the Scheduler.
+    to the Scheduler.  Without `keys` the server admits no client.
     """
 
     def __init__(
@@ -257,6 +326,8 @@ class ConsumerControlServer:
         peer_ports: list[int] | None = None,
         device: torch.device | None = None,
         drain_ready: Callable[[], list[str]] = lambda: [],
+        cancel_transfer: Callable[[str], bool] | None = None,
+        keys: ControlKeys | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -267,6 +338,8 @@ class ConsumerControlServer:
         self._status = status
         self._complete = complete
         self._cancel = cancel
+        self._cancel_transfer = cancel_transfer
+        self._keys = keys or ControlKeys.unshared()
         self._reap = reap
         self._drain_ready = drain_ready
         self._stop = threading.Event()
@@ -279,11 +352,20 @@ class ConsumerControlServer:
             if self._device is not None and self._device.type == "cuda":
                 torch.accelerator.set_device_index(self._device.index or 0)
             context = zmq.Context()
+            authenticator = ThreadAuthenticator(context)
             socket = context.socket(zmq.REP)
             event_socket = context.socket(zmq.PUSH)
             socket.setsockopt(zmq.IPV6, 1)
             event_socket.setsockopt(zmq.IPV6, 1)
+            _secure_server(socket, self._keys)
+            _secure_server(event_socket, self._keys)
             pending_events: deque[dict[str, Any]] = deque()
+
+            def release() -> None:
+                socket.close(linger=0)
+                event_socket.close(linger=0)
+                authenticator.stop()
+                context.term()
 
             def queue_event(event: dict[str, Any]) -> None:
                 event["shard"] = self.port
@@ -305,6 +387,10 @@ class ConsumerControlServer:
             last_reap_at = time.monotonic()
             socket.setsockopt(zmq.RCVTIMEO, 100)
             try:
+                authenticator.start()
+                authenticator.configure_curve_callback(
+                    _ZAP_DOMAIN, _ClientKeyPolicy(self._keys.client_public)
+                )
                 socket.bind(make_zmq_path("tcp", self.host, self.port))
                 event_socket.bind(make_zmq_path("tcp", self.host, 0))
                 self.event_port = int(
@@ -315,9 +401,7 @@ class ConsumerControlServer:
             except Exception as e:
                 self._startup_error = e
                 self._started.set()
-                socket.close(linger=0)
-                event_socket.close(linger=0)
-                context.term()
+                release()
                 return
             self._started.set()
             try:
@@ -415,6 +499,12 @@ class ConsumerControlServer:
                                     bool(request.get("refresh", False)),
                                 )
                             }
+                        elif op == "cancel_transfer" and self._cancel_transfer:
+                            result = {
+                                "cancelled": self._cancel_transfer(
+                                    str(request["transfer_id"])
+                                )
+                            }
                         else:
                             raise ValueError(f"unknown control op: {op!r}")
                         socket.send_json({"ok": True, "result": result})
@@ -430,9 +520,7 @@ class ConsumerControlServer:
                 )
                 raise
             finally:
-                socket.close(linger=0)
-                event_socket.close(linger=0)
-                context.term()
+                release()
 
         self._thread = threading.Thread(
             target=loop, name="ec-mooncake-control", daemon=True

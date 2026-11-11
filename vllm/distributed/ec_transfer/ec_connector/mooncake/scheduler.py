@@ -30,7 +30,6 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.config import (
 from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     ControlClient,
     EventInbox,
-    make_cancel_request,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
@@ -87,7 +86,9 @@ class ECMooncakeScheduler:
         self._push_wait_timeout = config.push_wait_timeout_s
         self._vllm_config = vllm_config
         self._model_config = vllm_config.model_config
-        self._control_client = ControlClient(config.control_timeout_ms)
+        self._control_client = ControlClient(
+            config.control_timeout_ms, config.control_keys
+        )
         self._control_executor = ThreadPoolExecutor(
             max_workers=_CONTROL_WORKERS,
             thread_name_prefix="ec-mooncake-control",
@@ -131,7 +132,7 @@ class ECMooncakeScheduler:
                 try:
                     result = self._control_client.request(
                         addr,
-                        make_cancel_request(transfer_id),
+                        {"op": "cancel_transfer", "transfer_id": transfer_id},
                     )
                 except Exception as exc:
                     if error is None:

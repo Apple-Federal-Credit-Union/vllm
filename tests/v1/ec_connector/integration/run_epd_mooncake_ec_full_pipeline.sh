@@ -15,6 +15,7 @@
 #   ENDPOINT_PORT, ENCODE_PORT, PREFILL_DECODE_PORT
 #   EC_MOONCAKE_RESERVATION_HOST  consumer control host (default 127.0.0.1)
 #   MOONCAKE_EC_PROTOCOL        tcp | rdma (default tcp)
+#   VLLM_EC_MOONCAKE_CONTROL_SECRET  control-plane secret (default: random)
 #   USE_MM_PROMPTS              1 (default) or 0 for text-only quick sanity
 #   TIMEOUT_SECONDS             wait_for_server timeout (default 1200)
 #   SKIP_BASELINE               set to 1 to reuse existing BASELINE_FILE
@@ -62,6 +63,11 @@ MOONCAKE_EC_PROTOCOL="${MOONCAKE_EC_PROTOCOL:-tcp}"
 export EC_MOONCAKE_RESERVATION_HOST
 export EC_MOONCAKE_RESERVATION_PORT
 export MOONCAKE_EC_PROTOCOL
+if [[ -z "${VLLM_EC_MOONCAKE_CONTROL_SECRET:-}" ]]; then
+  VLLM_EC_MOONCAKE_CONTROL_SECRET=$("$PYTHON_BIN" -c \
+    'import secrets; print(secrets.token_hex(32))')
+fi
+export VLLM_EC_MOONCAKE_CONTROL_SECRET
 if [[ "$MOONCAKE_EC_PROTOCOL" == "tcp" ]]; then
   # TransferEngine may otherwise auto-select RDMA on hosts with an HCA.
   export MC_FORCE_TCP=1

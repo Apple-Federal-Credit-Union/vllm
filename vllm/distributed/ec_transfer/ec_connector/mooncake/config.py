@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import zmq
+
+import vllm.envs as envs
+from vllm.distributed.ec_transfer.ec_connector.mooncake.control import ControlKeys
 from vllm.utils.network_utils import make_zmq_path
 
 if TYPE_CHECKING:
@@ -13,6 +17,22 @@ if TYPE_CHECKING:
 
 # Scheduler and Worker must agree on when a remote reservation becomes stale.
 _RESERVATION_TTL_SECONDS = 300
+_MIN_CONTROL_SECRET_LENGTH = 32
+
+
+def _control_keys() -> ControlKeys:
+    secret = envs.VLLM_EC_MOONCAKE_CONTROL_SECRET
+    if not secret or len(secret) < _MIN_CONTROL_SECRET_LENGTH:
+        raise ValueError(
+            "ECMooncakeConnector requires VLLM_EC_MOONCAKE_CONTROL_SECRET to "
+            f"hold a random secret of at least {_MIN_CONTROL_SECRET_LENGTH} "
+            "characters, identical on every producer and consumer."
+        )
+    if not zmq.has("curve"):
+        raise RuntimeError(
+            "ECMooncakeConnector requires a pyzmq build with CURVE support."
+        )
+    return ControlKeys.from_secret(secret)
 
 
 def _positive_int(name: str, value: object) -> int:
@@ -69,6 +89,7 @@ class MooncakeECConfig:
     control_timeout_ms: int
     push_wait_timeout_s: float
     pool_size: int
+    control_keys: ControlKeys = field(repr=False)
     cross_encoder_cache: bool = False
     store_max_pending_items: int = 32
     store_max_pending_bytes: int = 2 * 1024**3
@@ -142,6 +163,7 @@ class MooncakeECConfig:
                 "push_wait_timeout_s", get("push_wait_timeout_s", 60)
             ),
             pool_size=registered_buffer_size,
+            control_keys=_control_keys(),
             cross_encoder_cache=shared_reuse,
             store_max_pending_items=_positive_int(
                 "store_max_pending_items", get("store_max_pending_items", 32)

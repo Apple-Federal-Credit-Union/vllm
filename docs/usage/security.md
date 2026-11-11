@@ -5,8 +5,12 @@
 All communications between nodes in a multi-node vLLM deployment are **insecure by default** and must be protected by placing the nodes on an isolated network. This includes:
 
 1. PyTorch Distributed communications
-2. KV cache transfer communications
+2. KV cache and encoder cache transfer communications
 3. Tensor, Pipeline, and Data parallel communications
+
+`ECMooncakeConnector` authenticates its control channel with
+`VLLM_EC_MOONCAKE_CONTROL_SECRET`; its Mooncake Transfer Engine data plane is
+not authenticated and still requires an isolated network.
 
 ### Configuration Options for Inter-Node Communications
 

@@ -36,11 +36,29 @@ The two wheels are the same release built against different CUDA majors.
 Importing the wrong one fails with
 `libcudart.so.<major>: cannot open shared object file`.
 
+## Control-plane secret
+
+Every producer and consumer must export the same
+`VLLM_EC_MOONCAKE_CONTROL_SECRET`, a random value of at least 32 characters.
+The consumer's ZMQ control and readiness channels use ZeroMQ CURVE keys
+derived from it and accept only peers holding the same secret; instances
+refuse to start without it.
+
+```bash
+# Generate once and distribute to every instance through your secret store.
+export VLLM_EC_MOONCAKE_CONTROL_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+```
+
+The secret protects the control channel only. Mooncake Transfer Engine's
+data plane does not authenticate peers, so keep encoder and consumer nodes on
+an isolated network as described in [Security](../usage/security.md).
+
 ## 1E + 1PD
 
 One encoder producer and one combined prefill/decode consumer. The consumer
 listens on `ec_ip` + `ec_port` (ZMQ control). The proxy must advertise that
-address with `--ec-consumer-zmq-addrs`.
+address with `--ec-consumer-zmq-addrs`. Export the
+[control-plane secret](#control-plane-secret) before starting each instance.
 
 ### Encoder (producer)
 
@@ -125,6 +143,7 @@ Producer and consumer must use the same `mooncake_protocol`.
 
 | Setting | Where | Default | Notes |
 | --------- | ------- | --------- | ------- |
+| `VLLM_EC_MOONCAKE_CONTROL_SECRET` | process environment | none (required) | Shared secret of at least 32 characters, identical on every producer and consumer. |
 | `mooncake_protocol` | `ec_connector_extra_config` | `rdma` | Set `tcp` when no verbs device is available. With TCP, also export `MC_FORCE_TCP=1`. |
 | `ec_ip` / `ec_port` | consumer `ECTransferConfig` | `127.0.0.1` / `14579` | First ZMQ control port. Tensor-parallel rank `r` listens on `ec_port + dp_index * tp_size + r`. |
 | `ec_buffer_size` | `ECTransferConfig` | `1e9` | Registered receive arena on the consumer, in bytes. |
@@ -151,6 +170,8 @@ consumer as described in
 | Symptom | Likely cause |
 | --------- | ---------------- |
 | `Install mooncake-transfer-engine` / `libcudart.so.*` | Wrong or missing Mooncake wheel for this CUDA major. |
+| `requires VLLM_EC_MOONCAKE_CONTROL_SECRET` at startup | The secret is unset or shorter than 32 characters. |
+| Reservation or cancel requests time out although the consumer is up | Producer and consumer use different `VLLM_EC_MOONCAKE_CONTROL_SECRET` values. |
 | `Failed to register memory ... Bad address [14]` | GPUDirect registration failed. Set `WITH_NVIDIA_PEERMEM=0`. |
 | Proxy startup error about E+PD only | `--ec-consumer-zmq-addrs` used with a real `--prefill-servers-urls`. |
 | Consumer waits then errors; encoder never finishes the push | `--ec-consumer-zmq-addrs` does not match consumer `ec_ip`/`ec_port`, or producer/consumer protocols differ. |
