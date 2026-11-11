@@ -586,6 +586,54 @@ class precompiled_wheel_utils:
         return wheels, repo_url
 
     @staticmethod
+    def resolve_metadata_wheel_url(base_url: str, path: object) -> str:
+        """Resolve a nightly metadata ``path`` against ``base_url``.
+
+        Raises:
+            ValueError: If ``path`` is not a relative reference or resolves to
+                a different scheme or host than ``base_url``.
+
+        """
+        from urllib.parse import urljoin, urlsplit
+
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"Invalid wheel metadata path: {path!r}")
+        parsed_path = urlsplit(path)
+        if (
+            parsed_path.scheme
+            or parsed_path.netloc
+            or parsed_path.path.startswith(("/", "\\"))
+        ):
+            raise ValueError(f"Wheel metadata path must be relative: {path!r}")
+        wheel_url = urljoin(base_url, path)
+        base, resolved = urlsplit(base_url), urlsplit(wheel_url)
+        if (resolved.scheme, resolved.netloc) != (base.scheme, base.netloc):
+            raise ValueError(
+                f"Wheel metadata path {path!r} resolves outside {base_url}"
+            )
+        return wheel_url
+
+    @staticmethod
+    def validate_download_filename(filename: str) -> str:
+        """Return ``filename`` if it is a bare file name.
+
+        Raises:
+            ValueError: If ``filename`` is empty, absolute, contains a path
+                separator or NUL, or is a ``.``/``..`` segment.
+
+        """
+        separators = {os.sep, os.altsep} - {None}
+        if (
+            not isinstance(filename, str)
+            or filename in ("", ".", "..")
+            or "\0" in filename
+            or any(sep in filename for sep in separators)
+            or os.path.isabs(filename)
+        ):
+            raise ValueError(f"Unsafe wheel download filename: {filename!r}")
+        return filename
+
+    @staticmethod
     def is_rocm_system() -> bool:
         """Detect ROCm without relying on torch (for build environment)."""
         if os.getenv("ROCM_PATH"):
@@ -867,8 +915,6 @@ class precompiled_wheel_utils:
                     e,
                 )
         if wheels is not None and repo_url is not None:
-            from urllib.parse import urljoin
-
             for wheel in wheels:
                 if wheel.get("package_name") == "vllm" and arch in wheel.get(
                     "platform_tag", ""
@@ -876,7 +922,9 @@ class precompiled_wheel_utils:
                     print(f"Found precompiled wheel metadata: {wheel}")
                     if "path" not in wheel:
                         raise ValueError(f"Wheel metadata missing path: {wheel}")
-                    wheel_url = urljoin(f"{repo_url}vllm/", wheel["path"])
+                    wheel_url = precompiled_wheel_utils.resolve_metadata_wheel_url(
+                        f"{repo_url}vllm/", wheel["path"]
+                    )
                     download_filename = wheel.get("filename")
                     print(f"Using precompiled wheel URL: {wheel_url}")
                     return wheel_url, download_filename
@@ -1060,8 +1108,6 @@ class precompiled_wheel_utils:
     "path": "../vllm-0.11.2.dev278%2Bgdbc3d9991-cp38-abi3-manylinux1_x86_64.whl"
     },
     ...]"""
-            from urllib.parse import urljoin
-
             for wheel in wheels:
                 # TODO: maybe check more compatibility later? (python_tag, abi_tag, etc)
                 if wheel.get("package_name") == "vllm" and arch in wheel.get(
@@ -1070,7 +1116,9 @@ class precompiled_wheel_utils:
                     print(f"Found precompiled wheel metadata: {wheel}")
                     if "path" not in wheel:
                         raise ValueError(f"Wheel metadata missing path: {wheel}")
-                    wheel_url = urljoin(repo_url, wheel["path"])
+                    wheel_url = precompiled_wheel_utils.resolve_metadata_wheel_url(
+                        repo_url, wheel["path"]
+                    )
                     download_filename = wheel.get("filename")
                     print(f"Using precompiled wheel URL: {wheel_url}")
                     break
@@ -1097,9 +1145,17 @@ class precompiled_wheel_utils:
         try:
             if not os.path.isfile(wheel_url_or_path):
                 # use provided filename first, then derive from URL
-                wheel_filename = download_filename or wheel_url_or_path.split("/")[-1]
+                wheel_filename = precompiled_wheel_utils.validate_download_filename(
+                    download_filename or wheel_url_or_path.split("/")[-1]
+                )
                 temp_dir = tempfile.mkdtemp(prefix="vllm-wheels")
                 wheel_path = os.path.join(temp_dir, wheel_filename)
+                if os.path.dirname(os.path.realpath(wheel_path)) != (
+                    os.path.realpath(temp_dir)
+                ):
+                    raise ValueError(
+                        f"Wheel download path {wheel_path} escapes {temp_dir}"
+                    )
                 print(f"Downloading wheel from {wheel_url_or_path} to {wheel_path}")
                 from urllib.request import urlretrieve
 
