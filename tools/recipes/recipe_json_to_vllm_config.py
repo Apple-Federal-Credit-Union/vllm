@@ -871,17 +871,6 @@ def render_env(
     return "\n".join(lines)
 
 
-def write_outputs(
-    config_path: str,
-    config_text: str,
-    env_path: str,
-    env_text: str,
-) -> None:
-    Path(config_path).write_text(config_text, encoding="utf-8")
-    Path(env_path).write_text(env_text, encoding="utf-8")
-    Path(env_path).chmod(Path(env_path).stat().st_mode | 0o111)
-
-
 def main() -> int:
     args = parse_args()
 
@@ -1041,7 +1030,10 @@ def main() -> int:
 
         config_text = render_config(source, recipe, config)
         env_text = render_env(source, recipe, env_overrides=env_overrides)
-        write_outputs(args.config_out, config_text, args.env_out, env_text)
+        Path(args.config_out).write_text(config_text, encoding="utf-8")
+        env_path = Path(args.env_out)
+        env_path.write_text(env_text, encoding="utf-8")
+        env_path.chmod(env_path.stat().st_mode | 0o111)
 
         sweep_files: list[Path] = []
         if args.generate_full_sweep:
