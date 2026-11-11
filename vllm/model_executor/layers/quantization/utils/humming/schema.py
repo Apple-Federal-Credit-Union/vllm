@@ -3,6 +3,7 @@
 """Map Humming schemas and handle shared checkpoint quantization settings."""
 
 import dataclasses
+import time
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -400,12 +401,48 @@ def check_and_fallback_input_schema(
     )
 
 
+# Layer-name patterns come from checkpoint configs, and `regex` backtracks
+# without bound unless given a timeout. Each match gets a timeout, and all
+# matches share one budget so many slow-but-finishing patterns cannot add up.
+_PATTERN_MATCH_TIMEOUT_S = 0.1
+_PATTERN_MATCH_BUDGET_S = 5.0
+_pattern_match_budget_left_s = _PATTERN_MATCH_BUDGET_S
+
+
+def humming_pattern_match(pattern: str, name: str) -> bool:
+    """Return whether a Humming ignore/dynamic regex matches a layer name.
+
+    Raises:
+        ValueError: If the match exceeds the per-match timeout or the shared
+            matching budget is exhausted.
+
+    """
+    global _pattern_match_budget_left_s
+    timeout = min(_PATTERN_MATCH_TIMEOUT_S, _pattern_match_budget_left_s)
+    if timeout <= 0:
+        raise ValueError(
+            "Humming layer patterns exceeded the total matching budget of "
+            f"{_PATTERN_MATCH_BUDGET_S}s; refusing to match {pattern!r}."
+        )
+    compiled = re.compile(pattern)
+    start = time.perf_counter()
+    try:
+        return compiled.match(name, timeout=timeout) is not None
+    except TimeoutError as e:
+        raise ValueError(
+            f"Humming layer pattern {pattern!r} did not finish matching "
+            f"{name!r} within {timeout:.3g}s."
+        ) from e
+    finally:
+        _pattern_match_budget_left_s -= time.perf_counter() - start
+
+
 def resolve_humming_layer_config(config: dict[str, Any], prefix: str) -> dict[str, Any]:
     layer_config = config.copy()
     dynamic = config.get("dynamic", {})
     if isinstance(dynamic, dict):
         for pattern, overrides in dynamic.items():
-            if pattern.startswith("+") and re.match(pattern[2:], prefix):
+            if pattern.startswith("+") and humming_pattern_match(pattern[2:], prefix):
                 layer_config.update(overrides)
                 break
     return layer_config
@@ -431,7 +468,7 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
     for regex in config.get("dynamic", {}):
         if regex[:1] != "-":
             continue
-        if re.match(regex[2:], prefix):
+        if humming_pattern_match(regex[2:], prefix):
             return True
 
     return False
