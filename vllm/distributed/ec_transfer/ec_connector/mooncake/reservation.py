@@ -311,56 +311,75 @@ class ConsumerReservationManager:
         abandon: bool = False,
         refresh: bool = False,
     ) -> bool:
+        """Cancel the reservation a writer holds, named by its reservation id."""
+        if not reservation_id:
+            return False
         with self._memory.lock:
             record = self._records.get(transfer_id)
-            if (
-                record is not None
-                and reservation_id
-                and record.reservation_id != reservation_id
-            ):
+            if record is not None and record.reservation_id != reservation_id:
                 return False
-            if record is None:
-                record = ConsumerReservation(
-                    transfer_id,
-                    "",
-                    "",
-                    ConsumerReservationState.CANCELLED,
-                )
-                self._insert(record)
-                self._set_tombstone_deadline(record)
-                self._reap_tombstones(time.monotonic())
-                return True
-            if record.state is ConsumerReservationState.CANCELLED:
-                self._set_tombstone_deadline(record)
-                self._reap_tombstones(time.monotonic())
-                return True
-            if refresh:
-                if not abandon or record.state not in {
-                    ConsumerReservationState.WRITING,
-                    ConsumerReservationState.EXPIRE_PENDING,
-                }:
-                    return False
-                if record.state is ConsumerReservationState.WRITING:
-                    self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
-                self._terminate(record, ConsumerReservationState.EXPIRED)
-                self._condition.notify_all()
-                self._reap_tombstones(time.monotonic())
-                return True
-            if record.writer_id:
-                self._terminate(record, ConsumerReservationState.CANCELLED)
-                return True
-            if record.state in _DEFERRED_STATES and not abandon:
-                return True
-            if record.state is ConsumerReservationState.WRITING and not abandon:
-                self._defer(record, ConsumerReservationState.CANCEL_PENDING)
-                return True
-            if record.state not in _ACTIVE_STATES:
-                return False
-            self._terminate(record, ConsumerReservationState.CANCELLED)
-            if self._shutting_down:
-                self._condition.notify_all()
+            return self._cancel_locked(transfer_id, record, abandon, refresh)
+
+    def cancel_transfer(self, transfer_id: str) -> bool:
+        """Cancel whatever the Consumer holds for `transfer_id`.
+
+        Only the Consumer itself may do this: it is the one party that names
+        a transfer without holding one of its reservations.
+        """
+        with self._memory.lock:
+            return self._cancel_locked(
+                transfer_id, self._records.get(transfer_id), False, False
+            )
+
+    def _cancel_locked(
+        self,
+        transfer_id: str,
+        record: ConsumerReservation | None,
+        abandon: bool,
+        refresh: bool,
+    ) -> bool:
+        if record is None:
+            record = ConsumerReservation(
+                transfer_id,
+                "",
+                "",
+                ConsumerReservationState.CANCELLED,
+            )
+            self._insert(record)
+            self._set_tombstone_deadline(record)
             self._reap_tombstones(time.monotonic())
             return True
+        if record.state is ConsumerReservationState.CANCELLED:
+            self._set_tombstone_deadline(record)
+            self._reap_tombstones(time.monotonic())
+            return True
+        if refresh:
+            if not abandon or record.state not in {
+                ConsumerReservationState.WRITING,
+                ConsumerReservationState.EXPIRE_PENDING,
+            }:
+                return False
+            if record.state is ConsumerReservationState.WRITING:
+                self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
+            self._terminate(record, ConsumerReservationState.EXPIRED)
+            self._condition.notify_all()
+            self._reap_tombstones(time.monotonic())
+            return True
+        if record.writer_id:
+            self._terminate(record, ConsumerReservationState.CANCELLED)
+            return True
+        if record.state in _DEFERRED_STATES and not abandon:
+            return True
+        if record.state is ConsumerReservationState.WRITING and not abandon:
+            self._defer(record, ConsumerReservationState.CANCEL_PENDING)
+            return True
+        if record.state not in _ACTIVE_STATES:
+            return False
+        self._terminate(record, ConsumerReservationState.CANCELLED)
+        if self._shutting_down:
+            self._condition.notify_all()
+        self._reap_tombstones(time.monotonic())
+        return True
 
     def take(self, transfer_id: str, mm_hash: str) -> MemoryAllocation:
         with self._memory.lock:

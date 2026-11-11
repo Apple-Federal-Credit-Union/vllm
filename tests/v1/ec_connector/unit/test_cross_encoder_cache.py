@@ -51,6 +51,7 @@ def test_push_shapes_follow_each_modality(monkeypatch):
     from vllm.distributed.ec_transfer.ec_connector.mooncake import scheduler
 
     monkeypatch.setattr(scheduler, "ensure_mooncake_available", lambda: None)
+    monkeypatch.setenv("VLLM_EC_MOONCAKE_CONTROL_SECRET", "placeholder-" * 4)
     widths = {"image": 8192, "audio": 2048}
     config = create_ec_vllm_config(ec_role="ec_producer", encoder_output_widths=widths)
     request = SimpleNamespace(

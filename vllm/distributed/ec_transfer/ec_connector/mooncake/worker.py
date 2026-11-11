@@ -110,6 +110,7 @@ class ECMooncakeWorker:
         self._buffer_device = config.buffer_device
         self._control_host = config.control_host
         self._control_port = config.control_port
+        self._control_keys = config.control_keys
         self._transfer = MooncakeTransfer(get_ip(), config.protocol)
         self._consumer_memory = ConsumerMemoryPool(
             config.pool_size,
@@ -130,7 +131,9 @@ class ECMooncakeWorker:
             config.pool_size,
             self._transfer,
         )
-        self._control_client = ControlClient(config.control_timeout_ms)
+        self._control_client = ControlClient(
+            config.control_timeout_ms, config.control_keys
+        )
         self._shutdown_drain_timeout_s = config.control_timeout_ms / 1000
         self._io_executor = ThreadPoolExecutor(
             max_workers=_TRANSFER_WORKERS,
@@ -234,6 +237,8 @@ class ECMooncakeWorker:
             peer_ports=[base_port + rank for rank in range(self._tp_size)],
             device=consumer_pool.device,
             drain_ready=self._reservations.drain_ready,
+            cancel_transfer=self._reservations.cancel_transfer,
+            keys=self._control_keys,
         )
         try:
             self._control_server.start()
@@ -276,10 +281,12 @@ class ECMooncakeWorker:
             }
         assert reservation.allocation is not None
 
+        # Only the reservation that owns a fresh allocation may write it; a
+        # cached or in-flight tensor belongs to another transfer.
         return {
             "reservation_id": reservation.reservation_id,
-            "dst_session": self._transfer.local_session(),
-            "dst_ptr": reservation.allocation.tensor.data_ptr(),
+            "dst_session": self._transfer.local_session() if should_write else "",
+            "dst_ptr": reservation.allocation.tensor.data_ptr() if should_write else 0,
             "nbytes": reservation.allocation.tensor.nbytes,
             "write": should_write,
             "ready": reservation.state is ConsumerReservationState.READY,
@@ -625,7 +632,7 @@ class ECMooncakeWorker:
             if spec.mm_hash in encoder_cache:
                 if not spec.local:
                     # The spec's id is one shard's; cancel by transfer.
-                    self._reservations.cancel(spec.transfer_id, "")
+                    self._reservations.cancel_transfer(spec.transfer_id)
                 self._completed_loads.add(spec.mm_hash)
                 continue
             if spec.local:

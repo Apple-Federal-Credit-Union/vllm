@@ -824,7 +824,12 @@ class LocalSnapshotTools:
                 (key, hashlib.sha256(key.encode() + b"\0" + value.encode()).hexdigest())
                 for key, value in environment.items()
                 if key.startswith(prefixes)
-                and key not in {"VLLM_API_KEY", "VLLM_SNAPSHOT_TIMEOUT_S"}
+                and key
+                not in {
+                    "VLLM_API_KEY",
+                    "VLLM_EC_MOONCAKE_CONTROL_SECRET",
+                    "VLLM_SNAPSHOT_TIMEOUT_S",
+                }
             )
         )
         return selected + self._plugin_identity()
