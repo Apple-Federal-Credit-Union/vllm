@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.utils.checkpoint_regex import (
+    CheckpointRegexMatcher,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
@@ -130,6 +133,27 @@ def _check_torchao_fp8_activation_capability(torchao_config) -> None:
     )
 
 
+def _compile_module_fqn_patterns(
+    torchao_config, matcher: CheckpointRegexMatcher
+) -> list[tuple[str, re.Pattern]]:
+    """Compiles the ``re:`` keys of a ``ModuleFqnToConfig``, in order."""
+    from torchao.quantization import ModuleFqnToConfig
+
+    if not isinstance(torchao_config, ModuleFqnToConfig):
+        return []
+    module_fqn_to_config = torchao_config.module_fqn_to_config
+    for key, layer_cfg in module_fqn_to_config.items():
+        if isinstance(layer_cfg, ModuleFqnToConfig):
+            raise ValueError(
+                f"Nested ModuleFqnToConfig for module fqn {key!r} is not supported"
+            )
+    return [
+        (key, matcher.compile(key[3:]))
+        for key in module_fqn_to_config
+        if key.startswith("re:")
+    ]
+
+
 class TorchAOConfig(QuantizationConfig):
     """Config class for torchao."""
 
@@ -143,6 +167,10 @@ class TorchAOConfig(QuantizationConfig):
         self.torchao_config = torchao_config
         self.skip_modules = skip_modules or []
         self.is_checkpoint_torchao_serialized = is_checkpoint_torchao_serialized
+        self._module_fqn_matcher = CheckpointRegexMatcher()
+        self._module_fqn_patterns = _compile_module_fqn_patterns(
+            torchao_config, self._module_fqn_matcher
+        )
 
     def __repr__(self) -> str:
         return (
@@ -260,12 +288,10 @@ class TorchAOConfig(QuantizationConfig):
                 )
                 c = module_fqn_to_config[module_fqn]
             else:
-                for maybe_module_fqn_pattern in module_fqn_to_config:
-                    if not maybe_module_fqn_pattern.startswith("re:"):
-                        continue
-                    elif re.fullmatch(maybe_module_fqn_pattern[3:], module_fqn):
+                for key, pattern in self._module_fqn_patterns:
+                    if self._module_fqn_matcher.fullmatch(pattern, module_fqn):
                         # we'll apply the config for first fully matched pattern
-                        c = module_fqn_to_config[maybe_module_fqn_pattern]
+                        c = module_fqn_to_config[key]
                         break
                 else:
                     # fallback to use default if no module specific

@@ -41,3 +41,7 @@ You can quantize your own huggingface model with torchao, e.g. [transformers](ht
     ```
 
 Alternatively, you can use the [TorchAO Quantization space](https://huggingface.co/spaces/medmekk/TorchAO_Quantization) for quantizing models with a simple UI.
+
+## Per-Module Configs
+
+For `ModuleFqnToConfig` checkpoints, `module_fqn_to_config` keys that start with `re:` are matched with a restricted regular expression syntax so that loading a checkpoint stays bounded in time and memory. Patterns may be at most 512 characters, may not apply a repeat (`*`, `+`, `{m,n}`) to a group that already contains one (an optional `?` is allowed), and may not use recursion, backreferences, `\g`, `\p`, fuzzy matching, verbose mode or nested character sets. Counted repeats are expanded when checking the size limit. vLLM rejects a checkpoint that uses an unsupported pattern, and also one whose patterns take too long to match.
