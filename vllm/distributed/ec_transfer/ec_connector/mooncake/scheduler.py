@@ -30,7 +30,6 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.config import (
 from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     ControlClient,
     EventInbox,
-    make_cancel_transfer_request,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
@@ -133,7 +132,7 @@ class ECMooncakeScheduler:
                 try:
                     result = self._control_client.request(
                         addr,
-                        make_cancel_transfer_request(transfer_id),
+                        {"op": "cancel_transfer", "transfer_id": transfer_id},
                     )
                 except Exception as exc:
                     if error is None:

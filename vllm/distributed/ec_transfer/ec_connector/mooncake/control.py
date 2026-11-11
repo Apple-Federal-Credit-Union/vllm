@@ -194,10 +194,6 @@ def make_cancel_request(
     return request
 
 
-def make_cancel_transfer_request(transfer_id: str) -> ControlRequest:
-    return {"op": "cancel_transfer", "transfer_id": transfer_id}
-
-
 class EventInbox:
     """Receive Consumer readiness events without blocking the Scheduler.
 
