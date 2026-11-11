@@ -391,6 +391,15 @@ def _format_scheduler_value(value: object) -> str:
     return str(value)
 
 
+def _comment_text(value: object) -> str:
+    """Escape non-printable characters, including every YAML line break, so
+    the value stays inside a single `#` comment line."""
+    return "".join(
+        char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
+        for char in str(value)
+    )
+
+
 def _write_config(
     path: Path,
     *,
@@ -406,8 +415,8 @@ def _write_config(
     )
     header = (
         "# Generated from the initial recipe config after a vLLM parameter sweep.\n"
-        f"# Initial config: {source_path}\n"
-        f"# Selection objective: {objective}\n"
+        f"# Initial config: {_comment_text(source_path)}\n"
+        f"# Selection objective: {_comment_text(objective)}\n"
     )
     path.write_text(header + body, encoding="utf-8")
 
