@@ -24,6 +24,7 @@ import json
 from typing import Any
 
 from .content_parsers import STREAMABLE_PARSERS, process_field
+from .regex_budget import ResponseTemplateTimeoutError
 from .response_templates import (
     ResponseTemplate,
     ResponseTemplateField,
@@ -320,10 +321,14 @@ class ResponseParser:
         for kind, field in watch:
             # The watchlist only includes fields whose delimiter regex is set, so pattern is never None here.
             pattern = field.open_re if kind == "open" else field.close_re
-            if eos:
-                m = pattern.search(self._buffer, self._pos)
-            else:
-                m = pattern.search(self._buffer, self._pos, partial=True)
+            try:
+                if eos:
+                    m = pattern.search(self._buffer, self._pos)
+                else:
+                    m = pattern.search(self._buffer, self._pos, partial=True)
+            except ResponseTemplateTimeoutError:
+                # Past its regex budget, the template matches no more delimiters.
+                continue
             if m is None:
                 continue
             if not eos and (m.partial or self._can_grow(kind, field, m)):

@@ -28,6 +28,7 @@ from typing import Any
 import regex as re
 
 from .content_parsers import CONTENT_PARSERS, validate_transform_strings
+from .regex_budget import BoundedPattern, RegexBudget, ResponseTemplateTimeoutError
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ResponseTemplateField:
     name: str
+    budget: RegexBudget
     open_re: Any
     open_literals: list[str] | None
     open_literal_can_extend: bool
@@ -53,9 +55,12 @@ class ResponseTemplateField:
 
 @dataclass
 class ResponseTemplate:
+    """A loaded `response_template`. Its patterns share one `RegexBudget`, so load
+    a template per request rather than sharing one across requests."""
     defaults: dict
     fields: dict[str, ResponseTemplateField]
     start_anchor_re: Any
+    budget: RegexBudget
     implicit: str | None = None
     start_anchor_literals: list[str] | None = None
 
@@ -65,8 +70,11 @@ class ResponseTemplate:
         or <think> tokens in the prefill. Therefore, we take the whole chat as input, but truncate to the start
         of the most recent assistant message, which can include tokens from the template as well as the output."""
         last_end: int | None = None
-        for m in self.start_anchor_re.finditer(text):
-            last_end = m.end()
+        try:
+            for m in self.start_anchor_re.finditer(text):
+                last_end = m.end()
+        except ResponseTemplateTimeoutError:
+            return text
         if last_end is None:
             kind = "start_anchor" if self.start_anchor_literals is not None else "start_anchor_pattern"
             logger.info(
@@ -78,7 +86,7 @@ class ResponseTemplate:
         return text[last_end:]
 
 
-def _compile_anchor(scope: str, field: dict, literal_key: str, pattern_key: str) -> tuple[Any, list[str] | None, bool]:
+def _compile_anchor(scope: str, field: dict, literal_key: str, pattern_key: str, budget: RegexBudget) -> tuple[BoundedPattern | None, list[str] | None, bool]:
     """Compile a region's start/end anchor. An anchor can be:
 
     - a regex (`pattern_key`),
@@ -92,7 +100,7 @@ def _compile_anchor(scope: str, field: dict, literal_key: str, pattern_key: str)
 
     Returns `(compiled_re, literals, can_extend)`:
 
-    - `compiled_re`: the compiled pattern.
+    - `compiled_re`: the compiled pattern, searched under `budget`.
     - `literals`: the literal strings, or `None` for a regex anchor.
     - `can_extend`: `True` iff one literal is a strict prefix of another, in which case a match at the
       buffer edge could still be lengthened by future input.
@@ -117,10 +125,10 @@ def _compile_anchor(scope: str, field: dict, literal_key: str, pattern_key: str)
         ordered = sorted(literals, key=len, reverse=True)
         can_extend = any(a != b and a.startswith(b) for a in literals for b in literals)
         pattern = "|".join(re.escape(s) for s in ordered)
-        return re.compile(pattern, re.DOTALL), literals, can_extend
+        return budget.compile(pattern, re.DOTALL), literals, can_extend
     if pattern_key in field:
         try:
-            return re.compile(field[pattern_key], re.DOTALL), None, False
+            return budget.compile(field[pattern_key], re.DOTALL), None, False
         except re.error as e:
             raise ValueError(f"{scope}: invalid {pattern_key} regex: {e}") from e
     return None, None, False
@@ -144,7 +152,7 @@ def _validate_template_shape(spec: dict) -> None:
         raise ValueError("response_template.fields must be a non-empty dict")
 
 
-def _build_field(name: str, field: dict) -> ResponseTemplateField:
+def _build_field(name: str, field: dict, budget: RegexBudget) -> ResponseTemplateField:
     """Validate a single field spec and compile it into a `ResponseTemplateField`."""
 
     _ALLOWED_FIELD_KEYS = {
@@ -168,8 +176,8 @@ def _build_field(name: str, field: dict) -> ResponseTemplateField:
     content = field.get("content", "text")
     if content not in CONTENT_PARSERS:
         raise ValueError(f"{scope}: unknown content parser '{content}'. Available: {sorted(CONTENT_PARSERS)}")
-    open_re, open_literals, open_literal_can_extend = _compile_anchor(scope, field, "open", "open_pattern")
-    close_re, close_literals, close_literal_can_extend = _compile_anchor(scope, field, "close", "close_pattern")
+    open_re, open_literals, open_literal_can_extend = _compile_anchor(scope, field, "open", "open_pattern", budget)
+    close_re, close_literals, close_literal_can_extend = _compile_anchor(scope, field, "close", "close_pattern", budget)
     join = field.get("join")
     if join is not None and not isinstance(join, str):
         raise ValueError(f"{scope}: 'join' must be a string, got {type(join).__name__}")
@@ -200,6 +208,7 @@ def _build_field(name: str, field: dict) -> ResponseTemplateField:
             )
     return ResponseTemplateField(
         name=name,
+        budget=budget,
         open_re=open_re,
         open_literals=open_literals,
         open_literal_can_extend=open_literal_can_extend,
@@ -221,7 +230,8 @@ def load_response_template(spec: dict | ResponseTemplate) -> ResponseTemplate:
         return spec
     _validate_template_shape(spec)
 
-    fields = {name: _build_field(name, raw) for name, raw in spec["fields"].items()}
+    budget = RegexBudget()
+    fields = {name: _build_field(name, raw, budget) for name, raw in spec["fields"].items()}
     # A field without an open anchor is the implicit-open / leftover sink; at most one is allowed.
     implicit_fields = [name for name, field in fields.items() if field.open_re is None]
     if len(implicit_fields) > 1:
@@ -231,7 +241,7 @@ def load_response_template(spec: dict | ResponseTemplate) -> ResponseTemplate:
         )
 
     start_anchor_re, start_anchor_literals, _ = _compile_anchor(
-        "response_template", spec, "start_anchor", "start_anchor_pattern"
+        "response_template", spec, "start_anchor", "start_anchor_pattern", budget
     )
     if start_anchor_re is None:
         raise ValueError("response_template must define 'start_anchor' or 'start_anchor_pattern'.")
@@ -241,6 +251,7 @@ def load_response_template(spec: dict | ResponseTemplate) -> ResponseTemplate:
         fields=fields,
         implicit=implicit_fields[0] if implicit_fields else None,
         start_anchor_re=start_anchor_re,
+        budget=budget,
         start_anchor_literals=start_anchor_literals,
     )
 

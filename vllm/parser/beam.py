@@ -21,6 +21,7 @@ from vllm.parser.abstract_parser import (
     structured_outputs_to_format,
 )
 from vllm.parser.chat_parsing import ResponseParser
+from vllm.parser.chat_parsing.regex_budget import ResponseTemplateTimeoutError
 from vllm.parser.chat_parsing.response_templates import ResponseTemplate
 from vllm.parser.response_template import (
     CONTENT_FIELD,
@@ -57,7 +58,10 @@ def _named_tool(request: ChatCompletionRequest | ResponsesRequest) -> str:
 
 def _starts_message(template: ResponseTemplate, prefix: str) -> bool:
     """Whether output after `prefix` starts the assistant message."""
-    ends = [match.end() for match in template.start_anchor_re.finditer(prefix)]
+    try:
+        ends = [match.end() for match in template.start_anchor_re.finditer(prefix)]
+    except ResponseTemplateTimeoutError:
+        return False
     return bool(ends) and ends[-1] == len(prefix)
 
 

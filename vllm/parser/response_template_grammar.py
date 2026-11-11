@@ -17,6 +17,7 @@ except ImportError:  # Python 3.10
     import sre_parse as _parser
 
 from vllm.parser.chat_parsing.content_parsers import parse_content
+from vllm.parser.chat_parsing.regex_budget import BoundedPattern, RegexBudget
 from vllm.parser.chat_parsing.response_parser import _schema_types
 from vllm.parser.chat_parsing.response_templates import (
     ResponseTemplate,
@@ -223,7 +224,7 @@ def _openers(
 
 
 def _continuing(
-    literals: list[str] | None, anchors: list[str] | None, opener: re.Pattern
+    literals: list[str] | None, anchors: list[str] | None, opener: BoundedPattern
 ) -> list[str] | None:
     """Keep anchor continuations only where the parser finds the opener."""
     if not literals or not anchors:
@@ -247,14 +248,17 @@ def _escape(text: str) -> str:
 
 
 def _call_opener(
-    opener: tuple[str, str, str], name: str, message_start: list[str] | None
+    opener: tuple[str, str, str],
+    name: str,
+    message_start: list[str] | None,
+    budget: RegexBudget,
 ) -> str:
     before, _, after = opener
     if message_start is not None and before:
         literals = _literals(before, message_start=True)
         # Text before a name inside a group is no pattern of its own.
         if literals:
-            literals = _continuing(literals, message_start, re.compile(before))
+            literals = _continuing(literals, message_start, budget.compile(before))
             before = "(?:" + "|".join(map(_escape, literals or ())) + ")"
     return before + name + after
 
@@ -363,10 +367,10 @@ def _literal_piece(literals: list[str], before: str = "") -> tuple[str, str, boo
     return either, f"{either}|{_endings(tuple(literals))}", True
 
 
-@lru_cache(maxsize=512)
 def _spells_closer(
     closers: tuple[str, ...],
     pieces: tuple[tuple[str, str, bool], ...],
+    budget: RegexBudget,
     *,
     repeats: bool = False,
 ) -> bool:
@@ -376,8 +380,8 @@ def _spells_closer(
     # Another call or an answer may follow the call's own closer.
     closed = "(?:" + "|".join(map(re.escape, closers)) + r")[\s\S]*"
     for index, (_, endings, holds) in enumerate(pieces):
-        ends = re.compile(endings)
-        rest = re.compile("".join(texts[index + 1 :]) + loop + closed, re.DOTALL)
+        ends = budget.compile(endings)
+        rest = budget.compile("".join(texts[index + 1 :]) + loop + closed, re.DOTALL)
         for closer in closers:
             if holds and ends.fullmatch(closer, partial=True):
                 return True
@@ -598,6 +602,7 @@ def _xml_arguments_format(
     strict: bool,
     closers: list[str],
     sorted_arguments: bool,
+    budget: RegexBudget,
 ) -> dict[str, Any] | None:
     if set(content_args) - {"tag_pattern", "value_parser", "merge_duplicates"}:
         return None
@@ -650,7 +655,7 @@ def _xml_arguments_format(
         _TEXT_PIECE,
         _literal_piece(ends),
     )
-    if _spells_closer(tuple(closers), pieces, repeats=True):
+    if _spells_closer(tuple(closers), pieces, budget, repeats=True):
         return None
 
     # Raw text has no escaping for a call closer, nor, where a value may end
@@ -706,14 +711,14 @@ def _xml_arguments_format(
         if any(closer in written for closer in closers):
             return None
         try:
-            return parse_content(written, "xml-inline", content_args)
+            return parse_content(written, "xml-inline", content_args, budget)
         except ValueError:
             return None
 
     def parameter(
         key: str, value: dict[str, Any], choices: list[str] | None, last: bool
     ) -> dict[str, Any] | None:
-        if not re.fullmatch(key_pattern, key) or any(
+        if not budget.compile(key_pattern).fullmatch(key) or any(
             list(read_back(b + key + m + "0" + e) or ()) != [key]
             for b in begins
             for m in middles
@@ -803,7 +808,7 @@ def _arguments_format(
 ) -> dict[str, Any] | None:
     closers = _closers(field) or []
     if field.content == "json" and not field.content_args:
-        if _spells_closer(tuple(closers), (_JSON_PIECE,)):
+        if _spells_closer(tuple(closers), (_JSON_PIECE,), field.budget):
             return None
         schema = parameters if strict else {"type": "object"}
         return _json_format(schema, closers)
@@ -814,6 +819,7 @@ def _arguments_format(
             strict=strict,
             closers=closers,
             sorted_arguments=sorted_arguments,
+            budget=field.budget,
         )
     return None
 
@@ -925,7 +931,7 @@ def tool_call_structural_tag(
     names = []
     for function in functions:
         name = function["name"]
-        if not re.fullmatch(opener[1], name):
+        if not field.budget.compile(opener[1]).fullmatch(name):
             raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
         names.append(_escape(name))
     if answer is not None:
@@ -943,7 +949,10 @@ def tool_call_structural_tag(
         return _one_of(
             [
                 _sequence(
-                    {"type": "regex", "pattern": _call_opener(opener, name, start)},
+                    {
+                        "type": "regex",
+                        "pattern": _call_opener(opener, name, start, field.budget),
+                    },
                     function_arguments,
                 )
                 for name, function_arguments in zip(names, arguments)

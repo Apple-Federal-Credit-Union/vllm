@@ -26,21 +26,23 @@ from typing import Any
 
 import regex as re
 
+from .regex_budget import RegexBudget
 
-def _text(text: str, args: dict) -> str:
+
+def _text(text: str, args: dict, budget: RegexBudget) -> str:
     return text.strip() if args.get("strip", True) else text
 
 
-def _int(text: str, args: dict) -> int:
-    return int(_text(text, args))
+def _int(text: str, args: dict, budget: RegexBudget) -> int:
+    return int(_text(text, args, budget))
 
 
-def _float(text: str, args: dict) -> float:
-    return float(_text(text, args))
+def _float(text: str, args: dict, budget: RegexBudget) -> float:
+    return float(_text(text, args, budget))
 
 
-def _bool(text: str, args: dict) -> bool:
-    return _text(text, args).lower() in ("true", "1")
+def _bool(text: str, args: dict, budget: RegexBudget) -> bool:
+    return _text(text, args, budget).lower() in ("true", "1")
 
 
 # Sentinel characters for lax-JSON string pre-extraction — ASCII control chars
@@ -48,7 +50,7 @@ def _bool(text: str, args: dict) -> bool:
 _LAX_OPEN, _LAX_CLOSE = "\x01", "\x02"
 
 
-def _json(text: str, args: dict) -> Any:
+def _json(text: str, args: dict, budget: RegexBudget) -> Any:
     """JSON parser with optional dialect knobs for LLM-emitted quirks.
 
     `args`:
@@ -72,7 +74,7 @@ def _json(text: str, args: dict) -> Any:
             captured.append(m.group(1))
             return f"{_LAX_OPEN}{len(captured) - 1}{_LAX_CLOSE}"
 
-        working = re.sub(pattern, _capture, working, flags=re.DOTALL)
+        working = budget.compile(pattern, re.DOTALL).sub(_capture, working)
 
     if unquoted_keys:
         working = re.sub(r"(?<=[{,])(\w+):", r'"\1":', working)
@@ -84,7 +86,7 @@ def _json(text: str, args: dict) -> Any:
         return json.loads(working)
     except json.JSONDecodeError as e:
         if args.get("allow_non_json"):
-            return _text(text, args)
+            return _text(text, args, budget)
         if working == text:
             raise ValueError(f"json parser could not parse region as JSON.\nContent: {text!r}\nError: {e}") from e
         raise ValueError(
@@ -93,13 +95,13 @@ def _json(text: str, args: dict) -> Any:
         ) from e
 
 
-def _sub_parse(raw: str, value_parser: dict | None) -> Any:
+def _sub_parse(raw: str, value_parser: dict | None, budget: RegexBudget) -> Any:
     if value_parser is None:
         return raw
-    return parse_content(raw, value_parser.get("name", "text"), value_parser.get("args", {}))
+    return parse_content(raw, value_parser.get("name", "text"), value_parser.get("args", {}), budget)
 
 
-def _xml_inline(text: str, args: dict) -> dict:
+def _xml_inline(text: str, args: dict, budget: RegexBudget) -> dict:
     """Parse shallow XML-ish tags into a dict. `tag_pattern` regex must have named
     groups `key` and `value`. Optional `value_parser` recurses; `merge_duplicates`
     collects duplicate keys into a list."""
@@ -110,12 +112,12 @@ def _xml_inline(text: str, args: dict) -> dict:
     merge = args.get("merge_duplicates", False)
 
     out: dict[str, Any] = {}
-    for m in re.finditer(tag_pattern, text, flags=re.DOTALL):
+    for m in budget.compile(tag_pattern, re.DOTALL).finditer(text):
         groups = m.groupdict()
         key = groups.get("key")
         if key is None:
             raise ValueError(f"xml-inline: tag_pattern must have a named group 'key'. Pattern: {tag_pattern}")
-        value = _sub_parse(groups.get("value", ""), value_parser)
+        value = _sub_parse(groups.get("value", ""), value_parser, budget)
         if key in out and merge:
             if not isinstance(out[key], list):
                 out[key] = [out[key]]
@@ -125,7 +127,7 @@ def _xml_inline(text: str, args: dict) -> dict:
     return out
 
 
-def _kv_lines(text: str, args: dict) -> dict:
+def _kv_lines(text: str, args: dict, budget: RegexBudget) -> dict:
     """Parse line-delimited `key<sep>value` pairs into a dict."""
     line_sep = args.get("line_sep", "\n")
     kv_sep = args.get("kv_sep", ":")
@@ -133,12 +135,12 @@ def _kv_lines(text: str, args: dict) -> dict:
 
     out: dict[str, Any] = {}
     for line in text.split(line_sep):
-        line = _text(line, args)
+        line = _text(line, args, budget)
         if not line or kv_sep not in line:
             continue
         k, v = line.split(kv_sep, 1)
-        k, v = _text(k, args), _text(v, args)
-        out[k] = _sub_parse(v, value_parser)
+        k, v = _text(k, args, budget), _text(v, args, budget)
+        out[k] = _sub_parse(v, value_parser, budget)
     return out
 
 
@@ -160,8 +162,9 @@ CONTENT_PARSERS = {
 STREAMABLE_PARSERS = frozenset({"text", "int", "float", "bool"})
 
 
-def parse_content(text: str, name: str, args: dict) -> Any:
-    return CONTENT_PARSERS[name](text, args)
+def parse_content(text: str, name: str, args: dict, budget: RegexBudget) -> Any:
+    """Parse `text` with content parser `name`, running template regexes under `budget`."""
+    return CONTENT_PARSERS[name](text, args, budget)
 
 
 _PLACEHOLDER = re.compile(r"\{(\w+(?:\.\w+)*)\}")
@@ -224,7 +227,7 @@ def process_field(body: str, field, captures: dict) -> Any:
     keys unpacked into the template scope, alongside any regex captures).
 
     `field` is a `spec.Field`; typed via duck-typing to avoid a cyclic import."""
-    value = parse_content(body, field.content, field.content_args)
+    value = parse_content(body, field.content, field.content_args, field.budget)
     if field.transform is None:
         return value
     if field.transform_each:
