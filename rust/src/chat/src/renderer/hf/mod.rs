@@ -638,11 +638,18 @@ fn to_template_tools(tools: &[ChatTool]) -> Vec<TemplateTool> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::os::unix::io::FromRawFd;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     use expect_test::expect;
     use serde_json::Value;
+    use serial_test::serial;
     use vllm_text::Prompt;
-    use vllm_text::backend::hf::{HfSpecialTokens, NamedSpecialToken};
+    use vllm_text::backend::hf::{HfSpecialTokens, NamedSpecialToken, ResolvedModelFiles};
 
     use super::{ChatTemplateContentFormatOption, HfChatRenderer, MultimodalRenderInfo};
     use crate::EffortValue;
@@ -1784,5 +1791,291 @@ mod tests {
             hello<|im_end|>
         "#]]
         .assert_eq(&rendered);
+    }
+
+    /// Workload `only_request_templates_have_a_fuel_budget` already shows
+    /// exceeds the default request-template fuel (`VLLM_CHAT_TEMPLATE_FUEL`
+    /// unset). The model template must stop with that same error.
+    const FUEL_EXCEEDING_TEMPLATE: &str =
+        "{% for m in messages %}{% for _ in range(10) %}{{ m.content }}{% endfor %}{% endfor %}";
+
+    fn fuel_exceeding_request() -> ChatRequest {
+        sample_request((0..20_000).map(|_| ChatMessage::text(ChatRole::User, "x")).collect())
+    }
+
+    fn assert_fuel_exhausted(result: Result<crate::RenderedPrompt>) {
+        match result {
+            Err(Error::ChatTemplate(message)) if message.contains("exceeded its fuel budget") => {}
+            Err(error) => panic!("expected fuel exhaustion, got {error:?}"),
+            Ok(rendered) => {
+                let len = rendered.prompt.into_text().map(|text| text.len()).unwrap_or(0);
+                panic!(
+                    "chat template render finished without exhausting its fuel budget \
+                     (output len {len})"
+                )
+            }
+        }
+    }
+
+    fn write_model_file(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    /// Load the HF renderer the way model startup does: tokenizer config,
+    /// an adjacent template file, and `--chat-template` all end in
+    /// `HfChatRenderer::load`.
+    fn load_model_renderer(dir: &Path, options: crate::LoadModelBackendsOptions) -> HfChatRenderer {
+        write_model_file(dir, "config.json", r#"{"model_type":"qwen2"}"#);
+        write_model_file(dir, "tokenizer.json", "{}");
+        let files =
+            futures::executor::block_on(ResolvedModelFiles::new(dir.to_str().unwrap(), None))
+                .unwrap();
+        HfChatRenderer::load(&files, options, None).unwrap()
+    }
+
+    fn renderer_with_tokenizer_template(template: &str) -> (tempfile::TempDir, HfChatRenderer) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({"chat_template": template});
+        write_model_file(dir.path(), "tokenizer_config.json", &config.to_string());
+        let renderer = load_model_renderer(dir.path(), crate::LoadModelBackendsOptions::default());
+        (dir, renderer)
+    }
+
+    #[test]
+    fn tokenizer_config_chat_template_exhausts_instruction_fuel() {
+        let (_dir, renderer) = renderer_with_tokenizer_template(FUEL_EXCEEDING_TEMPLATE);
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    #[test]
+    fn empty_chat_template_file_still_fuel_limits_tokenizer_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({"chat_template": FUEL_EXCEEDING_TEMPLATE});
+        write_model_file(dir.path(), "tokenizer_config.json", &config.to_string());
+        write_model_file(dir.path(), "chat_template.jinja", "\n");
+        let renderer = load_model_renderer(dir.path(), crate::LoadModelBackendsOptions::default());
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    #[test]
+    fn chat_template_jinja_file_exhausts_instruction_fuel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_file(
+            dir.path(),
+            "tokenizer_config.json",
+            r#"{"chat_template":"{{ raise_exception('decoy template') }}"}"#,
+        );
+        write_model_file(dir.path(), "chat_template.jinja", FUEL_EXCEEDING_TEMPLATE);
+        let renderer = load_model_renderer(dir.path(), crate::LoadModelBackendsOptions::default());
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    #[test]
+    fn chat_template_json_file_exhausts_instruction_fuel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_file(
+            dir.path(),
+            "tokenizer_config.json",
+            r#"{"chat_template":"{{ raise_exception('decoy template') }}"}"#,
+        );
+        let file = serde_json::json!({"chat_template": FUEL_EXCEEDING_TEMPLATE});
+        write_model_file(dir.path(), "chat_template.json", &file.to_string());
+        let renderer = load_model_renderer(dir.path(), crate::LoadModelBackendsOptions::default());
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    #[test]
+    fn configured_chat_template_string_exhausts_instruction_fuel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_file(
+            dir.path(),
+            "tokenizer_config.json",
+            r#"{"chat_template":"{{ raise_exception('decoy template') }}"}"#,
+        );
+        let renderer = load_model_renderer(
+            dir.path(),
+            crate::LoadModelBackendsOptions {
+                chat_template: Some(FUEL_EXCEEDING_TEMPLATE.to_string()),
+                ..crate::LoadModelBackendsOptions::default()
+            },
+        );
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    #[test]
+    fn configured_chat_template_path_exhausts_instruction_fuel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_file(
+            dir.path(),
+            "tokenizer_config.json",
+            r#"{"chat_template":"{{ raise_exception('decoy template') }}"}"#,
+        );
+        // Keep the operator file outside the model dir so discovery does not
+        // treat it as the model's adjacent template.
+        let outside = tempfile::tempdir().unwrap();
+        let template_path = outside.path().join("operator-template.jinja");
+        std::fs::write(&template_path, FUEL_EXCEEDING_TEMPLATE).unwrap();
+        let renderer = load_model_renderer(
+            dir.path(),
+            crate::LoadModelBackendsOptions {
+                chat_template: Some(template_path.to_str().unwrap().to_string()),
+                ..crate::LoadModelBackendsOptions::default()
+            },
+        );
+        assert_fuel_exhausted(renderer.render(&fuel_exceeding_request()));
+    }
+
+    /// Restores `VLLM_CHAT_TEMPLATE_FUEL` even when the test panics.
+    struct FuelEnvGuard(Option<OsString>);
+
+    impl FuelEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("VLLM_CHAT_TEMPLATE_FUEL");
+            // SAFETY: this test is `serial` and nextest runs it in its own
+            // process. The variable is restored on drop.
+            unsafe { std::env::set_var("VLLM_CHAT_TEMPLATE_FUEL", value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for FuelEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("VLLM_CHAT_TEMPLATE_FUEL", value),
+                    None => std::env::remove_var("VLLM_CHAT_TEMPLATE_FUEL"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial(vllm_chat_template_fuel)]
+    fn fuel_env_limits_tokenizer_config_template() {
+        let _guard = FuelEnvGuard::set("1000");
+        let configured = super::template::request_template_fuel(
+            std::env::var_os("VLLM_CHAT_TEMPLATE_FUEL").as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            configured,
+            Some(1000),
+            "VLLM_CHAT_TEMPLATE_FUEL was not visible to the renderer"
+        );
+        let template = "{% for _ in range(2000) %}x{% endfor %}";
+        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hi")]);
+
+        // The same budget already stops a request override. This guards the
+        // loop size: if 2000 iterations fit in 1000 fuel, fail here.
+        request.chat_options.chat_template = Some(template.to_string());
+        let override_renderer = HfChatRenderer::new(
+            Some("{{ messages[0].content }}".to_string()),
+            HashMap::new(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap()
+        .with_trust_request_chat_template(true);
+        assert_fuel_exhausted(override_renderer.render(&request));
+
+        request.chat_options.chat_template = None;
+        let (_dir, renderer) = renderer_with_tokenizer_template(template);
+        assert_fuel_exhausted(renderer.render(&request));
+    }
+
+    /// Write to a process fd. libtest captures `print!`, so the child uses this
+    /// to report an outcome the parent can read if the process is killed.
+    fn write_process_fd(fd: i32, message: &str) {
+        // SAFETY: `fd` is stdout (1) or stderr (2). The file is forgotten so
+        // dropping it does not close the process fd.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let _ = file.write_all(message.as_bytes());
+        let _ = file.flush();
+        std::mem::forget(file);
+    }
+
+    fn render_nested_max_range_template() -> Result<crate::RenderedPrompt> {
+        // minijinja 2.24 allows `range` up to 100_000 items. Two nested loops
+        // stay under that cap, and their product does not return without fuel.
+        let template =
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% endfor %}{% endfor %}";
+        let (_dir, renderer) = renderer_with_tokenizer_template(template);
+        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hi")]);
+        renderer.render(&request)
+    }
+
+    #[test]
+    fn nested_max_range_model_template_returns_fuel_error() {
+        // Run the render in a child process so a template with no fuel budget
+        // can be killed without pinning a thread in this test process.
+        if std::env::var_os("VLLM_NESTED_TEMPLATE_CHILD").is_some() {
+            write_process_fd(2, "child-entered\n");
+            match render_nested_max_range_template() {
+                Err(Error::ChatTemplate(message))
+                    if message.contains("exceeded its fuel budget") =>
+                {
+                    write_process_fd(1, "fuel-ok\n");
+                    std::process::exit(0);
+                }
+                Ok(_) => {
+                    write_process_fd(2, "rendered without exhausting its fuel budget\n");
+                    std::process::exit(2);
+                }
+                Err(error) => {
+                    write_process_fd(2, &format!("render error: {error:?}\n"));
+                    std::process::exit(3);
+                }
+            }
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "renderer::hf::tests::nested_max_range_model_template_returns_fuel_error",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("VLLM_NESTED_TEMPLATE_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if !stderr.contains("child-entered") {
+                    panic!(
+                        "child did not reach the model template render\nstdout: {stdout}\nstderr: {stderr}"
+                    );
+                }
+                panic!(
+                    "model chat template render did not return within 5s\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        if status.code() == Some(0) && stdout.contains("fuel-ok") {
+            return;
+        }
+        panic!("nested model template child exited {status}: {stderr}{stdout}");
     }
 }
