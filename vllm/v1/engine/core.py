@@ -1934,6 +1934,23 @@ class EngineCoreProc(EngineCore):
             coordinator_output_address=self.addresses.coordinator_output,
         )
 
+    def _record_queued_lora_load(self, args: Sequence[Any]) -> None:
+        """Bump prefix-cache identity for an add_lora utility before it runs.
+
+        ``EngineCore.add_lora`` consumes this bump when the core loop applies
+        the load, so the generation advances once.
+        """
+        if not args:
+            return
+        try:
+            (lora_request,) = self._convert_msgspec_args(self.add_lora, (args[0],))
+        except Exception:
+            logger.exception(
+                "Could not record queued LoRA load for prefix-cache identity"
+            )
+            return
+        record_lora_load(lora_request, queued=True)
+
     def process_input_sockets(
         self,
         input_addresses: list[str],
@@ -2030,6 +2047,12 @@ class EngineCoreProc(EngineCore):
                                 client_idx, call_id, args[0]
                             )
                             continue
+                        if method == "add_lora":
+                            # Hashing runs on this thread, before the core loop
+                            # applies the load. Record the new generation now so
+                            # a request queued behind this utility cannot reuse
+                            # blocks computed with the previous weights.
+                            self._record_queued_lora_load(args)
                     else:
                         request = generic_decoder.decode(data_frames)
 

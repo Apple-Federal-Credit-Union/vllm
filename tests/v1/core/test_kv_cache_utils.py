@@ -922,6 +922,70 @@ def test_generate_block_hash_extra_keys_different_prompt_embeds():
     assert extra_keys1 != extra_keys2
 
 
+@pytest.fixture
+def isolated_lora_generations():
+    saved = dict(kv_cache_utils._lora_generations)
+    kv_cache_utils._lora_generations.clear()
+    yield
+    kv_cache_utils._lora_generations.clear()
+    kv_cache_utils._lora_generations.update(saved)
+
+
+def _lora_block_extra_keys(lora_request: LoRARequest) -> tuple[Any, ...] | None:
+    request = make_request("lora-hash", [0, 1, 2])
+    request.lora_request = lora_request
+    extra_keys, _ = generate_block_hash_extra_keys(request, 0, 3, 0)
+    return extra_keys
+
+
+def test_queued_lora_reload_is_visible_before_apply(isolated_lora_generations):
+    """A load queued on the input thread must change hashes before add_lora runs.
+
+    add_lora later consumes that bump. Hashing in between must already use the
+    new generation, and applying the load must not advance it again.
+    """
+    lora = LoRARequest(
+        lora_name="reload-race", lora_int_id=1, lora_path="/adapters/race"
+    )
+    kv_cache_utils.record_lora_load(lora)
+    before = _lora_block_extra_keys(lora)
+
+    kv_cache_utils.record_lora_load(lora, queued=True)
+    # preprocess_add_request records the request before hashing.
+    kv_cache_utils.record_lora_load(lora)
+    while_queued = _lora_block_extra_keys(lora)
+    kv_cache_utils.record_lora_load(lora, explicit_load=True)
+    after_apply = _lora_block_extra_keys(lora)
+
+    # A second reload queued before its apply must advance once more, and
+    # both applies must consume those bumps rather than add their own.
+    kv_cache_utils.record_lora_load(lora, queued=True)
+    kv_cache_utils.record_lora_load(lora)
+    second_queued = _lora_block_extra_keys(lora)
+    kv_cache_utils.record_lora_load(lora, explicit_load=True)
+    after_second_apply = _lora_block_extra_keys(lora)
+
+    assert before == (("lora", "reload-race", "/adapters/race"),)
+    assert while_queued == (("lora", "reload-race", "/adapters/race", 1),)
+    assert after_apply == while_queued
+    assert second_queued == (("lora", "reload-race", "/adapters/race", 2),)
+    assert after_second_apply == second_queued
+
+
+def test_each_applied_lora_reload_bumps_when_not_queued(isolated_lora_generations):
+    """In-process add_lora has no earlier queued bump, so each reload counts."""
+    lora = LoRARequest(
+        lora_name="reload-apply", lora_int_id=1, lora_path="/adapters/apply"
+    )
+    kv_cache_utils.record_lora_load(lora, explicit_load=True)
+    first = _lora_block_extra_keys(lora)
+    kv_cache_utils.record_lora_load(lora, explicit_load=True)
+    second = _lora_block_extra_keys(lora)
+
+    assert first == (("lora", "reload-apply", "/adapters/apply"),)
+    assert second == (("lora", "reload-apply", "/adapters/apply", 1),)
+
+
 def test_generate_block_hash_extra_keys_lora():
     request = make_request(
         request_id="0",

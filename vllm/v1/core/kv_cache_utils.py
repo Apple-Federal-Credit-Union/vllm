@@ -589,12 +589,19 @@ def _gen_mm_extra_hash_keys(
     return extra_keys, curr_mm_idx
 
 
-# (lora_name, lora_path) -> (reload generation, last seen lora_int_id).
-_lora_generations: dict[tuple[str, str], tuple[int, int]] = {}
+# (lora_name, lora_path) -> (generation, lora_int_id, pending explicit loads).
+# Pending loads were bumped when queued so later hashes see them; add_lora
+# consumes one instead of bumping again.
+_lora_generations: dict[tuple[str, str], tuple[int, int, int]] = {}
 _lora_generations_lock = threading.Lock()
 
 
-def record_lora_load(lora_request: LoRARequest, explicit_load: bool = False) -> None:
+def record_lora_load(
+    lora_request: LoRARequest,
+    explicit_load: bool = False,
+    *,
+    queued: bool = False,
+) -> None:
     """Record that the weights behind a LoRA name and path may be (re)read.
 
     Re-reading an adapter from an unchanged path may pick up new weights, so
@@ -604,29 +611,41 @@ def record_lora_load(lora_request: LoRARequest, explicit_load: bool = False) -> 
     under an earlier generation stop matching new requests.
 
     Must be called before the weights are loaded and before requests that
-    use them are hashed.
+    use them are hashed. Pass ``queued=True`` when an ``add_lora`` utility is
+    accepted on the input thread, before requests that arrive behind it are
+    hashed. The matching ``add_lora`` on the core loop then calls this with
+    ``explicit_load=True`` and consumes the queued bump.
 
     Args:
         lora_request: The adapter being loaded or requested.
         explicit_load: Whether this is an adapter load (``add_lora``) rather
             than a request that uses the adapter.
+        queued: Whether this explicit load was observed before it runs.
 
     """
+    if queued:
+        explicit_load = True
     key = (lora_request.lora_name, lora_request.lora_path)
     lora_int_id = lora_request.lora_int_id
     with _lora_generations_lock:
         entry = _lora_generations.get(key)
         if entry is None:
             generation = int(lora_request.load_inplace)
+            pending = 1 if queued else 0
         else:
-            generation, seen_lora_int_id = entry
-            if (
+            generation, seen_lora_int_id, pending = entry
+            if explicit_load and not queued and pending > 0:
+                # This load was already counted when it was queued.
+                pending -= 1
+            elif (
                 explicit_load
                 or lora_request.load_inplace
                 or lora_int_id != seen_lora_int_id
             ):
                 generation += 1
-        _lora_generations[key] = (generation, lora_int_id)
+                if queued:
+                    pending += 1
+        _lora_generations[key] = (generation, lora_int_id, pending)
 
 
 def _gen_lora_extra_hash_keys(request: Request) -> list[tuple[Any, ...]]:
@@ -649,7 +668,10 @@ def _gen_lora_extra_hash_keys(request: Request) -> list[tuple[Any, ...]]:
     if not lora_request:
         return []
     key = (lora_request.lora_name, lora_request.lora_path)
-    entry = _lora_generations.get(key)
+    # Same lock as record_lora_load. A reload can be recorded on the input
+    # thread while the core thread hashes blocks for another request.
+    with _lora_generations_lock:
+        entry = _lora_generations.get(key)
     if entry is None or entry[0] == 0:
         return [("lora", *key)]
     return [("lora", *key, entry[0])]
