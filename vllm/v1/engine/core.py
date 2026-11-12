@@ -62,6 +62,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
+    record_lora_load,
     resolve_cache_hit_alignment_tokens,
     resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
@@ -1086,6 +1087,7 @@ class EngineCore:
         return self.collective_rpc("compute_weight_checksums")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
+        record_lora_load(lora_request, explicit_load=True)
         return self.model_executor.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
@@ -1137,6 +1139,8 @@ class EngineCore:
                 request.mm_features
             )
 
+        if request.lora_request is not None:
+            record_lora_load(request.lora_request)
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.use_structured_output:
             # Note on thread safety: no race condition.

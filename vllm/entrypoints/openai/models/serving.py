@@ -212,16 +212,6 @@ class OpenAIServingModels:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            previous = self.lora_requests.get(lora_name)
-            if previous is not None and previous.lora_path == lora_path:
-                logger.warning(
-                    "Reloaded LoRA adapter '%s' in place from the same path '%s'. "
-                    "Prefix-cache blocks computed with its previous weights are "
-                    "not invalidated; load changed weights from a new path to "
-                    "avoid reusing them.",
-                    lora_name,
-                    lora_path,
-                )
             # Reset load_inplace before caching so the flag does not leak to
             # subsequent generate requests.
             lora_request.load_inplace = False
