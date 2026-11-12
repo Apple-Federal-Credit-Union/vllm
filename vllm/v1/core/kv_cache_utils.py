@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import (
@@ -21,6 +22,7 @@ from typing import (
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv
@@ -587,24 +589,70 @@ def _gen_mm_extra_hash_keys(
     return extra_keys, curr_mm_idx
 
 
-def _gen_lora_extra_hash_keys(request: Request) -> list[tuple[str, str, str]]:
+# (lora_name, lora_path) -> (reload generation, last seen lora_int_id).
+_lora_generations: dict[tuple[str, str], tuple[int, int]] = {}
+_lora_generations_lock = threading.Lock()
+
+
+def record_lora_load(lora_request: LoRARequest, explicit_load: bool = False) -> None:
+    """Record that the weights behind a LoRA name and path may be (re)read.
+
+    Re-reading an adapter from an unchanged path may pick up new weights, so
+    the adapter gets a new prefix-cache identity whenever it is loaded again:
+    through an explicit load of an already seen name and path, with
+    ``load_inplace``, or under a different ``lora_int_id``. Blocks hashed
+    under an earlier generation stop matching new requests.
+
+    Must be called before the weights are loaded and before requests that
+    use them are hashed.
+
+    Args:
+        lora_request: The adapter being loaded or requested.
+        explicit_load: Whether this is an adapter load (``add_lora``) rather
+            than a request that uses the adapter.
+
+    """
+    key = (lora_request.lora_name, lora_request.lora_path)
+    lora_int_id = lora_request.lora_int_id
+    with _lora_generations_lock:
+        entry = _lora_generations.get(key)
+        if entry is None:
+            generation = int(lora_request.load_inplace)
+        else:
+            generation, seen_lora_int_id = entry
+            if (
+                explicit_load
+                or lora_request.load_inplace
+                or lora_int_id != seen_lora_int_id
+            ):
+                generation += 1
+        _lora_generations[key] = (generation, lora_int_id)
+
+
+def _gen_lora_extra_hash_keys(request: Request) -> list[tuple[Any, ...]]:
     """Generate extra keys related to LoRA for block hash computation.
 
     The adapter path is included so that re-pointing a LoRA name at a different
-    adapter does not reuse KV computed with the previous one.
+    adapter does not reuse KV computed with the previous one. Once an adapter
+    has been reloaded (see `record_lora_load`), its reload generation is
+    included as well so KV computed with the previous weights is not reused.
 
     Args:
         request: The request object.
 
     Returns:
-        Return the LoRA name and path of the request if it is a LoRA request.
-        Return empty list otherwise.
+        Return the LoRA name, path and, after a reload, the reload generation
+        of the request if it is a LoRA request. Return empty list otherwise.
 
     """
     lora_request = request.lora_request
     if not lora_request:
         return []
-    return [("lora", lora_request.lora_name, lora_request.lora_path)]
+    key = (lora_request.lora_name, lora_request.lora_path)
+    entry = _lora_generations.get(key)
+    if entry is None or entry[0] == 0:
+        return [("lora", *key)]
+    return [("lora", *key, entry[0])]
 
 
 def _gen_prompt_embeds_extra_hash_keys(
