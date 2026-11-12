@@ -38,6 +38,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from vllm.platforms import current_platform
+from vllm.transformers_utils.utils import read_safetensors_header
 from vllm.utils.hashing import safe_hash
 
 SOCKET_NAME_TEMPLATE = "vllm_weight_cache_{gpu_uuid}{role}.sock"
@@ -275,9 +276,8 @@ def _safetensors_header(path: str) -> bytes:
     a content fingerprint of the shard without reading any weight bytes.
     """
     with open(path, "rb") as f:
-        size_bytes = f.read(8)
-        (header_len,) = struct.unpack("<Q", size_bytes)
-        return size_bytes + f.read(header_len)
+        header = read_safetensors_header(f)
+    return struct.pack("<Q", len(header)) + header
 
 
 def hash_checkpoint(model: str) -> str | None:
