@@ -7,12 +7,16 @@ import struct
 from functools import cache
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Same limit as `MAX_HEADER_SIZE` in the safetensors library.
+SAFETENSORS_MAX_HEADER_SIZE = 100_000_000
+_SAFETENSORS_LENGTH_PREFIX_SIZE = 8
 
 
 def is_s3(model_or_path: str) -> bool:
@@ -107,11 +111,36 @@ def maybe_model_redirect(model: str) -> str:
     return model
 
 
+def read_safetensors_header(f: BinaryIO) -> bytes:
+    """Read the JSON header of a safetensors file opened in binary mode.
+
+    The declared length is checked against the size of the open file and
+    the safetensors header limit before anything is read, so a corrupt or
+    hostile length prefix cannot force a large allocation.
+    """
+    prefix = f.read(_SAFETENSORS_LENGTH_PREFIX_SIZE)
+    if len(prefix) != _SAFETENSORS_LENGTH_PREFIX_SIZE:
+        raise ValueError("Invalid safetensors header: file is too short")
+    (header_len,) = struct.unpack("<Q", prefix)
+    file_size = os.fstat(f.fileno()).st_size
+    max_header_len = min(
+        SAFETENSORS_MAX_HEADER_SIZE, file_size - _SAFETENSORS_LENGTH_PREFIX_SIZE
+    )
+    if header_len > max_header_len:
+        raise ValueError(
+            f"Invalid safetensors header: declared length {header_len} does not "
+            f"fit in a {file_size}-byte file or exceeds the "
+            f"{SAFETENSORS_MAX_HEADER_SIZE}-byte limit"
+        )
+    header = f.read(header_len)
+    if len(header) != header_len:
+        raise ValueError("Invalid safetensors header: file is truncated")
+    return header
+
+
 def parse_safetensors_file_metadata(path: str | PathLike) -> dict[str, Any]:
     with open(path, "rb") as f:
-        length_of_metadata = struct.unpack("<Q", f.read(8))[0]
-        metadata = json.loads(f.read(length_of_metadata).decode("utf-8"))
-        return metadata
+        return json.loads(read_safetensors_header(f).decode("utf-8"))
 
 
 def convert_model_repo_to_path(model_repo: str) -> str:
