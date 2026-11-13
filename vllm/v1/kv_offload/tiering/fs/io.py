@@ -6,6 +6,7 @@ import logging
 import mmap
 import os
 import random
+import stat
 import threading
 
 try:
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-specific and not available on macOS
 O_DIRECT = getattr(os, "O_DIRECT", 0)
+
+# Cached KV blocks hold other requests' prompt state: keep them owner-only.
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
 
 # Thread-local storage for unique temporary file suffixes
 _thread_local = threading.local()
@@ -52,7 +57,11 @@ def probe_o_direct(directory: str) -> bool:
     path = os.path.join(directory, f".o_direct_probe{_get_tmp_suffix()}")
     page = mmap.mmap(-1, mmap.PAGESIZE)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | O_DIRECT, 0o644)
+        fd = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | O_DIRECT,
+            PRIVATE_FILE_MODE,
+        )
         try:
             os.write(fd, page)
         finally:
@@ -66,9 +75,49 @@ def probe_o_direct(directory: str) -> bool:
             os.remove(path)
 
 
+def _mkdir_private(path: str) -> None:
+    try:
+        os.mkdir(path, PRIVATE_DIR_MODE)
+    except FileExistsError:
+        if not os.path.isdir(path):
+            raise
+
+
+def makedirs_private(path: str) -> None:
+    """Create *path* and any missing parents with ``PRIVATE_DIR_MODE``.
+
+    Unlike ``os.makedirs``, which applies ``mode`` only to the leaf, every
+    directory created here is owner-only. Existing directories are left as is.
+    """
+    try:
+        _mkdir_private(path)
+    except FileNotFoundError:
+        parent = os.path.dirname(path)
+        if not parent or parent == path:
+            raise
+        makedirs_private(parent)
+        _mkdir_private(path)
+
+
+def restrict_dir_to_owner(path: str) -> None:
+    """Drop group/other access from *path* if it exists and this uid owns it."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return
+    try:
+        st = os.fstat(fd)
+        if st.st_uid == os.geteuid() and st.st_mode & 0o077:
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) & ~0o077)
+    finally:
+        os.close(fd)
+
+
 def _ensure_dirs(path: str) -> None:
     """Create parent directories of *path* if they don't exist."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:
+        makedirs_private(parent)
 
 
 def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> None:
@@ -111,7 +160,7 @@ def _store_block(
         fd = os.open(
             tmp_path,
             os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | o_direct,
-            0o644,
+            PRIVATE_FILE_MODE,
         )
         try:
             written = os.write(fd, view_slice)
