@@ -498,6 +498,7 @@ class WhisperCausalAttention(nn.Module):
             max_position=max_position_embeddings,
             is_neox_style=False,
             rope_parameters={"rope_theta": 1e6},
+            bound_cache_by_max_model_len=False,
         )
 
     def _init_qkv(

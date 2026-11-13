@@ -94,7 +94,11 @@ class FourierRotaryEmbedding(RotaryEmbedding):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         device = self.inv_freq.device
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device=device)
+        t = torch.arange(
+            self._cos_sin_cache_len(self.max_position_embeddings),
+            dtype=torch.float,
+            device=device,
+        )
 
         freqs = torch.einsum("j,i -> ji", t, self.inv_freq)
         if self.fope_sep_head:

@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from .bailing_mrope import BailingMRotaryEmbedding
-from .base import RotaryEmbedding
+from .base import RotaryEmbedding, get_max_model_len
 from .deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
     DeepseekV4ScalingRotaryEmbedding,
@@ -37,7 +37,14 @@ def get_rope(
     dtype: torch.dtype | None = None,
     dual_chunk_attention_config: dict[str, Any] | None = None,
     mrope_positions_factor: int = 4,
+    bound_cache_by_max_model_len: bool = True,
 ) -> RotaryEmbedding:
+    """Build (or reuse) the rotary embedding for these parameters.
+
+    The cos/sin cache is capped at the configured `max_model_len`. Pass
+    `bound_cache_by_max_model_len=False` only for default RoPE in encoders
+    whose positions are not token positions (e.g. vision patch grids).
+    """
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_parameters is not None:
@@ -64,7 +71,8 @@ def get_rope(
     base = rope_parameters.get("rope_theta", 10000)
     scaling_type = rope_parameters.get("rope_type", "default")
     if rotary_dim := rope_parameters.get("rope_dim", None):
-        pass
+        if not 0 < rotary_dim <= head_size:
+            raise ValueError(f"{rotary_dim=} must be in (0, {head_size=}]")
     else:
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
         if partial_rotary_factor <= 0.0 or partial_rotary_factor > 1.0:
@@ -80,6 +88,7 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
         mrope_positions_factor,
+        get_max_model_len() if bound_cache_by_max_model_len else None,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -152,6 +161,7 @@ def get_rope(
                 base,
                 is_neox_style,
                 dtype,
+                bound_cache_by_max_model_len=bound_cache_by_max_model_len,
             )
     elif scaling_type == "proportional":
         # Proportional RoPE is used by Gemma4 for global (full) attention.

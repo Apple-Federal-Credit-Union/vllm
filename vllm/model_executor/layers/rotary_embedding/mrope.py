@@ -348,6 +348,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         # the input video. We enlarge max_position_embeddings to 4 times to get
         # a larger the cos and sin cache. Models whose positions never exceed
         # the token count pass `positions_factor=1`.
+        self.positions_factor = positions_factor
         self.cache_max_position_num = max_position_embeddings * positions_factor
         super().__init__(
             head_size,
@@ -362,6 +363,12 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
+
+    def _max_cache_len(self) -> int | None:
+        max_model_len = super()._max_cache_len()
+        if max_model_len is None:
+            return None
+        return max_model_len * self.positions_factor
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         if self.scaling_factor is None:

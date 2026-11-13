@@ -8,6 +8,7 @@ import torch.nn as nn
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 
+from .base import get_cos_sin_cache_len, get_max_model_len
 from .common import rotate_neox
 
 logger = init_logger(__name__)
@@ -79,13 +80,21 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         self.short_mscale = short_mscale
         self.long_mscale = long_mscale
 
+        # With long RoPE, original_max_position_embeddings < max_cache_len, so
+        # the short cache keeps all of its rows and the long cache stays at
+        # offset original_max_position_embeddings.
+        max_cache_len = get_max_model_len()
         short_cache = self._compute_cos_sin_cache(
-            original_max_position_embeddings, short_factor, short_mscale
+            get_cos_sin_cache_len(original_max_position_embeddings, max_cache_len),
+            short_factor,
+            short_mscale,
         )
         short_cache = short_cache.to(dtype)
 
         long_cache = self._compute_cos_sin_cache(
-            max_position_embeddings, long_factor, long_mscale
+            get_cos_sin_cache_len(max_position_embeddings, max_cache_len),
+            long_factor,
+            long_mscale,
         )
         long_cache = long_cache.to(dtype)
 

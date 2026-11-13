@@ -800,6 +800,7 @@ class Qwen3Omni_VisionTransformer(nn.Module):
             max_position=8192,
             is_neox_style=True,
             rope_parameters={"partial_rotary_factor": 0.5},
+            bound_cache_by_max_model_len=False,
         )
 
         self.blocks = nn.ModuleList(
