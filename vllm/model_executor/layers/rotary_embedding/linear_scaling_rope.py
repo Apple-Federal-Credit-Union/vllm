@@ -87,7 +87,9 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             # maximum length before applying the rope scaling.
             # Thus, the maximum length after applying the rope scaling is
             # self.max_position_embeddings * self.scaling_factor.
-            max_len = self.max_position_embeddings * scaling_factor
+            max_len = self._cos_sin_cache_len(
+                self.max_position_embeddings * scaling_factor
+            )
             t = torch.arange(max_len, dtype=torch.float)
             t = t / scaling_factor
 

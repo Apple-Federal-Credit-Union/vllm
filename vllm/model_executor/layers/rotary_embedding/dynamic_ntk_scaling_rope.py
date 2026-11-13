@@ -64,7 +64,9 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             - (self.scaling_factor - 1)
         ) ** (self.rotary_dim / (self.rotary_dim - 2))
         inv_freq = self._compute_inv_freq(base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self._cos_sin_cache_len(self.max_position_embeddings), dtype=torch.float
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()

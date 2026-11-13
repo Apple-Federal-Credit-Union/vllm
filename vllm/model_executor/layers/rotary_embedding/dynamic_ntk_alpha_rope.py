@@ -29,7 +29,7 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         # For Hunyuan DynamicNTKAlphaRotaryEmbedding
-        max_len = self.max_position_embeddings
+        max_len = self._cos_sin_cache_len(self.max_position_embeddings)
         base = self.base * self.scaling_alpha ** (
             self.rotary_dim / (self.rotary_dim - 2)
         )

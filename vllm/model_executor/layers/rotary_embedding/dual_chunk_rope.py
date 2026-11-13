@@ -6,6 +6,7 @@ import torch
 
 from vllm.model_executor.custom_op import CustomOp
 
+from .base import get_cos_sin_cache_len, get_max_model_len
 from .common import rotate_gptj, rotate_neox
 
 
@@ -73,16 +74,27 @@ class DualChunkRotaryEmbedding(CustomOp):
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         chunk_len = self.chunk_size - self.local_size
-        q_t = torch.arange(chunk_len, dtype=torch.float)
-        qc_t = (torch.arange(chunk_len, dtype=torch.float) + chunk_len).clamp(
-            max=self.chunk_size
-        )
-        k_t = torch.arange(self.max_position_embeddings, dtype=torch.float) % chunk_len
+        max_model_len = get_max_model_len()
+        # Query caches are indexed by position % chunk_len.
+        q_len = get_cos_sin_cache_len(chunk_len, max_model_len)
+        k_len = get_cos_sin_cache_len(self.max_position_embeddings, max_model_len)
+        q_t = torch.arange(q_len, dtype=torch.float)
+        # The trailing row is position chunk_len - 1, used for query_inter.
+        qc_t = (
+            torch.cat(
+                (
+                    torch.arange(q_len, dtype=torch.float),
+                    torch.tensor([chunk_len - 1], dtype=torch.float),
+                )
+            )
+            + chunk_len
+        ).clamp(max=self.chunk_size)
+        k_t = torch.arange(k_len, dtype=torch.float) % chunk_len
 
         # count from chunk_len, no clamp(self.chunk_size) restriction
-        qc_no_clamp_t = torch.arange(chunk_len, dtype=torch.float) + chunk_len
+        qc_no_clamp_t = torch.arange(q_len, dtype=torch.float) + chunk_len
         # count from self.chunk_size for q_inter's rope
-        q_inter_t = torch.arange(chunk_len, dtype=torch.float) + self.chunk_size
+        q_inter_t = torch.arange(q_len, dtype=torch.float) + self.chunk_size
 
         q_freqs = torch.outer(q_t, inv_freq)
         qc_freqs = torch.outer(qc_t, inv_freq)
@@ -155,7 +167,7 @@ class DualChunkRotaryEmbedding(CustomOp):
             query_pass,
         )
         query_inter = self._apply_rotary_embedding(
-            self.cos_sin_qc_cache[chunk_len - 1].repeat(positions.shape[0], 1),
+            self.cos_sin_qc_cache[-1].repeat(positions.shape[0], 1),
             query_rot,
             query_pass,
         )

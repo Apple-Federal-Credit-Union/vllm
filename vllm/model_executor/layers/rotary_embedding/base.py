@@ -2,12 +2,61 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
+import math
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.custom_op import CustomOp
 
 from .common import ApplyRotaryEmb
+
+# Positions are materialized as float32, which stops representing every
+# integer at 2**24; no real context window comes close to it.
+MAX_COS_SIN_CACHE_POSITIONS = 1 << 24
+
+
+def get_max_model_len() -> int | None:
+    """The largest token position + 1 the engine can feed, if configured."""
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return None
+    max_model_len = getattr(vllm_config.model_config, "max_model_len", None)
+    if max_model_len is None:
+        return None
+    # Drafts built under their own ModelConfig are fed the target's positions.
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    target_config = getattr(spec_config, "target_model_config", None)
+    target_max_model_len = getattr(target_config, "max_model_len", None)
+    if target_max_model_len is not None:
+        max_model_len = max(max_model_len, target_max_model_len)
+    return max_model_len
+
+
+def get_cos_sin_cache_len(num_positions: float, max_cache_len: int | None) -> int:
+    """Number of cos/sin cache rows to build for `num_positions` positions.
+
+    `num_positions` comes from the checkpoint (e.g. `max_position_embeddings`
+    times a rope scaling factor), so it is validated before anything is
+    allocated, then capped at `max_cache_len` since rows past the largest
+    position the engine can feed are never read.
+
+    Raises:
+        ValueError: If `num_positions` is not in
+            `(0, MAX_COS_SIN_CACHE_POSITIONS)`.
+
+    """
+    if not 0 < num_positions < MAX_COS_SIN_CACHE_POSITIONS:
+        raise ValueError(
+            f"RoPE needs {num_positions} cos/sin cache positions, derived from "
+            "the model config's max_position_embeddings and rope scaling "
+            f"factor; expected a value in (0, {MAX_COS_SIN_CACHE_POSITIONS})."
+        )
+    num_rows = math.ceil(num_positions)
+    if max_cache_len is not None:
+        num_rows = min(num_rows, max_cache_len)
+    return num_rows
 
 
 # --8<-- [start:rotary_embedding]
@@ -26,6 +75,7 @@ class RotaryEmbeddingBase(CustomOp):
         is_neox_style: bool,
         dtype: torch.dtype,
         init_cache: bool = True,
+        bound_cache_by_max_model_len: bool = True,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -34,6 +84,11 @@ class RotaryEmbeddingBase(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        # Captured once: some subclasses rebuild the cache outside of a
+        # set_current_vllm_config() context and must keep the same length.
+        self.max_model_len = (
+            get_max_model_len() if bound_cache_by_max_model_len else None
+        )
         # TODO(mgoin): disabled for now due to failures
         # Flashinfer only supports head_size=64, 128, 256, 512.
         # https://github.com/flashinfer-ai/flashinfer/blob/ebfd655efe830048dba5d582aaa61d61d1cf9a87/include/flashinfer/utils.cuh#L174-L202
@@ -91,10 +146,19 @@ class RotaryEmbeddingBase(CustomOp):
         )
         return inv_freq
 
+    def _max_cache_len(self) -> int | None:
+        """Upper bound on the positions this embedding is indexed with."""
+        return self.max_model_len
+
+    def _cos_sin_cache_len(self, num_positions: float) -> int:
+        return get_cos_sin_cache_len(num_positions, self._max_cache_len())
+
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self._cos_sin_cache_len(self.max_position_embeddings), dtype=torch.float
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -146,6 +210,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         is_neox_style: bool,
         dtype: torch.dtype,
         init_cache: bool = True,
+        bound_cache_by_max_model_len: bool = True,
     ) -> None:
         super().__init__(
             head_size=head_size,
@@ -155,6 +220,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             is_neox_style=is_neox_style,
             dtype=dtype,
             init_cache=init_cache,
+            bound_cache_by_max_model_len=bound_cache_by_max_model_len,
         )
 
     @staticmethod

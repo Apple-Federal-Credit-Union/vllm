@@ -19,7 +19,13 @@ class Llama4VisionRotaryEmbedding(RotaryEmbeddingBase):
         dtype: torch.dtype,
     ):
         super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            bound_cache_by_max_model_len=False,
         )
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
@@ -32,7 +38,7 @@ class Llama4VisionRotaryEmbedding(RotaryEmbeddingBase):
 
         # self.max_position_embeddings here is number of image patches
         # i.e. (image_size // patch_size) ** 2
-        num_patches = self.max_position_embeddings
+        num_patches = self._cos_sin_cache_len(self.max_position_embeddings)
         img_idx = torch.arange(num_patches, dtype=torch.int32).reshape(num_patches, 1)
         img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
         img_idx[-1, -1] = -2  # set to ID_CLS_TOKEN
