@@ -50,9 +50,12 @@ from vllm.v1.kv_offload.tiering.base import (
     TransferJob,
 )
 from vllm.v1.kv_offload.tiering.fs.io import (
+    PRIVATE_FILE_MODE,
     batch_load_block,
     batch_store_block,
+    makedirs_private,
     probe_o_direct,
+    restrict_dir_to_owner,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -102,6 +105,8 @@ class FileSystemTierManager(SecondaryTierManager):
         variable to the same value on all instances overrides the default seed,
         and is required to share a cache when using a non-cryptographic
         prefix-caching hash algorithm, which seeds ``NONE_HASH`` randomly.
+        Block files are created owner-only (0600, directories 0700), so
+        instances sharing a ``root_dir`` must run as the same user.
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
@@ -181,9 +186,19 @@ class FileSystemTierManager(SecondaryTierManager):
 
         # Write config file
         config_path = self.file_mapper.get_config_file_path()
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
+        config_dir = os.path.dirname(config_path)
+        makedirs_private(config_dir)
+        # A pre-existing cache under root_dir may still be group/other-readable.
+        restrict_dir_to_owner(config_dir)
+        restrict_dir_to_owner(f"{self.file_mapper.base_path}_r{self.file_mapper.rank}")
+        try:
+            config_fd = os.open(
+                config_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_FILE_MODE
+            )
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(config_fd, "w") as f:
                 json.dump(
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
@@ -191,7 +206,7 @@ class FileSystemTierManager(SecondaryTierManager):
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
         # rather than failing every block.
-        self._use_o_direct = probe_o_direct(os.path.dirname(config_path))
+        self._use_o_direct = probe_o_direct(config_dir)
         if not self._use_o_direct:
             logger.warning(
                 "O_DIRECT is not supported at '%s'; falling back to buffered "

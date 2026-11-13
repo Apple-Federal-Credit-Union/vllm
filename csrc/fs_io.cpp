@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -21,16 +22,48 @@ extern "C" {
 
 namespace {
 
-// Returns 0 on success, or the std::error_code's POSIX-compatible value on
-// failure, mirroring the errno convention used by the syscalls below.
+// Cached KV blocks hold other requests' prompt state: keep them owner-only.
+constexpr mode_t kPrivateFileMode = 0600;
+constexpr mode_t kPrivateDirMode = 0700;
+
+// Returns 0 if `path` was created or already is a directory, else the errno.
+inline int mkdir_private(const char* path) {
+  if (mkdir(path, kPrivateDirMode) == 0) {
+    return 0;
+  }
+  const int err = errno;
+  if (err != EEXIST) {
+    return err;
+  }
+  struct stat st;
+  return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : ENOTDIR;
+}
+
+// Creates `path` and any missing parents with kPrivateDirMode (unlike
+// std::filesystem::create_directories, which uses 0777 & ~umask).
+inline int make_private_dirs(const std::string& path) {
+  int err = mkdir_private(path.c_str());
+  if (err != ENOENT) {
+    return err;
+  }
+  const std::string parent = std::filesystem::path(path).parent_path().string();
+  if (parent.empty() || parent == path) {
+    return err;
+  }
+  if ((err = make_private_dirs(parent)) != 0) {
+    return err;
+  }
+  return mkdir_private(path.c_str());
+}
+
+// Returns 0 on success, or the errno of the failing mkdir(2) on failure,
+// mirroring the errno convention used by the syscalls below.
 inline int ensure_parent_dirs(const std::string& path) {
   const auto parent = std::filesystem::path(path).parent_path();
   if (parent.empty()) {
     return 0;
   }
-  std::error_code ec;
-  std::filesystem::create_directories(parent, ec);
-  return ec ? ec.value() : 0;
+  return make_private_dirs(parent.string());
 }
 
 // Core single-block store: src/size are raw pointer + byte count. Returns 0
@@ -48,8 +81,9 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
   }
 
   const int o_direct_flag = use_o_direct ? kODirectFlag : 0;
-  const int fd = open(
-      tmp_path, O_CREAT | O_EXCL | O_WRONLY | O_TRUNC | o_direct_flag, 0644);
+  const int fd =
+      open(tmp_path, O_CREAT | O_EXCL | O_WRONLY | O_TRUNC | o_direct_flag,
+           kPrivateFileMode);
   if (fd < 0) {
     return errno;
   }
