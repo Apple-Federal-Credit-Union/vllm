@@ -64,6 +64,7 @@ from .inputs import (
 )
 from .inputs.preprocess import extract_target_prompt
 from .params import ChatParams, TokenizeParams
+from .template_deadline import ChatTemplateDeadlineError, render_with_deadline
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -373,10 +374,16 @@ class BaseRenderer(ABC, Generic[_T]):
                 logger.debug("Warming up chat template processing...")
                 start_time = time.perf_counter()
 
-                self.render_chat([[{"role": "user", "content": "warmup"}]], chat_params)
+                render_with_deadline(
+                    self.render_chat,
+                    [[{"role": "user", "content": "warmup"}]],
+                    chat_params,
+                )
 
                 elapsed = time.perf_counter() - start_time
                 logger.debug("Chat template warmup completed in %.3fs", elapsed)
+            except ChatTemplateDeadlineError:
+                raise
             except ChatTemplateResolutionError:
                 logger.debug("This model does not support chat template.")
             except Exception:

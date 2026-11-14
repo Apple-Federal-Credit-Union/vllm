@@ -41,6 +41,7 @@ from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.renderers.template_deadline import render_with_deadline
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
@@ -286,7 +287,8 @@ class NextTokenStrategy(ReadStrategy):
     def _generation_prompt(self) -> list[int]:
         """A chat prompt's ids up to the generation prompt, with thinking off."""
         context, tokenizer = self.context, self._tokenizer()
-        probe = tokenizer.apply_chat_template(
+        probe = render_with_deadline(
+            tokenizer.apply_chat_template,
             [{"role": "user", "content": "x"}],
             **{
                 **context.default_chat_template_kwargs,
@@ -1287,7 +1289,8 @@ class D3Strategy(ReadStrategy):
         content: Any = "\n".join(lines)
         if media:
             content = [{"type": m} for m in media] + [{"type": "text", "text": content}]
-        prompt = self.tokenizer.apply_chat_template(
+        prompt = render_with_deadline(
+            self.tokenizer.apply_chat_template,
             [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": content},

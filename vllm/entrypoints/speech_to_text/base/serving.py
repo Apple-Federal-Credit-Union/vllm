@@ -36,6 +36,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.outputs import RequestOutput
 from vllm.renderers.inputs import DictPrompt, EncoderDecoderDictPrompt
 from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_prompt
+from vllm.renderers.template_deadline import render_with_deadline
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
@@ -299,7 +300,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 model_config=self.model_config,
                 task_type=self.task_type,
             )
-            prompt = self.model_cls.get_generation_prompt(stt_params)
+            prompt = render_with_deadline(
+                self.model_cls.get_generation_prompt, stt_params
+            )
 
             parsed_prompt: DictPrompt
             if request.response_format == "verbose_json":

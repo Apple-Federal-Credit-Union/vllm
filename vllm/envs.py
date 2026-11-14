@@ -818,7 +818,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "600")
     ),
     # Maximum wall-clock seconds allowed for a single chat template render.
-    # Set to 0 to disable the timeout.
+    # Startup aborts if the chat template warmup exceeds it, or if the template
+    # uses `**` on anything but small constants. Set to 0 to disable the timeout.
     "VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT": lambda: float(
         os.environ.get("VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT", "30")
     ),
