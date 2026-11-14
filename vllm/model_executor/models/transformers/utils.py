@@ -16,6 +16,7 @@
 # limitations under the License.
 """Transformers modeling backend utilities."""
 
+import string
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from itertools import chain
@@ -145,6 +146,45 @@ def replace_linear_class(
         return_bias=False,
         **vllm_linear_kwargs,
     )
+
+
+class TensorParallelPlan:
+    """Module qualname patterns from a Transformers tensor parallel plan.
+
+    Plan keys come from the checkpoint config, so they are never compiled as
+    regular expressions. A key is a dot-separated path whose segments are
+    either a literal module name or `*`, which matches any single segment. A
+    key matches a qualname whose leading segments it matches.
+    """
+
+    _WILDCARD = "*"
+    _SEGMENT = frozenset(string.ascii_letters + string.digits + "_")
+
+    def __init__(self, plan: dict[str, Style], prefix: str = ""):
+        self._rules: list[tuple[tuple[str, ...], Style]] = []
+        for key, style in plan.items():
+            if not isinstance(key, str) or not all(
+                segment == self._WILDCARD
+                or (segment and self._SEGMENT.issuperset(segment))
+                for segment in key.split(".")
+            ):
+                raise ValueError(
+                    f"Invalid tensor parallel plan key {key!r}. Keys must be "
+                    "dot-separated module names, where `*` may stand in for a "
+                    "whole name, e.g. 'layers.*.self_attn.q_proj'."
+                )
+            self._rules.append((tuple(maybe_prefix(prefix, key).split(".")), style))
+
+    def get(self, qual_name: str, default: Style = "replicate") -> Style:
+        """Return the style of the first rule matching `qual_name`."""
+        names = qual_name.split(".")
+        for segments, style in self._rules:
+            if len(segments) <= len(names) and all(
+                segment in (self._WILDCARD, name)
+                for segment, name in zip(segments, names)
+            ):
+                return style
+        return default
 
 
 TorchConv: TypeAlias = nn.Conv2d | nn.Conv3d
