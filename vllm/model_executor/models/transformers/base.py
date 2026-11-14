@@ -64,6 +64,7 @@ from vllm.model_executor.models.transformers.fusers.attention import (
     VLLM_MLA_ATTN_IMPL,
 )
 from vllm.model_executor.models.transformers.utils import (
+    TensorParallelPlan,
     attrsetter,
     can_enable_torch_compile,
     disable_noop_dynamic_rope,
@@ -497,7 +498,7 @@ class Base(
             )
 
         # Prefix the patterns because we always start from `self.model`
-        tp_plan = {maybe_prefix("model", k): v for k, v in tp_plan.items()}
+        tp_plan_rules = TensorParallelPlan(tp_plan, prefix="model")
         # Detect fusable patterns once per module class (cached, so this is cheap)
         fusers = Fusers(self.model, self.vllm_config)
 
@@ -555,12 +556,10 @@ class Base(
                             self.ignore_unexpected_prefixes.append(mtp_prefix)
                 # Replace modules as needed
                 if isinstance(child_module, nn.Linear):
-                    generator = (p for p in tp_plan if re.match(p, qual_name))
-                    pattern = next(generator, None)
                     # Some weight loaders expect all linear layers to inherit
                     # LinearBase, so we set a default style which causes any
                     # unspecified layers to be replaced with ReplicatedLinear
-                    style = tp_plan.get(pattern, "replicate")
+                    style = tp_plan_rules.get(qual_name, "replicate")
                     new_module = replace_linear_class(
                         child_module, style, self.quant_config, prefix=qual_name
                     )
