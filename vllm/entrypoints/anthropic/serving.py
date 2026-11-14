@@ -58,6 +58,7 @@ from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
 from vllm.renderers.hf import HfRenderer, resolve_chat_template
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.renderers.template_deadline import render_with_deadline
 
 logger = init_logger(__name__)
 
@@ -314,14 +315,16 @@ class AnthropicServingMessages(OpenAIServingChat):
                 lstrip_blocks=True,
                 extensions=[jinja2.ext.loopcontrols],
             )
-            env.from_string(chat_template).render(
-                messages=[
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                ],
-                add_generation_prompt=False,
+            render_with_deadline(
+                lambda: env.from_string(chat_template).render(
+                    messages=[
+                        {"role": "system", "content": "t"},
+                        {"role": "user", "content": "t"},
+                        {"role": "system", "content": "t"},
+                        {"role": "user", "content": "t"},
+                    ],
+                    add_generation_prompt=False,
+                )
             )
             return False
         except jinja2.TemplateError:

@@ -56,6 +56,7 @@ from vllm.utils.func_utils import supports_kw
 
 from .base import BaseRenderer
 from .inputs.preprocess import parse_dec_only_prompt
+from .template_deadline import ChatTemplateDeadlineError, render_with_deadline
 
 if TYPE_CHECKING:
     from collections.abc import Set
@@ -568,8 +569,12 @@ def _try_extract_ast(chat_template: str) -> jinja2.nodes.Template | None:
     import transformers.utils.chat_template_utils as hf_chat_utils
 
     try:
-        jinja_compiled = hf_chat_utils._compile_jinja_template(chat_template)
+        jinja_compiled = render_with_deadline(
+            hf_chat_utils._compile_jinja_template, chat_template
+        )
         return jinja_compiled.environment.parse(chat_template)
+    except ChatTemplateDeadlineError:
+        raise
     except Exception:
         logger.exception("Error when compiling Jinja template")
         return None
