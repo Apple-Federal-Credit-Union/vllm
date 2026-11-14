@@ -16,17 +16,22 @@ swallow them.
 
 A single integer ``**`` is one native call that no trace function can
 interrupt, so templates parsed under the deadline are refused if they raise
-anything other than a small constant to a small constant power.
+anything other than a small constant to a small constant power. ``sum``,
+``list``, and ``join`` walk their input in the same kind of native call;
+their sync implementations are wrapped so that iteration re-enters Python
+and the deadline still applies.
 """
 
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from types import FrameType
 from typing import Any, ParamSpec, TypeVar
 
 import jinja2
+import jinja2.filters
 import jinja2.nodes
 
 import vllm.envs as envs
@@ -115,6 +120,87 @@ class _Deadline:
         return self.on_event
 
 
+# Index of the iterable argument on the sync filter after Jinja's async
+# wrapper has applied @pass_environment / @pass_eval_context.
+_CONSUMING_FILTERS: dict[str, int] = {"sum": 1, "list": 0, "join": 1}
+_CHECK_STRIDE = 1024
+_filters_guarded = False
+_filter_guard_lock = threading.Lock()
+
+
+class _DeadlineIter:
+    """Iterator that polls the active deadline while a C consumer pulls it."""
+
+    __slots__ = ("_deadline", "_it", "_n")
+
+    def __init__(self, iterable: Any, deadline: _Deadline) -> None:
+        self._it = iter(iterable)
+        self._deadline = deadline
+        self._n = 0
+
+    def __iter__(self) -> "_DeadlineIter":
+        return self
+
+    def __next__(self) -> Any:
+        if self._n % _CHECK_STRIDE == 0:
+            self._deadline._check()
+        self._n += 1
+        return next(self._it)
+
+
+def _active_deadline() -> _Deadline | None:
+    owner = getattr(sys.gettrace(), "__self__", None)
+    if isinstance(owner, _Deadline):
+        return owner
+    return None
+
+
+def _make_consuming_filter_guard(
+    original: Callable[..., Any], index: int
+) -> Callable[..., Any]:
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        deadline = _active_deadline()
+        if deadline is not None and len(args) > index:
+            try:
+                wrapped = _DeadlineIter(args[index], deadline)
+            except TypeError:
+                return original(*args, **kwargs)
+            args = (*args[:index], wrapped, *args[index + 1 :])
+        return original(*args, **kwargs)
+
+    guarded.__name__ = original.__name__  # type: ignore[attr-defined]
+    guarded._vllm_deadline_guard = True  # type: ignore[attr-defined]
+    return guarded
+
+
+def _install_consuming_filter_guards() -> None:
+    """Replace sync ``sum`` / ``list`` / ``join`` so a deadline can interrupt them.
+
+    Each stock filter wrapper closes over its sync function, and every
+    environment shares that wrapper. Swapping the closure cell covers
+    templates compiled before or after the deadline is installed.
+    """
+    global _filters_guarded
+    if _filters_guarded:
+        return
+    with _filter_guard_lock:
+        if _filters_guarded:
+            return
+        for name, index in _CONSUMING_FILTERS.items():
+            wrapper = jinja2.filters.FILTERS.get(name)
+            closure = getattr(wrapper, "__closure__", None)
+            if not closure:
+                continue
+            for cell in closure:
+                fn = cell.cell_contents
+                if getattr(fn, "__name__", "") != f"sync_do_{name}":
+                    continue
+                if not getattr(fn, "_vllm_deadline_guard", False):
+                    cell.cell_contents = _make_consuming_filter_guard(fn, index)
+                break
+        _filters_guarded = True
+
+
 def render_with_deadline(
     fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs
 ) -> _T:
@@ -130,6 +216,7 @@ def render_with_deadline(
     if timeout <= 0 or isinstance(getattr(previous, "__self__", None), _Deadline):
         return fn(*args, **kwargs)
 
+    _install_consuming_filter_guards()
     deadline = _Deadline(timeout)
     sys.settrace(deadline.on_call)
     try:
