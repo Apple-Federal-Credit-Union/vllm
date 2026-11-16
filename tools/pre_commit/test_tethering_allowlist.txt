@@ -198,6 +198,7 @@ tests/transformers_utils/test_dory_config.py  # CI jobs disabled pending locked 
 tests/transformers_utils/test_dspark_mla_config.py  # CI jobs disabled pending locked cmake installation
 tests/transformers_utils/test_hf_overrides_model_type.py  # CI jobs disabled pending locked cmake installation
 tests/transformers_utils/test_muse_spark_config.py  # CI jobs disabled pending locked cmake installation
+tests/transformers_utils/test_funasr_cmvn_path.py  # CI jobs disabled pending locked cmake installation
 tests/transformers_utils/test_processor.py  # CI jobs disabled pending locked cmake installation
 tests/transformers_utils/test_repo_utils.py  # CI jobs disabled pending locked cmake installation
 tests/transformers_utils/test_speculators_dspark_config.py  # CI jobs disabled pending locked cmake installation
