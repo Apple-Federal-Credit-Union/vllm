@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import multiprocessing
 import os
 import socket
+import stat
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import zmq
 
+from vllm.entrypoints.common.cli_args import make_arg_parser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import make_zmq_listener, make_zmq_socket
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.utils import (
     APIServerProcessManager,
+    RustFrontendProcessManager,
     wait_for_completion_or_failure,
 )
 
@@ -605,3 +611,131 @@ def test_rust_frontend_spawn_failure_cleans_up_listeners(tmp_path):
     for listener in (input_listener, output_listener):
         assert listener.socket.fileno() == -1
         assert not os.path.exists(listener.address.removeprefix("ipc://"))
+
+
+# Obvious placeholders. These stand in for an API key, a Hugging Face token,
+# and a watermark key supplied by the operator.
+_API_KEY = "placeholder-api-key"
+_API_KEY_OTHER = "placeholder-api-key-other"
+_HF_TOKEN = "placeholder-hf-token"
+_WATERMARK_KEY = 918273645
+_SECRET_MARKERS = (_API_KEY, _API_KEY_OTHER, _HF_TOKEN, str(_WATERMARK_KEY))
+
+
+def _serve_namespace(argv: list[str]):
+    """Parse argv the way `vllm serve` does, including `--config` expansion."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    make_arg_parser(subparsers.add_parser("serve"))
+    return parser.parse_args(argv)
+
+
+def _idle_frontend(directory: Path) -> Path:
+    script = directory / "idle-frontend"
+    script.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n")
+    script.chmod(0o700)
+    return script
+
+
+def _process_cmdline(pid: int) -> str:
+    payload = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    return payload.replace(b"\x00", b" ").decode()
+
+
+def _assert_markers_absent(text: str) -> None:
+    for marker in _SECRET_MARKERS:
+        assert marker not in text
+
+
+def _frontend_command_line(tmp_path: Path, args, caplog) -> str:
+    """Start the Rust frontend the way serve does and return its argv."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    input_listener = make_zmq_listener("tcp://127.0.0.1:0", zmq.ROUTER)
+    output_listener = make_zmq_listener("tcp://127.0.0.1:0", zmq.PULL)
+    manager = None
+    try:
+        with caplog.at_level("INFO", logger="vllm.v1.utils"):
+            manager = RustFrontendProcessManager(
+                binary_path=str(_idle_frontend(tmp_path)),
+                sock=sock,
+                args=args,
+                input_listener=input_listener,
+                output_listener=output_listener,
+                engine_start_index=0,
+                engine_count=1,
+                data_parallel_size=1,
+            )
+        process = manager.processes[0]
+        assert process.is_alive()
+        cmdline_stat = os.stat(f"/proc/{process.pid}/cmdline")
+        assert cmdline_stat.st_mode & stat.S_IROTH
+        _assert_markers_absent(caplog.text)
+        return _process_cmdline(process.pid)
+    finally:
+        if manager is not None:
+            manager.shutdown()
+        sock.close()
+        input_listener.cleanup()
+        output_listener.cleanup()
+
+
+def test_rust_frontend_config_secrets_stay_off_the_command_line(tmp_path, caplog):
+    """A mode-0600 serve config must not be copied onto the frontend argv.
+
+    `vllm serve --config` is the parent command line. Parsing expands the file
+    into the serve namespace, and the Rust frontend process is what a local
+    account can read.
+    """
+    config_path = tmp_path / "serve.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "model: org/placeholder-model",
+                "api-key:",
+                f"  - {_API_KEY}",
+                f"  - {_API_KEY_OTHER}",
+                f"hf-token: {_HF_TOKEN}",
+                "watermark-config:",
+                f"  key: {_WATERMARK_KEY}",
+                "  algorithm: gumbel",
+            ]
+        )
+        + "\n"
+    )
+    os.chmod(config_path, 0o600)
+    assert not (config_path.stat().st_mode & stat.S_IROTH)
+
+    argv = ["serve", "--config", str(config_path)]
+    _assert_markers_absent(" ".join(argv))
+    args = _serve_namespace(argv)
+    assert args.api_key == [_API_KEY, _API_KEY_OTHER]
+    assert args.hf_token == _HF_TOKEN
+    assert args.watermark_config["key"] == _WATERMARK_KEY
+
+    cmdline = _frontend_command_line(tmp_path, args, caplog)
+    _assert_markers_absent(cmdline)
+
+
+def test_rust_frontend_flag_secrets_stay_off_the_command_line(tmp_path, caplog):
+    """API keys, the Hugging Face token, and the watermark key passed as flags
+    must not be arguments of the Rust frontend process."""
+    watermark = json.dumps({"key": _WATERMARK_KEY, "algorithm": "gumbel"})
+    args = _serve_namespace(
+        [
+            "serve",
+            "org/placeholder-model",
+            "--api-key",
+            _API_KEY,
+            _API_KEY_OTHER,
+            "--hf-token",
+            _HF_TOKEN,
+            "--watermark-config",
+            watermark,
+        ]
+    )
+    assert args.api_key == [_API_KEY, _API_KEY_OTHER]
+    assert args.hf_token == _HF_TOKEN
+    assert args.watermark_config["key"] == _WATERMARK_KEY
+
+    cmdline = _frontend_command_line(tmp_path, args, caplog)
+    _assert_markers_absent(cmdline)
