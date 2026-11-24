@@ -1922,4 +1922,142 @@ mod tests {
 
         assert_eq!(encoded, source);
     }
+
+    const SHARED_MEDIA_UUID: &str = "doc-42";
+
+    fn assert_client_uuid_is_not_the_cache_key(
+        first_tokens: &[u32],
+        first: &MmFeatureSpec,
+        second_tokens: &[u32],
+        second: &MmFeatureSpec,
+        repeated_first: &MmFeatureSpec,
+    ) {
+        // Same prompt tokens and placeholder geometry: prefix-cache block
+        // hashes and the scheduler's embed-count check both follow the
+        // identifier, and that check does not reject the hit.
+        assert_eq!(first_tokens, second_tokens);
+        assert_eq!(first.mm_position.length, second.mm_position.length);
+        assert_eq!(first.mm_position.is_embed, second.mm_position.is_embed);
+        assert_ne!(first.mm_hash, second.mm_hash);
+        assert_ne!(first.data, second.data);
+        assert_ne!(first.identifier, SHARED_MEDIA_UUID);
+        assert_ne!(second.identifier, SHARED_MEDIA_UUID);
+        assert_ne!(first.identifier, second.identifier);
+        assert_eq!(repeated_first.identifier, first.identifier);
+    }
+
+    async fn image_feature(bytes_b64: &str, uuid: Option<&str>) -> (Vec<u32>, MmFeatureSpec) {
+        let info = qwen3_vl_info();
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user(vec![ChatContentPart::ImageUrl {
+                image_url: format!("data:image/png;base64,{bytes_b64}"),
+                detail: None,
+                uuid: uuid.map(str::to_string),
+            }])],
+            ..ChatRequest::for_test()
+        };
+        chat_feature(&info, request, vec![11, QWEN3_IMAGE_PAD_ID]).await
+    }
+
+    #[tokio::test]
+    async fn image_client_uuid_is_not_the_encoder_or_prefix_cache_key() {
+        // 32x32 solid red and blue PNGs. Same dimensions, different bytes.
+        const RED: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
+        const BLUE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsP7/tF7hIASyp5pjAoFAIBAIBAKB4EmwOkv8Lom8x/sAAAAASUVORK5CYII=";
+
+        let (red_tokens, red) = image_feature(RED, Some(SHARED_MEDIA_UUID)).await;
+        let (blue_tokens, blue) = image_feature(BLUE, Some(SHARED_MEDIA_UUID)).await;
+        let (_, red_again) = image_feature(RED, Some(SHARED_MEDIA_UUID)).await;
+        assert_client_uuid_is_not_the_cache_key(&red_tokens, &red, &blue_tokens, &blue, &red_again);
+
+        let (_, untagged) = image_feature(RED, None).await;
+        assert_eq!(untagged.identifier, untagged.mm_hash.clone().unwrap());
+        assert_ne!(untagged.identifier, SHARED_MEDIA_UUID);
+    }
+
+    async fn video_feature(bytes: &'static [u8], uuid: Option<&str>) -> (Vec<u32>, MmFeatureSpec) {
+        let info = qwen3_vl_info();
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user(vec![ChatContentPart::VideoUrl {
+                video_url: format!("data:video/mp4;base64,{}", standard_base64(bytes)),
+                uuid: uuid.map(str::to_string),
+            }])],
+            ..ChatRequest::for_test()
+        };
+        chat_feature(&info, request, vec![11, QWEN3_VIDEO_PAD_ID]).await
+    }
+
+    async fn chat_feature(
+        info: &MultimodalModelInfo,
+        request: ChatRequest,
+        prompt_token_ids: Vec<u32>,
+    ) -> (Vec<u32>, MmFeatureSpec) {
+        let rendered = RenderedPrompt {
+            prompt: Prompt::TokenIds(prompt_token_ids),
+            media_order: None,
+            effective_template_kwargs: HashMap::new(),
+        };
+        let (prompt, features) =
+            finalize_rendered_prompt(&request, rendered, Some(info), ModelDtype::Float32, None)
+                .await
+                .expect("multimodal features");
+        let Prompt::TokenIds(tokens) = prompt else {
+            panic!("expanded prompt should be token ids");
+        };
+        let mut features = features.expect("features");
+        assert_eq!(features.len(), 1);
+        (tokens, features.pop().unwrap())
+    }
+
+    #[tokio::test]
+    async fn video_client_uuid_is_not_the_encoder_or_prefix_cache_key() {
+        let red = include_bytes!("multimodal/fixtures/red-32.mp4");
+        let blue = include_bytes!("multimodal/fixtures/blue-32.mp4");
+        let (first_tokens, first) = video_feature(red, Some(SHARED_MEDIA_UUID)).await;
+        let (second_tokens, second) = video_feature(blue, Some(SHARED_MEDIA_UUID)).await;
+        let (_, repeated) = video_feature(red, Some(SHARED_MEDIA_UUID)).await;
+        assert_client_uuid_is_not_the_cache_key(
+            &first_tokens,
+            &first,
+            &second_tokens,
+            &second,
+            &repeated,
+        );
+    }
+
+    fn standard_base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut index = 0;
+        while index + 3 <= bytes.len() {
+            let packed = ((bytes[index] as u32) << 16)
+                | ((bytes[index + 1] as u32) << 8)
+                | bytes[index + 2] as u32;
+            out.push(TABLE[((packed >> 18) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 12) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 6) & 63) as usize] as char);
+            out.push(TABLE[(packed & 63) as usize] as char);
+            index += 3;
+        }
+        if index < bytes.len() {
+            let b0 = bytes[index];
+            let b1 = if index + 1 < bytes.len() {
+                bytes[index + 1]
+            } else {
+                0
+            };
+            let packed = ((b0 as u32) << 16) | ((b1 as u32) << 8);
+            out.push(TABLE[((packed >> 18) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 12) & 63) as usize] as char);
+            if index + 1 < bytes.len() {
+                out.push(TABLE[((packed >> 6) & 63) as usize] as char);
+                out.push('=');
+            } else {
+                out.push('=');
+                out.push('=');
+            }
+        }
+        out
+    }
 }

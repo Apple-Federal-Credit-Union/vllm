@@ -79,8 +79,10 @@ mod tests {
 
     use llm_multimodal::{MediaContentPart, ModelSpecificValue, PreProcessorConfig};
     use ndarray::ArrayD;
-    use vllm_engine_core_client::protocol::multimodal::{MmField, MmKwargValue};
+    use vllm_engine_core_client::protocol::multimodal::{MmFeatureSpec, MmField, MmKwargValue};
     use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use crate::request::{ChatContentPart, ChatMessage, ChatRequest};
 
     use super::super::{MultimodalModelContext, TokenizerResolver};
     use super::*;
@@ -386,5 +388,152 @@ mod tests {
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype.as_str() == "int64" && tensor.shape.is_empty()
         ));
+    }
+
+    const SHARED_AUDIO_UUID: &str = "doc-42";
+
+    fn assert_audio_uuid_is_not_the_cache_key(
+        first_tokens: &[u32],
+        first: &MmFeatureSpec,
+        second_tokens: &[u32],
+        second: &MmFeatureSpec,
+        repeated_first: &MmFeatureSpec,
+    ) {
+        assert_eq!(first_tokens, second_tokens);
+        assert_eq!(first.mm_position.length, second.mm_position.length);
+        assert_eq!(first.mm_position.is_embed, second.mm_position.is_embed);
+        assert_ne!(first.mm_hash, second.mm_hash);
+        assert_ne!(first.data, second.data);
+        assert_ne!(first.identifier, SHARED_AUDIO_UUID);
+        assert_ne!(second.identifier, SHARED_AUDIO_UUID);
+        assert_ne!(first.identifier, second.identifier);
+        assert_eq!(repeated_first.identifier, first.identifier);
+    }
+
+    async fn audio_feature_from_part(part: MediaContentPart) -> (Vec<u32>, MmFeatureSpec) {
+        let info = qwen3_asr_info();
+        let mut tokens = vec![AUDIO_PAD_ID];
+        let features = info
+            .prepare_multimodal(vec![part], &mut tokens, ModelDtype::Float32, None)
+            .await
+            .expect("audio feature");
+        assert_eq!(features.len(), 1);
+        (tokens, features.into_iter().next().unwrap())
+    }
+
+    fn audio_part(samples: &[i16], uuid: Option<&str>) -> MediaContentPart {
+        MediaContentPart::AudioData {
+            data: wav_i16_mono(16_000, samples),
+            mime_type: Some("audio/wav".to_string()),
+            uuid: uuid.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_client_uuid_is_not_the_encoder_or_prefix_cache_key() {
+        let tone = [0i16; 1_600];
+        let mut other = tone;
+        other[0] = 8_000;
+        let (first_tokens, first) =
+            audio_feature_from_part(audio_part(&tone, Some(SHARED_AUDIO_UUID))).await;
+        let (second_tokens, second) =
+            audio_feature_from_part(audio_part(&other, Some(SHARED_AUDIO_UUID))).await;
+        let (_, repeated) =
+            audio_feature_from_part(audio_part(&tone, Some(SHARED_AUDIO_UUID))).await;
+        assert_audio_uuid_is_not_the_cache_key(
+            &first_tokens,
+            &first,
+            &second_tokens,
+            &second,
+            &repeated,
+        );
+    }
+
+    fn audio_b64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut index = 0;
+        while index + 3 <= bytes.len() {
+            let packed = ((bytes[index] as u32) << 16)
+                | ((bytes[index + 1] as u32) << 8)
+                | bytes[index + 2] as u32;
+            out.push(TABLE[((packed >> 18) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 12) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 6) & 63) as usize] as char);
+            out.push(TABLE[(packed & 63) as usize] as char);
+            index += 3;
+        }
+        if index < bytes.len() {
+            let b0 = bytes[index];
+            let b1 = if index + 1 < bytes.len() {
+                bytes[index + 1]
+            } else {
+                0
+            };
+            let packed = ((b0 as u32) << 16) | ((b1 as u32) << 8);
+            out.push(TABLE[((packed >> 18) & 63) as usize] as char);
+            out.push(TABLE[((packed >> 12) & 63) as usize] as char);
+            if index + 1 < bytes.len() {
+                out.push(TABLE[((packed >> 6) & 63) as usize] as char);
+                out.push('=');
+            } else {
+                out.push('=');
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    async fn assert_chat_audio_parts_do_not_share_uuid(
+        parts_for: fn(&[u8]) -> Vec<MediaContentPart>,
+    ) {
+        let tone = wav_i16_mono(16_000, &[0i16; 1_600]);
+        let mut samples = [0i16; 1_600];
+        samples[0] = 8_000;
+        let other = wav_i16_mono(16_000, &samples);
+        let (first_tokens, first) = audio_feature_from_part(parts_for(&tone).remove(0)).await;
+        let (second_tokens, second) = audio_feature_from_part(parts_for(&other).remove(0)).await;
+        let (_, repeated) = audio_feature_from_part(parts_for(&tone).remove(0)).await;
+        assert_audio_uuid_is_not_the_cache_key(
+            &first_tokens,
+            &first,
+            &second_tokens,
+            &second,
+            &repeated,
+        );
+    }
+
+    fn input_audio_parts(bytes: &[u8]) -> Vec<MediaContentPart> {
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user(vec![ChatContentPart::InputAudio {
+                data: audio_b64(bytes),
+                format: Some("wav".to_string()),
+                uuid: Some(SHARED_AUDIO_UUID.to_string()),
+            }])],
+            ..ChatRequest::for_test()
+        };
+        super::super::extract_media_parts(&request, None).expect("input_audio part")
+    }
+
+    fn audio_url_parts(bytes: &[u8]) -> Vec<MediaContentPart> {
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user(vec![ChatContentPart::AudioUrl {
+                audio_url: format!("data:audio/wav;base64,{}", audio_b64(bytes)),
+                uuid: Some(SHARED_AUDIO_UUID.to_string()),
+            }])],
+            ..ChatRequest::for_test()
+        };
+        super::super::extract_media_parts(&request, None).expect("audio_url part")
+    }
+
+    #[tokio::test]
+    async fn input_audio_uuid_is_not_the_encoder_or_prefix_cache_key() {
+        assert_chat_audio_parts_do_not_share_uuid(input_audio_parts).await;
+    }
+
+    #[tokio::test]
+    async fn audio_url_uuid_is_not_the_encoder_or_prefix_cache_key() {
+        assert_chat_audio_parts_do_not_share_uuid(audio_url_parts).await;
     }
 }
