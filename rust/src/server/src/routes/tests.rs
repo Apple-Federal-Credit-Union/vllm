@@ -3398,6 +3398,76 @@ async fn non_stream_chat_image_url_reaches_engine_mm_features() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn chat_image_uuids_are_not_encoder_cache_keys() {
+    // 32x32 solid red and blue. Same decoded grid, different bytes.
+    const RED: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
+    const BLUE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsP7/tF7hIASyp5pjAoFAIBAIBAKB4EmwOkv8Lom8x/sAAAAASUVORK5CYII=";
+    const SHARED_UUID: &str = "doc-42";
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (app, engine_task) = test_app_with_backend_and_engine_request_check(
+        Arc::new(FakeChatBackend::with_multimodal_model_info(
+            qwen_multimodal_model_info(),
+        )),
+        move |request| {
+            tx.send(request.mm_features.clone()).expect("send features");
+        },
+    )
+    .await;
+
+    let image = |bytes: &str| {
+        json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/png;base64,{bytes}")},
+            "uuid": SHARED_UUID,
+        })
+    };
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": false,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe "},
+                                image(RED),
+                                image(BLUE),
+                            ]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+
+    let features = rx.recv().expect("engine features").expect("multimodal features");
+    assert_eq!(features.len(), 2);
+    assert_eq!(
+        features[0].mm_position.length,
+        features[1].mm_position.length
+    );
+    assert_ne!(features[0].mm_hash, features[1].mm_hash);
+    assert_ne!(features[0].data, features[1].data);
+    assert_ne!(features[0].identifier, SHARED_UUID);
+    assert_ne!(features[1].identifier, SHARED_UUID);
+    assert_ne!(features[0].identifier, features[1].identifier);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn non_stream_chat_rejects_when_image_count_exceeds_limit_mm_per_prompt() {
     // The request is rejected by `--limit-mm-per-prompt` validation before
     // ever reaching the engine, so the mock engine task is never awaited.
