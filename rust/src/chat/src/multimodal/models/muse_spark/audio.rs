@@ -217,4 +217,41 @@ mod tests {
         };
         assert!(processor.preprocess_decoded_clips(vec![bad]).is_err());
     }
+
+    /// A client-chosen rate inside the range of real recordings, but coprime
+    /// with 24 kHz, must be refused before the sinc table is built. 44 056 Hz
+    /// reduces to 5507:3000 and asks for 16_593_000 coefficients (~66 MiB),
+    /// which this port currently allocates and fills.
+    #[test]
+    fn refuses_inband_rate_before_building_resample_kernel() {
+        let processor = MuseSparkAudioProcessor::default();
+        // A benign clip first: a fix that only inspects the first rate must
+        // still refuse the second.
+        let error = processor
+            .preprocess_decoded_clips(vec![decoded(1920, 24_000), decoded(1, 44_056)])
+            .expect_err("44_056 Hz must be refused")
+            .to_string();
+        assert_resample_refused(44_056, &error);
+    }
+
+    fn assert_resample_refused(rate: usize, message: &str) {
+        assert!(
+            !message.contains("failed to allocate"),
+            "{rate} Hz tried to allocate the kernel: {message}"
+        );
+        assert!(
+            !message.contains("after resampling"),
+            "{rate} Hz was resampled before the error: {message}"
+        );
+        let names_rate = message.contains(&rate.to_string());
+        let names_bound = message.contains("kernel")
+            && (message.contains("too large")
+                || message.contains("practical")
+                || message.contains("exceed")
+                || message.contains("bound"));
+        assert!(
+            names_rate || names_bound,
+            "expected {rate} Hz to be refused for its resample kernel, got: {message}"
+        );
+    }
 }

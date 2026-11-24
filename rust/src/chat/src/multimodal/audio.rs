@@ -387,4 +387,267 @@ mod tests {
                 if tensor.dtype.as_str() == "int64" && tensor.shape.is_empty()
         ));
     }
+
+    const MUSE_AUDIO_ID: u32 = 200_038;
+
+    fn muse_spark_info() -> MultimodalModelInfo {
+        let config = serde_json::json!({
+            "model_type": "muse_spark",
+            "audio_config": {"patch_sizes": [16, 6, 5, 4]},
+        });
+        let tokenizer = TestTokenizer::new()
+            .with_regular_token("<|audio|>", MUSE_AUDIO_ID)
+            .with_regular_token("<|soft_audio_start|>", 201_463)
+            .with_regular_token("<|soft_audio_end|>", 201_464);
+        let context = MultimodalModelContext {
+            model_id: "muse-spark-test".to_string(),
+            model_type: Some("muse_spark".to_string()),
+            config,
+            tokenizer: TokenizerResolver(Arc::new(tokenizer)),
+        };
+        MultimodalModelInfo::from_loaded(
+            context,
+            PreProcessorConfig::default(),
+            PreProcessorConfig::default(),
+            PreProcessorConfig::default(),
+            HashMap::new(),
+        )
+        .unwrap()
+        .expect("MuseSpark audio lane")
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut index = 0;
+        while index + 3 <= bytes.len() {
+            let chunk = ((bytes[index] as u32) << 16)
+                | ((bytes[index + 1] as u32) << 8)
+                | bytes[index + 2] as u32;
+            for shift in [18, 12, 6, 0] {
+                out.push(TABLE[((chunk >> shift) & 0x3f) as usize] as char);
+            }
+            index += 3;
+        }
+        let rest = bytes.len() - index;
+        if rest == 1 {
+            let chunk = (bytes[index] as u32) << 16;
+            out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        } else if rest == 2 {
+            let chunk = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+            out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+            out.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        out
+    }
+
+    fn input_audio_request(rates: &[u32]) -> crate::request::ChatRequest {
+        let mut request = crate::request::ChatRequest::for_test();
+        request.messages = vec![crate::request::ChatMessage::user(
+            crate::request::ChatContent::Parts(
+                rates
+                    .iter()
+                    .map(|&rate| {
+                        crate::request::ChatContentPart::input_audio(
+                            base64_encode(&wav_i16_mono(rate, &[0])),
+                            Some("wav".to_string()),
+                        )
+                    })
+                    .collect(),
+            ),
+        )];
+        request
+    }
+
+    async fn prepare_input_audio(
+        info: &MultimodalModelInfo,
+        rates: &[u32],
+        placeholder: u32,
+    ) -> String {
+        let request = input_audio_request(rates);
+        let parts = super::super::extract_media_parts(&request, None).expect("input_audio parts");
+        assert_eq!(parts.len(), rates.len());
+        for part in &parts {
+            match part {
+                MediaContentPart::AudioUrl { url, .. } => {
+                    assert!(url.starts_with("data:audio/wav;base64,"), "{url}");
+                }
+                other => panic!("input_audio must be fetched as an audio URL, got {other:?}"),
+            }
+        }
+        let fetched = info.fetch_media(parts.clone()).await.expect("decode wav");
+        assert_eq!(fetched.audios.len(), rates.len());
+        for (clip, &rate) in fetched.audios.iter().zip(rates) {
+            assert_eq!(clip.decoded().sample_rate, rate as usize);
+            assert_eq!(clip.decoded().samples.len(), 1);
+        }
+        let mut tokens = vec![placeholder; rates.len()];
+        match info.prepare_multimodal(parts, &mut tokens, ModelDtype::Float32, None).await {
+            Ok(_) => "prepared audio without refusing the sample rate".to_string(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn assert_resample_refused(rate: u32, message: &str) {
+        assert!(
+            !message.contains("failed to allocate"),
+            "{rate} Hz tried to allocate the kernel: {message}"
+        );
+        assert!(
+            !message.contains("after resampling"),
+            "{rate} Hz was resampled before the error: {message}"
+        );
+        let names_rate = message.contains(&rate.to_string());
+        let names_bound = message.contains("kernel")
+            && (message.contains("too large")
+                || message.contains("practical")
+                || message.contains("exceed")
+                || message.contains("bound"));
+        assert!(
+            names_rate || names_bound,
+            "expected {rate} Hz to be refused for its resample kernel, got: {message}"
+        );
+    }
+
+    /// PCM WAV whose `fmt` rate is coprime with the model rate. One sample is
+    /// enough: the sinc table depends on the reduced rates, not the length.
+    #[tokio::test]
+    async fn standard_wav_rates_still_prepare() {
+        let info = muse_spark_info();
+        for rate in [16_000, 44_100, 48_000] {
+            let message = prepare_input_audio(&info, &[rate], MUSE_AUDIO_ID).await;
+            assert!(
+                message.contains("without refusing"),
+                "{rate} Hz is a standard rate and must still preprocess: {message}"
+            );
+        }
+    }
+
+    /// 44 056 Hz shares only a factor of 8 with 24 kHz (5507:3000). The
+    /// MuseSpark resampler asks for 16_593_000 kernel floats before reading
+    /// the single sample. The same ratio against Qwen3 and Inkling's 16 kHz
+    /// target is 11_082_000 floats. Both must be refused.
+    #[tokio::test]
+    async fn inband_coprime_wav_rate_is_refused_before_resample() {
+        let hostile = 44_056;
+        let muse = prepare_input_audio(&muse_spark_info(), &[24_000, hostile], MUSE_AUDIO_ID).await;
+        assert_resample_refused(hostile, &muse);
+
+        let qwen = prepare_input_audio(&qwen3_asr_info(), &[hostile], AUDIO_PAD_ID).await;
+        assert_resample_refused(hostile, &qwen);
+
+        let inkling = prepare_input_audio(
+            &inkling_info(serde_json::json!(1024)),
+            &[hostile],
+            INKLING_AUDIO_EMBED_ID as u32,
+        )
+        .await;
+        assert_resample_refused(hostile, &inkling);
+    }
+
+    /// 23 999 Hz and 240 007 Hz are coprime with 24 kHz. The kernel is
+    /// `new_freq * kernel_len` floats: about 2.3 GiB and 23 GiB. The child
+    /// process caps its address space so a vulnerable build fails this test
+    /// on the allocation error instead of exhausting the machine.
+    #[tokio::test]
+    async fn unbounded_header_rate_is_refused_before_kernel_allocation() {
+        if std::env::var_os("VLLM_RESAMPLE_PROBE").is_none() {
+            let exe = std::env::current_exe().expect("test executable");
+            let output = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "multimodal::audio::tests::unbounded_header_rate_is_refused_before_kernel_allocation",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("VLLM_RESAMPLE_PROBE", "1")
+                .output()
+                .expect("spawn probe");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("VLLM_RESAMPLE_PROBE_RAN")
+                    || stderr.contains("VLLM_RESAMPLE_PROBE_RAN"),
+                "probe did not run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                output.status.success(),
+                "probe status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            return;
+        }
+        eprintln!("VLLM_RESAMPLE_PROBE_RAN");
+
+        let _guard = AddressSpaceGuard::cap_above_current(32 * 1024 * 1024);
+        let info = muse_spark_info();
+        for rate in [23_999, 240_007] {
+            let message = prepare_input_audio(&info, &[rate], MUSE_AUDIO_ID).await;
+            assert_resample_refused(rate, &message);
+        }
+    }
+
+    #[repr(C)]
+    struct RLimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+
+    const RLIMIT_AS: i32 = 9;
+
+    struct AddressSpaceGuard(RLimit);
+
+    impl AddressSpaceGuard {
+        fn cap_above_current(extra_bytes: u64) -> Self {
+            let mut current = RLimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let rc = unsafe { getrlimit(RLIMIT_AS, &mut current) };
+            assert_eq!(rc, 0, "getrlimit(RLIMIT_AS) failed");
+            let status = std::fs::read_to_string("/proc/self/status").expect("VmSize");
+            let vm_kb = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmSize:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .expect("VmSize");
+            let want = vm_kb.saturating_mul(1024).saturating_add(extra_bytes);
+            let cur = if current.rlim_max == u64::MAX {
+                want
+            } else {
+                want.min(current.rlim_max)
+            };
+            assert!(
+                cur > vm_kb.saturating_mul(1024),
+                "address-space cap {cur} is not above VmSize"
+            );
+            let tightened = RLimit {
+                rlim_cur: cur,
+                rlim_max: current.rlim_max,
+            };
+            let rc = unsafe { setrlimit(RLIMIT_AS, &tightened) };
+            assert_eq!(rc, 0, "setrlimit(RLIMIT_AS) failed");
+            Self(current)
+        }
+    }
+
+    impl Drop for AddressSpaceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                setrlimit(RLIMIT_AS, &self.0);
+            }
+        }
+    }
 }
