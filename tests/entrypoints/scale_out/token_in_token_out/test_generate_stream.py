@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import StreamOptions
@@ -1563,3 +1564,116 @@ async def test_stream_text_mode_usage_chunk_echoes_output_mode():
     assert usage_chunk["output_mode"] == "text"
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["completion_tokens"] == 1
+
+
+def _qwen_placeholder_len(grid: tuple[int, int, int]) -> int:
+    """Image/video tokens Qwen-VL derives when spatial_merge_size is 2."""
+    t, h, w = grid
+    return (t * h * w) // 4
+
+
+def _qwen_vision_features(
+    modality: str,
+    pixel_key: str,
+    grid_key: str,
+    pixel_rows: int,
+    grid: tuple[int, int, int],
+    placeholder_len: int,
+) -> MultiModalFeatures:
+    item = MultiModalKwargsItem(
+        {
+            pixel_key: MultiModalFieldElem(
+                data=torch.zeros((pixel_rows, 8), dtype=torch.float32),
+                field=MultiModalBatchedField(keep_on_cpu=False),
+            ),
+            grid_key: MultiModalFieldElem(
+                data=torch.tensor([list(grid)], dtype=torch.int64),
+                field=MultiModalBatchedField(keep_on_cpu=True),
+            ),
+        }
+    )
+    return MultiModalFeatures(
+        mm_hashes={modality: ["vision-item"]},
+        mm_placeholders={
+            modality: [PlaceholderRangeInfo(offset=0, length=placeholder_len)]
+        },
+        kwargs_data={modality: [encode_mm_kwargs_item(item)]},
+    )
+
+
+def _vision_generate_request(
+    features: MultiModalFeatures, prompt_len: int
+) -> GenerateRequest:
+    return GenerateRequest(
+        token_ids=[11] * prompt_len,
+        sampling_params=SamplingParams(max_tokens=1),
+        model=MODEL_NAME,
+        features=features,
+        stream=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scale_out_generate_rejects_inconsistent_preprocessed_vision_tensors():
+    """Client pixel/grid pairs must be a 400 before engine.generate.
+
+    The placeholder length is the token count implied by the grid, so rejecting
+    only a placeholder mismatch would still let these tensors through. An
+    exception raised later inside execute_model is fatal to EngineCore.
+    """
+    mismatch_len = _qwen_placeholder_len((1, 4, 4))
+    assert mismatch_len == 4
+    cases = [
+        ("image", "pixel_values", "image_grid_thw", 4, (1, 4, 4), mismatch_len),
+        ("video", "pixel_values_videos", "video_grid_thw", 4, (1, 4, 4), mismatch_len),
+        ("image", "pixel_values", "image_grid_thw", 16, (-1, -4, 4), 4),
+        ("image", "pixel_values", "image_grid_thw", 9, (1, 3, 3), 2),
+        ("image", "pixel_values", "image_grid_thw", 4, (1, 4000, 4000), 1),
+    ]
+    for modality, pixel_key, grid_key, rows, grid, length in cases:
+        engine = _mock_engine()
+
+        async def mock_generate(*args, **kwargs):
+            yield _make_request_output(
+                "req-1", token_ids=[10], finish_reason="stop", finished=True
+            )
+
+        # A request that reaches the engine completes. The assertion below
+        # fails while these tensors are forwarded, and passes only when
+        # serve_tokens rejects them before engine.generate.
+        engine.generate = MagicMock(side_effect=mock_generate)
+        serving = _build_serving_tokens(engine)
+        features = _qwen_vision_features(
+            modality, pixel_key, grid_key, rows, grid, length
+        )
+        response = await serving.serve_tokens(
+            _vision_generate_request(features, max(length, 1))
+        )
+        assert isinstance(response, ErrorResponse), (modality, grid, response)
+        assert response.error.code == 400
+        engine.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scale_out_generate_forwards_consistent_preprocessed_vision_grid():
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output(
+            "req-1", token_ids=[10], finish_reason="stop", finished=True
+        )
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine)
+    features = _qwen_vision_features(
+        "image",
+        "pixel_values",
+        "image_grid_thw",
+        4,
+        (1, 2, 2),
+        _qwen_placeholder_len((1, 2, 2)),
+    )
+    response = await serving.serve_tokens(_vision_generate_request(features, 1))
+
+    assert isinstance(response, GenerateTokensResponse)
+    engine.generate.assert_called_once()
