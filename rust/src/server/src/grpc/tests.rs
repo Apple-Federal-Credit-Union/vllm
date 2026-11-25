@@ -990,6 +990,252 @@ async fn generate_forwards_preprocessed_multimodal_features() {
     }
 }
 
+/// Qwen-VL image tokens implied by a grid when `spatial_merge_size` is 2.
+fn qwen_placeholder_len(grid: [i64; 3]) -> u64 {
+    let product = grid[0] * grid[1] * grid[2];
+    u64::try_from(product / 4).unwrap_or(0)
+}
+
+fn batched_tensor(tensor: WireTensor, keep_on_cpu: bool) -> MmFieldElem {
+    MmFieldElem {
+        data: Some(MmKwargValue::Tensor(tensor)),
+        field: MmField::Batched(MmBatchedField { keep_on_cpu }),
+    }
+}
+
+/// One preprocessed vision item: pixel rows plus a grid the vision encoder trusts.
+fn qwen_vision_media(
+    modality: pb::Modality,
+    pixel_key: &str,
+    grid_key: &str,
+    pixel_rows: usize,
+    grid: [i64; 3],
+    placeholder_len: u64,
+) -> pb::MediaItem {
+    let kwargs = BTreeMap::from([
+        (
+            pixel_key.to_string(),
+            batched_tensor(
+                WireTensor::from_f32(vec![pixel_rows, 8], vec![0.0; pixel_rows * 8]).unwrap(),
+                false,
+            ),
+        ),
+        (
+            grid_key.to_string(),
+            batched_tensor(
+                WireTensor::from_i64(vec![1, 3], grid.to_vec()).unwrap(),
+                true,
+            ),
+        ),
+    ]);
+    pb::MediaItem {
+        modality: modality as i32,
+        source: Some(pb::media_item::Source::Features(
+            pb::PreprocessedMediaFeatures {
+                kwargs: Some(rmp_serde::to_vec_named(&kwargs).expect("encode kwargs")),
+                identifier: "vision-item".to_string(),
+                offset: 0,
+                length: placeholder_len,
+                mm_hash: Some("vision-item".to_string()),
+                is_embed: Vec::new(),
+            },
+        )),
+        mime_type: String::new(),
+        uuid: String::new(),
+    }
+}
+
+/// Bad vision features must die as `INVALID_ARGUMENT` before any engine handoff.
+///
+/// `EngineCore.step` re-raises encoder failures, and the busy loop treats that as
+/// fatal for every request. A check that still submits the original tensors does
+/// not satisfy this test.
+async fn assert_vision_features_rejected(
+    label: &str,
+    rpc: &str,
+    media: pb::MediaItem,
+    prompt_len: usize,
+) {
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let (inference_service, control_service, engine_health, engine_task) =
+        setup_grpc_service_with_backend(
+            format!("engine-grpc-bad-vision-{label}-{rpc}").into_bytes(),
+            default_stream_output_specs(),
+            multimodal_backend(),
+            move |_| {
+                let _ = seen_tx.send(());
+            },
+        )
+        .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let mut client = InferenceClient::new(channel);
+    let request = pb::GenerateRequest {
+        request_id: format!("bad-vision-{rpc}"),
+        model: "test-model".to_string(),
+        prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+            ids: vec![11; prompt_len],
+        })),
+        media: vec![media],
+        stopping: Some(pb::StoppingCriteria {
+            max_new_tokens: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let status = match rpc {
+        "unary" => client.generate(request).await.expect_err("unary must reject"),
+        "stream" => client.generate_stream(request).await.expect_err("stream must reject"),
+        _ => unreachable!("rpc"),
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{rpc}");
+    let forwarded = tokio::time::timeout(Duration::from_millis(200), seen_rx).await;
+    assert!(
+        forwarded.is_err(),
+        "{rpc} handed the rejected tensors to the engine"
+    );
+    drop(engine_task);
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn generate_rejects_inconsistent_preprocessed_vision_tensors() {
+    // Placeholder length is the Qwen token count for the grid (product / 4), so a
+    // check of only the placeholder still has to reject the patch/grid mismatch.
+    let mismatch_len = qwen_placeholder_len([1, 4, 4]);
+    assert_eq!(mismatch_len, 4);
+    let cases = [
+        (
+            "image",
+            "pixel_values",
+            "image_grid_thw",
+            4usize,
+            [1, 4, 4],
+            mismatch_len,
+        ),
+        (
+            "video",
+            "pixel_values_videos",
+            "video_grid_thw",
+            4,
+            [1, 4, 4],
+            mismatch_len,
+        ),
+    ];
+    for (modality_name, pixel_key, grid_key, rows, grid, length) in cases {
+        let modality = if modality_name == "image" {
+            pb::Modality::Image
+        } else {
+            pb::Modality::Video
+        };
+        let media = qwen_vision_media(modality, pixel_key, grid_key, rows, grid, length);
+        for rpc in ["unary", "stream"] {
+            assert_vision_features_rejected(modality_name, rpc, media.clone(), length as usize)
+                .await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn generate_rejects_nonpositive_and_oversized_preprocessed_grids() {
+    // Product of [-1, -4, 4] is 16, matching the pixel rows. A product-only check
+    // must not accept a negative axis the encoder will index with.
+    let negative = qwen_vision_media(
+        pb::Modality::Image,
+        "pixel_values",
+        "image_grid_thw",
+        16,
+        [-1, -4, 4],
+        4,
+    );
+    assert_vision_features_rejected("negative", "unary", negative, 4).await;
+
+    // 3 is not divisible by spatial_merge_size 2, so the vision rotary reshape
+    // raises even though the patch count matches the grid product.
+    let indivisible = qwen_vision_media(
+        pb::Modality::Image,
+        "pixel_values",
+        "image_grid_thw",
+        9,
+        [1, 3, 3],
+        2,
+    );
+    assert_vision_features_rejected("indivisible", "unary", indivisible, 2).await;
+
+    // A 4000x4000 grid is a few integers on the wire and sizes the position
+    // embedding from the grid, not from the four pixel rows.
+    let oversized = qwen_vision_media(
+        pb::Modality::Image,
+        "pixel_values",
+        "image_grid_thw",
+        4,
+        [1, 4000, 4000],
+        1,
+    );
+    assert_vision_features_rejected("oversized", "unary", oversized, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn generate_forwards_consistent_preprocessed_vision_grid() {
+    let (inference_service, control_service, engine_health, engine_task) =
+        setup_grpc_service_with_backend(
+            b"engine-grpc-consistent-vision".to_vec(),
+            default_stream_output_specs(),
+            multimodal_backend(),
+            |request| {
+                let feature = &request.mm_features.as_ref().expect("features")[0];
+                assert_eq!(feature.mm_position.length, 1);
+                let data = feature.data.as_ref().expect("inline features");
+                assert!(data.contains_key("pixel_values"));
+                assert!(data.contains_key("image_grid_thw"));
+            },
+        )
+        .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let mut client = InferenceClient::new(channel);
+    let media = qwen_vision_media(
+        pb::Modality::Image,
+        "pixel_values",
+        "image_grid_thw",
+        4,
+        [1, 2, 2],
+        1,
+    );
+    client
+        .generate(pb::GenerateRequest {
+            request_id: "consistent-vision".to_string(),
+            model: "test-model".to_string(),
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![11],
+            })),
+            media: vec![media],
+            stopping: Some(pb::StoppingCriteria {
+                max_new_tokens: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("consistent grid reaches the engine");
+    engine_task.await.expect("mock engine task");
+    server_task.abort();
+}
+
 fn preprocessed_grpc_media(
     modality: pb::Modality,
     identifier: &str,
