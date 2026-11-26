@@ -271,4 +271,25 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// gRPC `Generate` builds these features in `feature_from_proto` and
+    /// forwards whatever `prepare_preprocessed` returns. The engine stores
+    /// encoder outputs under `identifier`, so a caller-chosen value must not
+    /// survive as that key.
+    #[test]
+    fn client_identifier_cannot_alias_another_items_encoder_cache_key() {
+        let info = qwen3_vl_info();
+        let client_identifier = "victim-content-hash".to_owned();
+        let mut supplied = feature(0, batched());
+        supplied.identifier = client_identifier.clone();
+        supplied.mm_hash = Some(client_identifier.clone());
+
+        match info.prepare_preprocessed(vec![supplied], 4) {
+            Err(_) => {}
+            Ok(features) => assert_ne!(
+                features[0].identifier, client_identifier,
+                "preprocessed features must not keep a client-chosen encoder-cache identifier"
+            ),
+        }
+    }
 }
